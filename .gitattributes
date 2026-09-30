@@ -1,0 +1,15 @@
+# 统一以 LF 存进仓库、以 LF 检出。
+# 本机 Windows 的 git 默认 core.autocrlf=true，若不锁定，regress.sh 会带着 CR
+# 提交上去，Linux/macOS 用户 clone 后 `bash regress.sh` 直接报 `\r: command not found`。
+* text=auto eol=lf
+
+# 二进制资源，别做任何行尾转换
+*.docx  binary
+*.doc   binary
+*.xlsx  binary
+*.xls   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.zip   binary
+*.exe   binary
