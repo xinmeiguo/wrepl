@@ -1,0 +1,83 @@
+name: Release
+
+# 推一个 v* 的 tag 就触发：在 GitHub 的 Windows 机器上编译 → 打包 → 挂成 Release 附件。
+#
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# 打完上面两行，Releases 页面上就会出现带 exe 的下载项，本机一次都不用编。
+# （tag 推送后 Releases 里本来就会自动多出 Source code (zip)/(tar.gz)，
+#   那两个是 GitHub 对 tag 快照自动打的包，和我们这个附件是两回事。）
+on:
+  push:
+    tags:
+      - 'v*'
+
+# softprops/action-gh-release 要写 Release，必须给 contents: write
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 编译并发布 Windows 版
+    # windows-latest 自带 Visual Studio / MSVC，编出来的是自带运行时的独立 exe，
+    # 不像本机 GNU 工具链那样依赖 libgcc_s_seh-1.dll / libwinpthread-1.dll。
+    runs-on: windows-latest
+
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 装 Rust 工具链
+        # edition 2024 需要 Rust >= 1.85，stable 就是当前最新稳定版。
+        # 本机的 rust-toolchain.toml（锁 Windows GNU）故意没进仓库，不会干扰这里。
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 编译命令行 + 图形界面
+        # --locked 保证用的是仓库里那份 Cargo.lock，不会偷偷升级依赖
+        run: cargo build --release --locked --features gui
+
+      - name: 打包（zip + SHA256）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver   = "${{ github.ref_name }}"
+          $name  = "wrepl-$ver-x64-windows"
+          $stage = "dist/$name"
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/wrepl.exe     "$stage/"
+          Copy-Item target/release/wrepl-gui.exe "$stage/"
+          Copy-Item README.md                    "$stage/"
+          Copy-Item LICENSE                      "$stage/"
+
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip" -Force
+
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+
+          Write-Host "打好了："
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            解压 `wrepl-*-x64-windows.zip`，里面是两个免安装的可执行文件：
+
+            | 文件 | 用途 |
+            |---|---|
+            | `wrepl.exe` | 命令行 |
+            | `wrepl-gui.exe` | 图形界面，双击即用 |
+
+            自带运行时，**不需要额外装 DLL，也不需要装 Word / Office**。
+            包内附 `README.md`、`LICENSE`，以及同目录的 `.sha256` 校验值。

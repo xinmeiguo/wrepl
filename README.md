@@ -11,6 +11,19 @@
 
 ---
 
+## 下载
+
+- **直接用** —— 去 [Releases](../../releases) 取 `wrepl-<版本>-x64-windows.zip`，
+  解开就是两个免安装的可执行文件：`wrepl.exe`（命令行）、`wrepl-gui.exe`（图形界面）。
+  **不需要装 Word / Office，也不需要额外装 DLL**；包里附同目录的 `.sha256` 校验值。
+- **看源码 / 自己编** —— `git clone` 之后见下面的[构建](#构建)。
+
+> Windows 包是 GitHub Actions 在 `windows-latest` 上自动编的（MSVC 工具链，自带运行时），
+> 所以不会有本机 GNU 工具链那种 `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` 的依赖问题。
+> 触发方式只是推一个 tag，见 [`.github/workflows/release.yml`](.github/workflows/release.yml)。
+
+---
+
 ## 它解决什么问题
 
 手上有一批交付文档（FAT/IQ/OQ/PQ/SAT/MCL/URS…），要把里面的**项目编号**和
