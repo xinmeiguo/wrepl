@@ -1,0 +1,27 @@
+# ── Rust 构建产物 ────────────────────────────────────────────────
+/target
+/target-*/
+
+# ── 本机构建配置（机器相关，不进版本库）─────────────────────────
+# .cargo/config.toml  : 本机把 target-dir 指到 D:/test/cargo-target，
+#                       并设 RUSTC_STAGE=1 跳过 proc-macro2 的能力探测；
+#                       别人 clone 后不该被迫在 D 盘建目录。
+# rust-toolchain.toml : 本机没装 MSVC、锁的是 Windows GNU 工具链；
+#                       锁进仓库会让 Linux / macOS 上 rustup 直接装不上。
+/.cargo/config.toml
+/rust-toolchain.toml
+
+# ── 调试残留 ─────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+
+# ── 本机真实语料值（含真实客户名/项目号）─────────────────────────
+/regress-samples.local.sh
+
+# ── 编辑器 / 系统 ────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
