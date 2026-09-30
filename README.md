@@ -247,4 +247,4 @@ src/
 
 ## 许可
 
-尚未指定。若打算公开分发，请先补一份 `LICENSE`（MIT / Apache-2.0 都可以）。
+[MIT](LICENSE) © 2026 XINWEI
