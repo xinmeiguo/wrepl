@@ -56,12 +56,30 @@ pub struct Outcome {
     /// （或改名后的空路径）。所以这一份必须在 `process_one` 里当场算出来带着走。
     /// 写副本路径不用它（原件还在磁盘上，事后按路径验即可）。
     pub verdict: Option<verify::PairVerdict>,
+    /// 本次是「未改动 → 原样复制到输出目录」（勾了**完整镜像**才会有）。
+    ///
+    /// 它与 [`Outcome::status`] 是**正交**的两件事：`status = NO_MATCH` 说的是
+    /// "一条规则都没命中"，`mirrored` 说的是"即便如此，产物路径上也确实有文件了"。
+    /// 凡是要判断"产物路径上有没有本次写出来的文件"，都要走
+    /// [`Outcome::produced`]——只看 `status == "OK"` 会把镜像产物漏掉。
+    pub mirrored: bool,
 }
 
 impl Outcome {
     /// 某个规则在本文件里的命中条数（界面规则表用）。
     pub fn hits_of_rule(&self, rule_id: u32) -> usize {
         self.hits.iter().filter(|h| h.rule_id == rule_id).count()
+    }
+
+    /// 本次运行**真的写出了** `dst`。
+    ///
+    /// - `OK`：按规则改写后落盘；
+    /// - [`Outcome::mirrored`]：未改动，但按「完整镜像」原样复制到了输出目录。
+    ///
+    /// 判据是"本轮真的落过盘"，不是"路径上碰巧有文件"——输出目录里可能躺着
+    /// 上一轮留下的同名旧文件，那不是本次产物，不该被改名、也不该被拿去验证。
+    pub fn produced(&self) -> bool {
+        self.status == "OK" || self.mirrored
     }
 
     fn errored(src: &Path, rules: &[Rule], msg: String) -> Self {
@@ -85,6 +103,7 @@ impl Outcome {
                 .unwrap_or_default(),
             rule_count: rules.iter().filter(|r| r.enabled).count(),
             verdict: None,
+            mirrored: false,
         }
     }
 }
@@ -117,6 +136,16 @@ pub struct Options {
     ///
     /// 两者都只看规则集合与命中区间，与文件、线程数无关；默认关闭时行为与旧版逐字节一致。
     pub longest_first: bool,
+    /// **完整镜像**：写副本模式下，一处都没改动的文件也原样复制到输出目录，
+    /// 文件名同样按规则归一。
+    ///
+    /// - `false`（默认）：输出目录里**只有本次真正改过的文件**——搬过去只会让
+    ///   "哪些动过"变模糊，这是既定设计（回归第 10 组钉着）。
+    /// - `true`：输出目录是输入目录的完整镜像，可以直接当交付包拿走。
+    ///
+    /// 只对写副本模式有意义（就地替换本来就在原地，谈不上镜像）。预演不落盘，
+    /// 恒不生效。
+    pub mirror: bool,
 }
 
 /// 一次运行的完整结果。
@@ -222,6 +251,7 @@ pub fn run(
             opts.backup,
             opts.longest_first,
             opts.verify_after && !opts.dry_run,
+            opts.mirror && !opts.dry_run,
         ) {
             Ok(o) => o,
             Err(e) => Outcome::errored(src, rules, format!("{e:#}")),
@@ -494,6 +524,9 @@ pub fn file_sha(p: &Path) -> Result<String> {
 /// `want_verify` 只在**就地替换**下有意义：它决定要不要在覆盖源文件之前
 /// 把验证基准（[`verify::PkgSnap`]）扣下来。写副本模式无视它——那条路径的原件
 /// 一直在磁盘上，验证阶段按路径读就行。
+///
+/// `mirror` 也只在**写副本**下有意义（见 [`Options::mirror`]）：一处都没改动时，
+/// 是原样复制一份到输出目录（完整镜像），还是什么都不写（默认）。
 #[allow(clippy::too_many_arguments)]
 pub fn process_one(
     src: &Path,
@@ -505,6 +538,7 @@ pub fn process_one(
     backup: bool,
     longest_first: bool,
     want_verify: bool,
+    mirror: bool,
 ) -> Result<Outcome> {
     let text_parts = package::read_text_parts(src)?;
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
@@ -540,6 +574,7 @@ pub fn process_one(
     let mut note = String::new();
     let mut verdict: Option<verify::PairVerdict> = None;
     let mut snap_err: Option<String> = None;
+    let mut mirrored = false;
 
     if !dry && !replaced.is_empty() {
         // ★★ **就地替换的验证基准只能在这里扣下来。**
@@ -598,6 +633,38 @@ pub fn process_one(
                 }
             }
         }
+    } else if !dry && mirror && !in_place {
+        // ── 完整镜像：没改动，也要在输出目录里出现 ──
+        //
+        // 走到这里说明一批规则打下来 `replaced` 是空的：一条都没命中（`NO_MATCH`）、
+        // 命中了但全是区间冲突没落笔（`CONFLICT`）、或者命中的是"查找==替换"的空转
+        // 规则（`NO_CHANGE`）。三种情况文件都没被改动，但勾了完整镜像时输出目录
+        // 要能整包拿走，所以原样复制一份过去。
+        //
+        // 用 `fs::copy` 而不是走 `write_with_replacements`：产物必须与源文件
+        // **逐字节相同**——"镜像"这个词的全部内容就是这个。重打包会重排 zip 条目、
+        // 换压缩参数，做不到逐字节相同，也就没法用整文件 SHA256 自证复制无损。
+        if let Some(d) = dst {
+            // ★ 父目录得自己建。写副本那条路（`write_with_replacements`）会按需
+            // `create_dir_all`，而 `fs::copy` 不会——不建就是
+            // 「系统找不到指定的路径 (os error 3)」。
+            //
+            // 而且这是个**竞态**：并行跑一批时，`out` 目录由谁先落盘谁创建。
+            // 若第一个被处理的恰好是个零命中的文件（它走的就是这条路），
+            // 那一刻目录还不存在，整批就冒出一个 ERROR。`create_dir_all` 幂等，
+            // 多线程同时建也没事。
+            if let Some(parent) = d.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("建输出目录失败：{}", parent.display()))?;
+                }
+            }
+            std::fs::copy(src, d)
+                .with_context(|| format!("复制到输出目录失败：{}", d.display()))?;
+            sha_after = file_sha(d)?;
+            mirrored = true;
+            note = "未改动，已原样复制到输出目录（完整镜像）".into();
+        }
     }
 
     let status = if hits.is_empty() {
@@ -627,6 +694,7 @@ pub fn process_one(
         mtime,
         rule_count: rl.iter().filter(|r| r.enabled).count(),
         verdict,
+        mirrored,
     })
 }
 
@@ -672,6 +740,11 @@ pub fn format_epoch(secs: u64) -> String {
 ///
 /// 分三阶段，避免"改到一半撞名"的半成品：
 /// A 按规则算出全部新名 → B 统一消解重名（含与"未改名文件"的碰撞）→ C 一次性落盘。
+///
+/// **只改"本次真的落过盘"的文件**（阶段 A 里判 `status == OK`）：写副本模式下没改动的
+/// 文件不写进输出目录，产物路径上什么都没有，去 rename 只会报
+/// 「系统找不到指定的路径 (os error 3)」；就地替换的 `dst` 就是源文件本身，
+/// 未命中也能改名（文件名里带旧编号的文件照样要归一），这条不动。
 pub fn rename_outputs(
     outcomes: &mut [Outcome],
     rules: &[Rule],
@@ -701,6 +774,28 @@ pub fn rename_outputs(
         };
         match naming::rename_file_name(&old_name, rules, chain) {
             Ok(p) => {
+                // ★ 写副本模式有一条设计：**没改动的文件不写进输出目录**（见 README
+                // 「落盘位置」）。那种文件在产物路径上根本不存在，改名无处可落 ——
+                // 硬去 rename 会报「系统找不到指定的路径 (os error 3)」，看着像
+                // 文件名同步功能坏了，其实是"输出目录里压根没有这个文件"。
+                //
+                // 判据用**本次真的落过盘**（[`Outcome::produced`] = 状态 OK，或勾了
+                // 完整镜像时那个"未改动但原样复制"的产物），不用"路径上碰巧有文件"：
+                // 输出目录里可能躺着上一轮留下的同名旧文件，那不是本次产物，不该被改名。
+                // （就地替换的 `dst` 就是源文件本身，未命中也能改名 —— 文件名里带旧编号
+                //   的文件照样要归一，那是既定行为，别在这里误伤。）
+                if !o.produced() && d != &o.src {
+                    if p.changed() {
+                        rows.push(NameRow {
+                            index: i + 1,
+                            old_name: old_name.clone(),
+                            new_name: old_name,
+                            changed: false,
+                            note: "未产出（无改动，未写输出目录），改名未执行".into(),
+                        });
+                    }
+                    continue;
+                }
                 let mut notes: Vec<String> = p.warnings.clone();
                 if p.conflicts() > 0 {
                     notes.push(format!("{} 处命中区间重叠，冲突未替换", p.conflicts()));
@@ -822,37 +917,128 @@ fn split_stem_ext(name: &str) -> (&str, &str) {
 ///   路径都失效了）。基准是 `process_one` 在写盘前扣下、写盘后当场比完的
 ///   `o.verdict`——这里直接取用，**不再去读任何"原件路径"**。
 ///
-/// 残留自检两条路都要做：它只看产物，与基准无关。
+/// 残留自检两条路都要做：它只看落盘后的那个文件（没产出时退回源文件），与基准无关。
+///
+/// ## 没产出的文件：输出目录里根本没有它，这是设计
+///
+/// 写副本模式有一条刻意的设计——**没改动的文件不写进输出目录**（`--out` 里只有本次
+/// 真正改过的那些，见 README「落盘位置」与回归第 10 组）。早先这里对这些文件照样
+/// 拿 `(源文件, 产物路径)` 去比对，而那个产物路径压根不存在，于是整批报
+/// `残留自检未能执行：打不开文件：…/out/…docx: 系统找不到指定的文件 (os error 2)`。
+///
+/// 正确做法：**没有产物，就没有"产物 vs 源文件"可比**。此时把自检对象退回源文件
+/// （"未改动"这件事的全部内容就在源文件里），并在备注里写明「未产出」。这样同一个
+/// 文件的验证结论不随落盘模式漂移——就地模式下没改动的文件同样是这么验的（它也没
+/// 被写过，也是"拿源文件做自检"）。
+///
+/// 顺带盯一个陷阱：输出目录里**可能躺着上一轮留下的同名旧文件**（这轮规则变了、
+/// 不再命中它）。那不是本次产物，绝不能拿去验证；它也不会被覆盖（"不覆盖已存在
+/// 文件"是既定策略），所以只如实写进备注提醒。
 pub fn verify_outputs(outcomes: &[Outcome], rules: &[Rule], threads: usize) -> Vec<VerifyRow> {
+    /// 待验证对象：产物路径 + 「这一轮到底产出了没有」。
+    struct Job {
+        /// 就地路径在写盘前扣下的裁决（写副本模式为 `None`，要按路径现算）。
+        pre: Option<verify::PairVerdict>,
+        src: PathBuf,
+        dst: PathBuf,
+        /// 本次运行**真的写出了** `dst`（见 [`Outcome::produced`]）。
+        produced: bool,
+        /// 本次是"未改动 → 原样复制"（完整镜像）。这类产物与源文件逐字节相同，
+        /// 关卡 1/2 不必读包，比整文件 SHA256 即可，见下面 `verdicts` 那段。
+        mirrored: bool,
+        /// 整文件 SHA256（复制前后的对照，只对镜像产物用）。
+        sha_before: String,
+        sha_after: String,
+        /// 就地替换：`dst` 与 `src` 是同一个物理文件，备注措辞要跟着变。
+        in_place: bool,
+    }
+
     // 顺序 = outcomes 顺序（报告行序必须稳定）。
-    let jobs: Vec<(Option<verify::PairVerdict>, PathBuf, PathBuf)> = outcomes
+    let jobs: Vec<Job> = outcomes
         .iter()
         .filter(|o| o.status != "ERROR")
-        .filter_map(|o| o.dst.clone().map(|d| (o.verdict.clone(), o.src.clone(), d)))
+        .filter_map(|o| {
+            o.dst.clone().map(|d| Job {
+                pre: o.verdict.clone(),
+                in_place: d == o.src,
+                src: o.src.clone(),
+                dst: d,
+                produced: o.produced(),
+                mirrored: o.mirrored,
+                sha_before: o.sha_before.clone(),
+                sha_after: o.sha_after.clone(),
+            })
+        })
         .collect();
 
     // 已在 process_one 里验过的（就地路径）不必重算——它的"原件路径"根本不存在了。
     // 写副本路径的原件还在盘上，这里按路径现算。两条路的判据都在 verify 里，只有一份。
-    let verdicts = parallel_map(&jobs, threads, |_i, (pre, a, b)| match pre {
-        Some(v) => v.clone(),
-        None => verify::verify_one(a, b),
-    });
+    // **没产出的不验**：文件都没写出来，谈不上"格式有没有被动"。
+    //
+    // 镜像产物单独走一条快捷路：它是 `fs::copy` 出来的，与源文件**逐字节相同**，
+    // 拿两个包去比关卡 1/2 必然全等——这个结论毫无信息量，却要为此把两个 docx
+    // 各解压读一遍（完整镜像下未命中的文件通常是多数，这一步会很贵）。改成直接比
+    // 整文件 SHA256：相等就证明复制无损，**比逐 part 比对更强**，而且零额外 IO。
+    let verdicts: Vec<Option<verify::PairVerdict>> =
+        parallel_map(&jobs, threads, |_i, j| match &j.pre {
+            Some(v) => Some(v.clone()),
+            None if j.mirrored => {
+                let same = !j.sha_before.is_empty() && j.sha_before == j.sha_after;
+                Some(verify::PairVerdict {
+                    src: j.src.clone(),
+                    dst: j.dst.clone(),
+                    l1_pass: same,
+                    l2_pass: same,
+                    changed_parts: Vec::new(),
+                    note: if same {
+                        "未改动，已原样复制到输出目录（整文件逐字节一致）".into()
+                    } else {
+                        "未改动，但复制后的字节与原文件不一致（复制过程有问题）".into()
+                    },
+                })
+            }
+            None if j.produced => Some(verify::verify_one(&j.src, &j.dst)),
+            None => None,
+        });
 
-    parallel_map(&jobs, threads, |i, (_, _a, b)| {
+    parallel_map(&jobs, threads, |i, j| {
         let v = &verdicts[i];
-        // 文件名与残留自检都走**当前**的产物路径。
+        // 文件名与残留自检都走**当前**的产物路径；没产出就退回源文件。
         // 不能用 `v.dst`：就地路径的裁决是写盘那一刻算的，那之后还可能改名。
-        let file = b
+        let file = j
+            .dst
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let (l1, l2) = (
-            if v.l1_pass { "通过" } else { "不通过" }.to_string(),
-            if v.l2_pass { "通过" } else { "不通过" }.to_string(),
-        );
+        let target: &Path = if j.produced { &j.dst } else { &j.src };
+        let (l1, l2, mut note) = match v {
+            Some(v) => (
+                if v.l1_pass { "通过" } else { "不通过" }.to_string(),
+                if v.l2_pass { "通过" } else { "不通过" }.to_string(),
+                v.note.clone(),
+            ),
+            // 未产出：不存在"产物 vs 源文件"这回事，格式也就谈不上被动过。
+            // 但**必须写明**——只看到一片"通过"会让人以为输出目录里有这个文件。
+            None => (
+                "通过".to_string(),
+                "通过".to_string(),
+                if j.in_place {
+                    "未改动（源文件未写盘）".to_string()
+                } else {
+                    "未产出（无改动，未写输出目录）".to_string()
+                },
+            ),
+        };
+        if !j.produced {
+            note.push_str("；残留自检按源文件做");
+            if !j.in_place && j.dst.exists() {
+                // 上一轮留下的旧产物：同名，但不是这次写出来的，不能当成产物看。
+                note.push_str("；输出目录里已有同名旧文件，本次未覆盖（未参与验证）");
+            }
+        }
 
-        let res = match verify::residue(b, rules) {
+        let res = match verify::residue(target, rules) {
             Ok(r) => r,
             Err(e) => {
                 return VerifyRow {
@@ -860,7 +1046,11 @@ pub fn verify_outputs(outcomes: &[Outcome], rules: &[Rule], threads: usize) -> V
                     level1: l1,
                     level2: l2,
                     residue: "自检失败".to_string(),
-                    note: format!("残留自检未能执行：{e:#}"),
+                    note: if j.produced {
+                        format!("残留自检未能执行：{e:#}")
+                    } else {
+                        format!("残留自检未能执行（按源文件）：{e:#}")
+                    },
                 };
             }
         };
@@ -890,15 +1080,22 @@ pub fn verify_outputs(outcomes: &[Outcome], rules: &[Rule], threads: usize) -> V
             )
         };
 
-        let mut note = v.note.clone();
         if !res_note.is_empty() {
             if !note.is_empty() {
                 note.push('　');
             }
             note.push_str(&res_note);
+            if j.mirrored {
+                // 镜像产物是"未改动"的文件，旧串本来就在里面，报残留是**正常的**。
+                // 不写这一句，读报告的人会把一整批没改过的文件当成"没替换干净"。
+                note.push_str("（该文件未改动，这些旧串本就是原文件内容）");
+            }
         }
         if note.is_empty() {
-            note = format!("改动 part：{}", v.changed_parts.join(", "));
+            // 能走到这里只可能是"验过、但既没备注也没残留"（未产出那几行上面已填过字）。
+            if let Some(v) = v {
+                note = format!("改动 part：{}", v.changed_parts.join(", "));
+            }
         }
 
         VerifyRow {

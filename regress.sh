@@ -662,6 +662,208 @@ else
   bad "就地（不改名）验证存疑：$IV2_OUT"
 fi
 
+# ───────── 16. 写副本 × 未命中不落盘 × 执行后验证（没有产物的不能拿去验）─────────
+#
+# 写副本模式下"没改动的文件不写进输出目录"是**设计**（第 10 组钉着）。早先验证阶段
+# 对这些文件照样拿 (源文件, 产物路径) 去比对，而那个产物路径压根不存在 ⇒ 整批报
+#   「残留自检未能执行：打不开文件：…out/…docx: 系统找不到指定的文件 (os error 2)」
+# 还把该行记成"不通过"。**没有产物，就没有"产物 vs 源文件"可比**——自检对象该退回
+# 源文件，并在备注里写明「未产出」，否则一片"通过"会让人以为输出目录里有这个文件。
+head1 "16. 写副本 + 未命中不落盘 + 执行后验证（没有产物的不能拿去验）"
+VO=$WORK/verify-out; mkdir -p "$VO/src"
+for n in "$F1" "$F2" "$F3"; do cp "$CORPUS/$n.docx" "$VO/src/$n.docx"; done
+: > "$VO/before.txt"
+for f in "$VO/src"/*.docx; do printf '%s\t%s\n' "$(sha "$f")" "$(basename "$f")" >> "$VO/before.txt"; done
+
+# 只用前三条规则（$R1/$R2/$R3 来自第 10 组）：$F2（包装箱封面）正文里只有 $P_ALT，
+# 前三条都打不到它 ⇒ 必然零命中 ⇒ 不落盘 —— 这正是触发条件，先跑出来。
+"$WREPL" apply "$VO/src" --rule "$R1" --rule "$R2" --rule "$R3" \
+  --out "$VO/out" --verify-after --report "$VO/报告.xlsx" > "$VO/run.log" 2>&1
+
+# ① 前提必须成立，否则后面几条等于没测
+n_out=$(ls "$VO"/out/*.docx 2>/dev/null | wc -l)
+if [ "$n_out" = "2" ] && [ ! -f "$VO/out/$F2.docx" ]; then
+  ok "前提成立：零命中的 $F2 不落盘（源 3 个 / 输出 2 个）"
+else
+  bad "前提不成立：输出目录 $n_out 个 —— 零命中文件被写进去了？见 $VO/run.log"
+fi
+
+# ② 不许再出现"拿不存在的产物去验"
+if ! grep -q "打不开文件" "$VO/run.log" \
+   && grep -q "自动验证：3 个文件　通过 3 / 不通过 0" "$VO/run.log"; then
+  ok "写副本 + 验证：3/3 通过，不再报「打不开文件」"
+else
+  bad "写副本 + 验证仍然报错 —— 见 $VO/run.log"
+fi
+
+# ③ 那一行必须写明「未产出」，而不是含糊的一片"通过"
+VO_OUT=$("$PY" - "$VO/报告.xlsx" <<'PYEOF'
+import sys, openpyxl
+rows = list(openpyxl.load_workbook(sys.argv[1])["验证结论"].iter_rows(values_only=True))[1:]
+print("ROWS=%d NOTPROD=%d SELFFAIL=%d BAD=%d" % (
+    len(rows),
+    sum(1 for r in rows if str(r[4] or "").startswith("未产出（")),
+    sum(1 for r in rows if r[3] == "自检失败"),
+    sum(1 for r in rows if r[1] != "通过" or r[2] != "通过" or r[3] != "无残留"),
+))
+PYEOF
+)
+if [ "$VO_OUT" = "ROWS=3 NOTPROD=1 SELFFAIL=0 BAD=0" ]; then
+  ok "验证结论：3 行、1 行写明「未产出」、无「自检失败」、无不合格"
+else
+  bad "验证结论不符合预期：$VO_OUT"
+fi
+
+# ④ 写副本模式源文件一个字节都不许动
+moved=0
+while IFS=$'\t' read -r h n; do
+  [ "$(sha "$VO/src/$n")" != "$h" ] && moved=$((moved+1))
+done < "$VO/before.txt"
+if [ "$moved" = "0" ]; then
+  ok "写副本模式源文件零改动（3/3 SHA256 未变）"
+else
+  bad "写副本模式居然改了源文件：$moved 个"
+fi
+
+# ⑤ ★ 输出目录里躺着**上一轮的同名旧文件**（这轮不再命中它）：
+#    那不是本次产物 —— 不许拿去验证，也不许覆盖，只如实写进备注。
+cp "$VO/src/$F2.docx" "$VO/out/$F2.docx"
+stale_sha=$(sha "$VO/out/$F2.docx")
+"$WREPL" apply "$VO/src" --rule "$R1" --rule "$R2" --rule "$R3" \
+  --out "$VO/out" --verify-after --report "$VO/报告2.xlsx" > "$VO/run2.log" 2>&1
+VO2=$("$PY" - "$VO/报告2.xlsx" <<'PYEOF'
+import sys, openpyxl
+rows = list(openpyxl.load_workbook(sys.argv[1])["验证结论"].iter_rows(values_only=True))[1:]
+print("STALE=%d NOHIT=%d OPENERR=%d" % (
+    sum(1 for r in rows if "已有同名旧文件" in str(r[4] or "")),
+    sum(1 for r in rows if str(r[4] or "").startswith("未产出（")),
+    sum(1 for r in rows if r[3] == "自检失败"),
+))
+PYEOF
+)
+if [ "$VO2" = "STALE=1 NOHIT=1 OPENERR=0" ] \
+   && [ "$(sha "$VO/out/$F2.docx")" = "$stale_sha" ]; then
+  ok "旧产物没被当成产物：备注点名、文件未被覆盖、未参与验证"
+else
+  bad "旧产物处理有问题：$VO2（或旧文件被覆盖了）见 $VO/run2.log"
+fi
+
+# ⑥ 同一个"产物路径一定存在"的假设还有第二处：**文件名**命中规则、正文零命中
+#    （⇒ 不落盘）的文件，改名阶段照样对它 rename ⇒ 报「系统找不到指定的路径
+#    (os error 3)」，看着像文件名同步功能坏了。没产物就没有文件可改名。
+NM=$WORK/verify-out-name; mkdir -p "$NM/src"
+cp "$CORPUS/$F2.docx" "$NM/src/封面-$P_OLD-模板.docx"
+printf '封面\t封面A\t文件名\t\t只在文件名里命中\n' > "$NM/r.txt"
+"$WREPL" apply "$NM/src" --rules-file "$NM/r.txt" \
+  --out "$NM/out" --rename-files --report "$NM/报告.xlsx" > "$NM/run.log" 2>&1
+NM_OUT=$("$PY" - "$NM/报告.xlsx" <<'PYEOF'
+import sys, openpyxl
+rows = list(openpyxl.load_workbook(sys.argv[1])["文件名对照"].iter_rows(values_only=True))[1:]
+print("ROWS=%d OSERR=%d SKIP=%d CHANGED=%d" % (
+    len(rows),
+    sum(1 for r in rows if "os error" in str(r[4] or "")),
+    sum(1 for r in rows if "改名未执行" in str(r[4] or "")),
+    sum(1 for r in rows if r[3] == "是"),
+))
+PYEOF
+)
+n_out2=$(ls "$NM"/out/*.docx 2>/dev/null | wc -l)
+if [ "$NM_OUT" = "ROWS=1 OSERR=0 SKIP=1 CHANGED=0" ] && [ "$n_out2" = "0" ] \
+   && ! grep -q "os error" "$NM/run.log"; then
+  ok "零命中文件不落盘 ⇒ 更不改名（不再报 os error 3）"
+else
+  bad "零命中文件的改名处理有问题：$NM_OUT（输出 $n_out2 个）见 $NM/run.log"
+fi
+
+# ───────── 17. 完整镜像（--mirror）：未改动的文件也进输出目录，且逐字节相同 ─────────
+#
+# 默认 `--out` 里只有改过的文件（第 10 / 16 组钉着），做交付包时输出目录拿不齐全。
+# `--mirror` 把没改动的文件**原样复制**过去 —— 必须是 `fs::copy` 出来的逐字节相同，
+# 不能走重打包：重打包会重排 zip 条目、换压缩参数，做不到逐字节相同，也就没法用
+# 整文件 SHA256 自证复制无损。文件名同样按规则归一。
+head1 "17. 完整镜像（--mirror）：未改动的文件也复制过去，且逐字节相同"
+MI=$WORK/mirror; mkdir -p "$MI/src"
+for n in "$F1" "$F2" "$F3"; do cp "$CORPUS/$n.docx" "$MI/src/$n.docx"; done
+: > "$MI/src.sha"
+for f in "$MI/src"/*.docx; do printf '%s\t%s\n' "$(sha "$f")" "$(basename "$f")" >> "$MI/src.sha"; done
+
+"$WREPL" apply "$MI/src" --rule "$R1" --rule "$R2" --rule "$R3" \
+  --out "$MI/out" --mirror --rename-files --verify-after --report "$MI/报告.xlsx" \
+  > "$MI/run.log" 2>&1
+
+# ① 前提：三个文件**全部**落进输出目录（零命中的 $F2 也在），否则后面几条等于空测。
+#    先钉前提再断言结论 —— 哪天"未命中不落盘"的默认变了，这里会立刻报红，
+#    而不是变成一组"白测还全绿"。
+n_out=$(ls "$MI"/out/*.docx 2>/dev/null | wc -l)
+if [ "$n_out" = "3" ] && [ -f "$MI/out/$F2.docx" ]; then
+  ok "前提成立：未改动的 $F2 也进了输出目录（源 3 / 输出 3）"
+else
+  bad "前提不成立：输出目录 $n_out 个（应 3）—— 见 $MI/run.log"
+fi
+
+# ② 镜像件与源件**逐字节相同** —— 这就是"镜像"这个词的全部内容
+if [ -f "$MI/out/$F2.docx" ] && [ "$(sha "$MI/out/$F2.docx")" = "$(sha "$MI/src/$F2.docx")" ]; then
+  ok "镜像件与源件逐字节相同（$F2）"
+else
+  bad "镜像件与源件不一致 —— 见 $MI/run.log"
+fi
+
+# ③ 命中的文件照旧被真正改写（内容确实变了，不是"整包原样搬过去"）
+MI_F1_NEW="${F1/$P_OLD/$P_NEW}"
+if [ -f "$MI/out/$MI_F1_NEW.docx" ] \
+   && [ "$(sha "$MI/out/$MI_F1_NEW.docx")" != "$(sha "$MI/src/$F1.docx")" ]; then
+  ok "命中的文件内容仍被正确改写（$F1）"
+else
+  bad "命中的文件没被改写或改名不对 —— 见 $MI/run.log"
+fi
+
+# ④ 改名对两类文件都成立：改过的 $F1 换成新编号，镜像件保持原名（文件名里本就没编号）
+if [ -f "$MI/out/$MI_F1_NEW.docx" ] && [ -f "$MI/out/$F2.docx" ]; then
+  ok "文件名归一：改过的改名成功，镜像件保持原名"
+else
+  bad "输出目录文件名不对 —— 见 $MI/run.log"
+fi
+
+# ⑤ 报告里镜像行给的是"整文件逐字节一致"，且**不再出现「未产出」**
+#    （镜像模式下每个输入文件都有产物，那条措辞不该再冒出来）
+MI_REP=$("$PY" - "$MI/报告.xlsx" <<'PYEOF'
+import sys, openpyxl
+rows = list(openpyxl.load_workbook(sys.argv[1])["验证结论"].iter_rows(values_only=True))[1:]
+note = lambda r: str(r[4] or "")
+print("ROWS=%d BYTEID=%d NOPROD=%d BAD=%d" % (
+    len(rows),
+    sum(1 for r in rows if "整文件逐字节一致" in note(r)),
+    sum(1 for r in rows if "未产出" in note(r)),
+    sum(1 for r in rows if r[1] != "通过" or r[2] != "通过"),
+))
+PYEOF
+)
+if [ "$MI_REP" = "ROWS=3 BYTEID=1 NOPROD=0 BAD=0" ]; then
+  ok "报告：镜像行标注「整文件逐字节一致」，且不再出现「未产出」"
+else
+  bad "镜像模式报告不符：$MI_REP"
+fi
+
+# ⑥ 镜像模式仍然**一个源文件都不许动**
+mi_same=0
+while IFS=$'\t' read -r h n; do
+  [ "$(sha "$MI/src/$n")" = "$h" ] && mi_same=$((mi_same+1))
+done < "$MI/src.sha"
+if [ "$mi_same" = "3" ]; then
+  ok "镜像模式源文件零改动（3/3 SHA256 未变）"
+else
+  bad "镜像模式动了源文件：只有 $mi_same/3 未变"
+fi
+
+# ⑦ 镜像只对写副本有意义：不给 --out 时必须**明确拒绝**，不许静默什么都不做
+"$WREPL" apply "$MI/src" --rule "$R1" --mirror > "$MI/bad.log" 2>&1
+rc=$?
+if [ "$rc" != "0" ] && grep -q -- "--out" "$MI/bad.log"; then
+  ok "--mirror 不给 --out 时明确拒绝（退出码 $rc）"
+else
+  bad "--mirror 缺少 --out 却没被拒绝：退出码 $rc —— 见 $MI/bad.log"
+fi
+
 # ───────────────────── 汇总 ─────────────────────
 printf '\n\033[1m══════════ 汇总：通过 %d ／ 失败 %d ══════════\033[0m\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then

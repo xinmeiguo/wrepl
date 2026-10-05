@@ -336,8 +336,8 @@ pub fn write_xlsx(
         sheet(
             &VERIFY_HEADERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             verify_rows.iter().map(|v| {
-                let ok = v.level1 == "通过" && v.level2 == "通过" && v.residue == "无残留";
-                let style = if ok { STYLE_BODY } else { STYLE_WARN };
+                // 判据只允许有一份：走 `VerifyRow::ok`，别在这里再抄一遍条件。
+                let style = if v.ok() { STYLE_BODY } else { STYLE_WARN };
                 vec![
                     Cell::styled(&v.file, style),
                     Cell::styled(&v.level1, style),

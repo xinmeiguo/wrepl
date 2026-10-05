@@ -188,17 +188,37 @@ impl Preset {
 
 pub struct App {
     // 输入 / 输出
+    /// 输入：一个目录、一个 .docx，或**多个 .docx**。
+    ///
+    /// 存原始文本，按需拆（见 [`App::input_paths`]）。一行一个路径，也认
+    /// `;` / `；` 分隔——多选文件时是一行一个，手输时可以一行写一个，
+    /// 也可以一行写完用分号隔开。目录与文件可以混着给。
+    ///
+    /// 与命令行同构：`wrepl <PATH>...` 本来就收多个位置参数，界面这里
+    /// 只是把"多个"从一个参数列表变成一栏文本。
     input: String,
     /// 勾上「输出到子文件夹」时才用：产物目录。默认 `<输入目录>/out`。
     output: String,
     /// 落盘位置开关。**false（默认）＝ 就地替换源文件**；
     /// true ＝ 写到 `output` 目录，源文件不动。
     out_to_subdir: bool,
+    /// **完整镜像**：写副本时，一处都没改动的文件也原样复制到输出目录。
+    ///
+    /// **默认 false**：输出目录里只有本次真正改过的文件（既定设计）。
+    /// 勾上则输出目录是输入目录的完整镜像（未改动的那些逐字节相同，文件名一并归一），
+    /// 可以直接当交付包拿走。只对写副本有意义——就地替换本就在原地，界面上置灰。
+    mirror: bool,
     recursive: bool,
     exclude: String,
 
     // 规则
     rows: Vec<Row>,
+    /// 「清空规则」是否已经按过第一下（等第二下确认）。
+    ///
+    /// 清空是**不可逆**的：手工一条条填进去的规则，清掉就没了，而且界面里
+    /// 没有"撤销"。所以这个按钮走两步——第一次点只是把按钮换成一对
+    /// 「确认清空 / 取消」，再点一次才真清。代价是一次点击，只在真要清的时候付。
+    clear_armed: bool,
     chain: bool,
     /// 「最长匹配优先」：规则命中区间重叠时，只让「查找内容更长」的那条生效，
     /// 被挤掉的记进报告。不勾（默认）则两条都不改、报冲突。
@@ -260,9 +280,11 @@ impl App {
             output: String::new(),
             // ★ 默认不勾：不勾就是就地替换源文件（有 .bak 备份兜底）。
             out_to_subdir: false,
+            mirror: false,
             recursive: false,
             exclude: String::new(),
             rows: Vec::new(),
+            clear_armed: false,
             chain: false,
             // ★ 默认不勾：保持了工具一贯的"不猜"——重叠时两条都不改，把冲突报出来。
             longest_first: false,
@@ -284,7 +306,7 @@ impl App {
             job: None,
             run_log_from: 0,
         };
-        app.push_log("就绪：选输入 → 填规则（或「从 Excel 导入」）→ 点「执行替换」");
+        app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
         app
     }
 
@@ -464,22 +486,46 @@ impl App {
 
     // ─────────────────────── 参数收集 ───────────────────────
 
+    /// 把输入框里的文本拆成路径清单。
+    ///
+    /// 分隔符：换行、`;`、`；`（不认半角逗号——Windows 路径里没有它，
+    /// 但文件名里可能有，拆错比不拆更糟）。空项与重复项丢掉：同一个文件
+    /// 选两遍没有意义，内核虽然会去重，报告里却会留两条一样的「输入」。
     fn input_paths(&self) -> Vec<PathBuf> {
-        vec![PathBuf::from(self.input.trim())]
+        let mut out: Vec<PathBuf> = Vec::new();
+        for piece in self.input.split(['\n', '\r', ';', '；']) {
+            let s = piece.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let p = PathBuf::from(s);
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 
-    /// 输入所在的目录（输入是目录就是它本身；是单个 .docx 就是它的父目录）。
+    /// 输入的"家"：这批文件落在哪个目录。
+    ///
+    /// 取**第一个**输入的落点目录（是目录就是它本身，是文件就是它的父目录）。
+    /// 用途有二：① 勾了「输出到子文件夹」却没填目录时，默认 `<它>/out`；
+    /// ② 就地替换时，报告与运行日志落在这里——跟产物挨着，回头好找。
+    ///
+    /// 多个输入散在不同目录时这里不瞎猜：就用第一个。真实产物落点由内核
+    /// 按每个文件自己的来源目录决定（就地替换是各自写回各自那儿），
+    /// 这一处只影响"报告放哪"，取第一个是人能预期的那种。
     fn input_dir(&self) -> PathBuf {
-        let s = self.input.trim();
-        if s.is_empty() {
-            return PathBuf::new();
-        }
-        let p = Path::new(s);
-        if p.is_dir() {
-            p.to_path_buf()
-        } else {
-            p.parent().map(|x| x.to_path_buf()).unwrap_or_default()
-        }
+        self.input_paths()
+            .first()
+            .map(|p| {
+                if p.is_dir() {
+                    p.to_path_buf()
+                } else {
+                    p.parent().map(|x| x.to_path_buf()).unwrap_or_default()
+                }
+            })
+            .unwrap_or_default()
     }
 
     /// 产物落点：写副本＝输出目录；就地替换＝输入目录（那是这批文件的"家"）。
@@ -585,18 +631,33 @@ impl App {
             // 不在界面上做成选项——"几个线程"是机器的事，不是规则的事，
             // 摆出来只会让人多一个不知道该怎么选的开关。
             threads: 0,
+            // 完整镜像只对写副本有意义（就地替换本就在原地）；预演不落盘，同样不生效。
+            // 注意这里判 `in_place` 而不是 `out_dir`——`out_dir` 在同一条结构体字面量里
+            // 已经先被移进字段，再读它就是 use-after-move。
+            mirror: self.mirror && !dry && !in_place,
         }
     }
 
     // ─────────────────────── 动作 ───────────────────────
 
     fn precheck(&mut self) -> bool {
-        if self.input.trim().is_empty() {
-            self.error = Some("请先指定输入（目录或 .docx 文件）".into());
+        let paths = self.input_paths();
+        if paths.is_empty() {
+            self.error = Some("请先指定输入（目录，或一个 / 多个 .docx 文件）".into());
             return false;
         }
-        if !Path::new(self.input.trim()).exists() {
-            self.error = Some(format!("输入路径不存在：{}", self.input.trim()));
+        // 逐个报。多选十几个文件时，"输入路径不存在"等于没说——得指出是哪个。
+        let missing: Vec<String> = paths
+            .iter()
+            .filter(|p| !p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        if !missing.is_empty() {
+            self.error = Some(format!(
+                "{} 个输入路径不存在：{}",
+                missing.len(),
+                missing.join("　；　")
+            ));
             return false;
         }
         true
@@ -686,7 +747,16 @@ impl App {
         self.push_log(if dry {
             "落盘位置：预演，不写任何文件".to_string()
         } else if self.out_to_subdir {
-            format!("落盘位置：副本 → {}", self.output.trim())
+            // 勾了镜像就说一句。它改变的是"输出目录里有什么"，
+            // 而这正是执行完之后最容易被误解的一件事（少了一堆没改动的文件）。
+            if self.mirror {
+                format!(
+                    "落盘位置：副本 → {}（完整镜像：未改动的文件也原样复制过去）",
+                    self.output.trim()
+                )
+            } else {
+                format!("落盘位置：副本 → {}", self.output.trim())
+            }
         } else if self.backup {
             "落盘位置：就地替换源文件（保留 .bak 备份）".to_string()
         } else {
@@ -695,6 +765,18 @@ impl App {
 
         let opts = self.options_for(dry);
         let paths = self.input_paths();
+        // 多输入时说一声：报告里"输入"那一栏会是好几条，别让人以为出了错
+        if paths.len() > 1 {
+            self.push_log(format!(
+                "输入 {} 项（{}）",
+                paths.len(),
+                paths
+                    .iter()
+                    .map(|p| short_name(p))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+        }
         // 报告/日志落点提前算好并冻住：执行期间人还可以改输入框，
         // 收尾时再算就可能落到另一个目录去。
         let report_path = self.report_path();
@@ -1089,7 +1171,7 @@ impl App {
     }
 
     fn section_io(&mut self, ui: &mut egui::Ui) {
-        section(ui, "输入与输出", |ui| {
+        section(ui, "文件与输出", |ui| {
             const L: f32 = 52.0; // 标签列宽
             const F: f32 = 560.0; // 路径输入框宽
 
@@ -1098,21 +1180,49 @@ impl App {
             let mut pick_out_dir = false;
             let mut use_sibling_out = false;
 
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 cell_label(ui, L, "输入");
-                path_edit(ui, F, &mut self.input, "");
-                if ui.button("选目录…").clicked() {
-                    pick_in_dir = true;
-                }
-                if ui.button("选文件…").clicked() {
-                    pick_in_file = true;
-                }
+                // 多行：一行一个路径。只给一个目录 / 一个文件时就是一行高。
+                // 高度封顶 6 行——一次选了几十个文件时不再往长里撑，框内自己滚。
+                let rows = self.input.lines().count().clamp(1, 6) as f32;
+                ui.add_sized(
+                    [F, 26.0 * rows],
+                    egui::TextEdit::multiline(&mut self.input)
+                        .hint_text("目录，或若干 .docx（一行一个）"),
+                );
+                ui.vertical(|ui| {
+                    if ui.button("选目录…").clicked() {
+                        pick_in_dir = true;
+                    }
+                    if ui
+                        .button("选文件…（可多选）")
+                        .on_hover_text(
+                            "按住 Ctrl / Shift 一次选多个 .docx；选中几个就处理几个。\n\
+                             也可以直接把多个路径粘进左边的框里（一行一个，或用分号隔开）。",
+                        )
+                        .clicked()
+                    {
+                        pick_in_file = true;
+                    }
+                });
             });
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
                 cell_label(ui, L, "输出");
                 ui.checkbox(&mut self.out_to_subdir, "输出到子文件夹");
+                ui.add_space(8.0);
+                // 镜像只对写副本有意义：就地替换本就在原地，没有"要不要复制"这回事。
+                // 置灰而不是隐藏——让人看到这个开关存在，切换落盘方式后它就在那儿。
+                let writes_copy = self.out_to_subdir;
+                ui.add_enabled_ui(writes_copy, |ui| {
+                    ui.checkbox(&mut self.mirror, "完整镜像").on_hover_text(
+                        "默认不勾：输出目录里只有本次真正改过的文件。\n\
+                         勾上则未改动的文件也原样复制过去（逐字节相同，文件名一并归一），\n\
+                         输出目录成为输入目录的**完整镜像**，可直接当交付包拿走。\n\
+                         只对「输出到子文件夹」有效。",
+                    );
+                });
             });
             if self.out_to_subdir {
                 ui.add_space(8.0);
@@ -1159,11 +1269,17 @@ impl App {
                 }
             }
             if pick_in_file {
-                if let Some(p) = rfd::FileDialog::new()
+                // 多选：选中几个就是几个，一行写一个。
+                // 单选时结果与从前一样是一行，行为不变。
+                if let Some(ps) = rfd::FileDialog::new()
                     .add_filter("Word 文档", &["docx"])
-                    .pick_file()
+                    .pick_files()
                 {
-                    self.input = p.display().to_string();
+                    self.input = ps
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                 }
             }
             if pick_out_dir {
@@ -1172,14 +1288,9 @@ impl App {
                 }
             }
             if use_sibling_out {
-                let inp = self.input.trim().to_string();
-                if !inp.is_empty() {
-                    let p = Path::new(&inp);
-                    let base = if p.is_dir() {
-                        p.to_path_buf()
-                    } else {
-                        p.parent().map(|x| x.to_path_buf()).unwrap_or_default()
-                    };
+                // 与「输出到子文件夹」留空时的默认落点同一条路（见 input_dir）
+                let base = self.input_dir();
+                if !base.as_os_str().is_empty() {
                     self.output = base.join("out").display().to_string();
                 }
             }
@@ -1190,7 +1301,7 @@ impl App {
         let mut import_txt = false;
         let mut import_xlsx = false;
         let mut export_xlsx = false;
-        section(ui, "规则", |ui| {
+        section(ui, "替换规则", |ui| {
             // 列宽显式给定。
             //
             // 之前用 `egui::Grid` + `TextEdit::desired_width`，实测输入框被压到 ~50px：
@@ -1240,6 +1351,41 @@ impl App {
                 {
                     export_xlsx = true;
                 }
+                // 清空整表。靠右摆、离"添加 / 导入"那三个常用动作远一点，
+                // 而且走两步——清掉的手工规则界面里没有"撤销"，一次误点代价太大。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.clear_armed {
+                        // right_to_left：先放的在最右边，所以顺序是
+                        // 「清空 N 条规则？ … [取消] [确认清空]」
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("确认清空").color(ERR_C).strong(),
+                            ))
+                            .clicked()
+                        {
+                            let n = self.rows.len();
+                            self.rows.clear();
+                            self.last_rule_hits.clear();
+                            self.rename_preview = None;
+                            self.clear_armed = false;
+                            self.push_log(format!("已清空 {n} 条规则"));
+                            self.toast = Some((format!("已清空 {n} 条规则"), true));
+                        }
+                        if ui.button("取消").clicked() {
+                            self.clear_armed = false;
+                        }
+                        ui.label(
+                            RichText::new(format!("清空 {} 条规则？", self.rows.len()))
+                                .color(WARN_C),
+                        );
+                    } else if ui
+                        .add_enabled(!self.rows.is_empty(), egui::Button::new("清空规则"))
+                        .on_hover_text("一次清掉整张规则表（导入新表、换一批任务时用）。\n点一下只是待命，会再问一次。")
+                        .clicked()
+                    {
+                        self.clear_armed = true;
+                    }
+                });
             });
             ui.add_space(12.0);
 
@@ -1463,9 +1609,9 @@ impl App {
             return;
         };
         let title = if self.dry_run {
-            "上次结果（未落盘）"
+            "执行结果（未落盘）"
         } else {
-            "上次结果"
+            "执行结果"
         };
         section(ui, title, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1513,7 +1659,7 @@ impl App {
     }
 
     fn section_log(&mut self, ui: &mut egui::Ui) {
-        // 各分区一律不带序号：「上次结果」没跑过之前不出现，
+        // 各分区一律不带序号：「执行结果」没跑过之前不出现，
         // 一旦编号就会断号；而且序号本身对使用毫无帮助。
         section(ui, "运行日志", |ui| {
             // 只读：渲染成可选中的标签，不给文本框——可编辑的日志框会让人
@@ -1778,6 +1924,9 @@ fn write_report(
             } else {
                 "写出到新目录（原文件不动）".to_string()
             };
+            if opts.mirror {
+                m.push_str("　＋　完整镜像（未改动的文件也复制到输出目录）");
+            }
             if opts.rename_files {
                 m.push_str("　＋　文件名同步改名");
             }
@@ -1968,6 +2117,36 @@ pub fn selftest(args: &[String]) -> i32 {
             return 2;
         }
     }
+
+    // 3.6) 新增的两处控件只在特定交互下才画得出来，普通一趟渲染照不到：
+    //      · 输入框的多行形态（选了几个文件之后）
+    //      · 「清空规则」的待命态（点过第一下之后）
+    //      这两处一旦排版出问题（宽度溢出、高度算负），只能在真窗口里当场发现，
+    //      所以在这里各画两帧钉住。
+    let keep_input = app.input.clone();
+    app.input = (1..=7)
+        .map(|i| format!("D:/wrepl-selftest/第{i}个.docx"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.clear_armed = true;
+    for _ in 0..2 {
+        let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+    }
+    app.clear_armed = false;
+    app.input = keep_input;
+    println!("  多行输入框 + 「清空规则」待命态：布局 2 帧通过");
+
+    // 3.7) 「完整镜像」复选框的两态：可用（写副本）与置灰（就地替换）。
+    //      它是跟着「输出到子文件夹」启停的，普通一趟渲染只能照到其中一态。
+    let keep_out = app.out_to_subdir;
+    app.out_to_subdir = false;
+    let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+    app.out_to_subdir = true;
+    app.mirror = true;
+    let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+    app.mirror = false;
+    app.out_to_subdir = keep_out;
+    println!("  「完整镜像」可用 / 置灰两态：布局通过");
 
     // 4) 真跑一次批量
     let dry = app.do_run_selftest(true);

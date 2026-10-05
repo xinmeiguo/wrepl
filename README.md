@@ -16,11 +16,6 @@
 - **直接用** —— 去 [Releases](../../releases) 取 `wrepl-<版本>-x64-windows.zip`，
   解开就是两个免安装的可执行文件：`wrepl.exe`（命令行）、`wrepl-gui.exe`（图形界面）。
   **不需要装 Word / Office，也不需要额外装 DLL**；包里附同目录的 `.sha256` 校验值。
-- **看源码 / 自己编** —— `git clone` 之后见下面的[构建](#构建)。
-
-> Windows 包是 GitHub Actions 在 `windows-latest` 上自动编的（MSVC 工具链，自带运行时），
-> 所以不会有本机 GNU 工具链那种 `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` 的依赖问题。
-> 触发方式只是推一个 tag，见 [`.github/workflows/release.yml`](.github/workflows/release.yml)。
 
 ---
 
@@ -59,44 +54,6 @@ Xxx Pharmaceutical Co., Ltd.  →  Xxx Biological
 
 ---
 
-## 构建
-
-```bash
-# 只要命令行（不拉 GUI 依赖，编得快）
-cargo build --release --offline
-
-# 带图形界面（eframe + glow 后端）
-cargo build --release --offline --features gui
-```
-
-产物：
-
-```
-target/release/wrepl.exe        # 命令行
-target/release/wrepl-gui.exe    # 图形界面（需 --features gui）
-```
-
-**Windows 上如果没装 Visual Studio / MSVC Build Tools**，默认的 `msvc` 工具链找不到
-真正的链接器，会退而调用 PATH 里的 `link.exe`（Git Bash 里那是 BusyBox 的 `link`，
-语义是"建硬链接"），缺参数时它去读 stdin，**进程会永久挂起**。此时改用 GNU 工具链：
-
-```bash
-cargo +stable-x86_64-pc-windows-gnu build --release --offline --features gui
-```
-
-或者建个 `rust-toolchain.toml`：
-
-```toml
-[toolchain]
-channel = "stable-x86_64-pc-windows-gnu"
-```
-
-> 本仓库**故意不收录** `rust-toolchain.toml` 与 `.cargo/config.toml`——它们是本机
-> 环境产物（前者锁 Windows GNU 工具链，后者把 `target-dir` 指到别的盘），
-> 锁进仓库会让 Linux/macOS 上 `rustup` 直接装不上。
-
----
-
 ## 用法
 
 ### 命令行
@@ -110,6 +67,9 @@ wrepl apply ./交付包 --rules-file 规则.txt --rename-files --verify-after
 
 # 源文件不动，产物写到 ./out
 wrepl apply ./交付包 --rule "2026-001CE=>2026-002CE" --out ./out
+
+# 源文件不动，./out 里是整包的完整镜像（没改动的文件也复制过去）
+wrepl apply ./交付包 --rule "2026-001CE=>2026-002CE" --out ./out --mirror
 
 # 就地替换但留一份 .docx.bak（默认不留）
 wrepl apply ./交付包 --rule "2026-001CE=>2026-002CE" --backup
@@ -125,6 +85,17 @@ wrepl apply ./交付包 --rule "2026-001CE=>2026-002CE" --backup
 | `verify` | 关卡 1+2 比对；`--batch` 时给两个目录，改过名的按 XML 结构指纹配对 |
 | `inspect` / `diff` / `dump` | 摸 part 指纹 / 比对 part 差异 / 导出"段落→run 切分"报告 |
 | `rules` | `template` 生成规则模板、`dump` 导出、`check` 只校验 |
+
+### 图形界面
+
+双击 `wrepl-gui.exe`。界面分三块：**文件与输出**（选文件、选落点）、
+**替换规则**（一张三列表，可手工填、可从文本/Excel 导入导出）、**执行结果**。
+「执行替换」是唯一的执行入口，验证在后台一并做完。
+
+- **输入可多选** —— 「选文件…（可多选）」按住 Ctrl / Shift 一次挑多个；
+  也可以把多个路径直接粘进输入框（一行一个，或用分号隔开）；目录与文件能混着给。
+- **执行默认就地替换源文件**；勾「输出到子文件夹」才改成写副本，源文件不动。
+- **「完整镜像」** 只在写副本时可勾（见下面「落盘位置」）。
 
 ### 规则从哪来
 
@@ -153,10 +124,31 @@ wrepl apply ./交付包 --rule "2026-001CE=>2026-002CE" --backup
 | `apply` 不给 `--out` | **就地替换源文件**（原文件上直接覆盖） |
 | 加 `--backup` | 就地替换时另留一份 `.docx.bak`（只首次生成，始终是最初那版） |
 | 给了 `--out DIR` | 写副本，源文件不动（`--backup` 与 `--out` 互斥，明确拒绝） |
+| 再加 `--mirror` | 写副本时，**未改动的文件也原样复制过去**，输出目录成为完整镜像 |
 | `--dry-run` | 只走完整执行路径，不落盘 |
 
 就地替换不建临时文件、不做 rename，是在原文件上直接改写。代价是失去原子性——
 写失败时先把内存里的原件写回去再报错，保底是（勾了才有的）`.bak`。
+
+**默认 `--out` 里只有本次真正改过的文件** —— 一处都没命中的文件不写副本（搬过去只会让
+"哪些动过"变模糊）。所以默认的输出目录**不是一个完整镜像**，两份后果要说清：
+
+- 「验证结论」对这类文件不会去读一个不存在的产物：自检对象退回源文件，备注写明
+  `未产出（无改动，未写输出目录）`；
+- 文件名同步改名也不会去 rename 一个不存在的产物，备注写明 `…，改名未执行`
+  （就地替换不受影响：那里的文件名照样归一）。
+
+**要输出目录能整包拿走，就加 `--mirror`**（界面里是「完整镜像」复选框）。此时：
+
+- 未改动的文件**原样复制**过去，与源文件**逐字节相同**（逐文件 SHA256 可复核），
+  文件名同样按规则归一；
+- 「验证结论」对它们给的是"整文件逐字节一致"，而不是去比 XML 骨架——内容都没动过，
+  逐 part 比对得不出任何信息，整文件哈希才是"复制无损"的直接证据；
+- 残留自检仍会如实报出里面的旧串（文件本来就没改），备注里跟着一句
+  `（该文件未改动，这些旧串本就是原文件内容）`，别误读成"没替换干净"。
+
+顺带：输出目录里若躺着**上一轮留下的同名旧文件**（这轮规则变了、不再命中它），
+它不会被当成本次产物去验证，也不会被覆盖，只在备注里点名。
 
 ### 规则打架了怎么办
 
@@ -187,58 +179,10 @@ CLI 加 `--verify-after`、GUI 执行时**恒开**。逐文件做三件事，全
 > 写盘**后**立刻比完即弃。报告「验证结论」的**备注**列会写明
 > `改动 part：word/footer2.xml` —— **冒号后面是空的就说明没真比过**。
 
----
-
-## 回归
-
-```bash
-bash regress.sh                       # 默认用 debug 产物
-bash regress.sh path/to/wrepl.exe path/to/wrepl-gui.exe
-```
-
-15 组 44 项，每一组都对照**外部可复算**的量（SHA256 / 命中数 / 退出码），
-不依赖工具自己的说法；任一项失败即非零退出。
-
-回归跑的是**真实交付包**，里面的项目编号与客户名属于商业信息，不适合随源码公开，
-可脚本又必须靠这些字面量去 `cp` 文件、`grep` 期望值。所以：
-
-- `regress.sh` 里的语料字面量**全是变量**，默认值是脱敏占位；
-- 本机真实值放在同目录的 `regress-samples.local.sh`（`.gitignore` 已排除）；
-- 换语料 / 换机器只改那个文件，`regress.sh` 一个字都不用动；
-- 没那个文件也能跑 —— 语法没毛病，但会整片报红，这是设计如此。
-
-要拿自己的语料跑，照 `regress-samples.example.sh` 改：
-
-```bash
-cp regress-samples.example.sh regress-samples.local.sh
-# 把 CORPUS 指到你的 docx 目录，再把 P_OLD / P_NEW / C_OLD / C_NEW
-# 换成语料里真实存在的串
-```
-
-另外 `cargo test --offline --lib` 有 26 项单元测试，不需要任何外部语料，随时可跑。
-
----
-
-## 目录结构
-
-```
-src/
-  main.rs         CLI 入口
-  cli.rs          命令行参数定义（只有参数，没有逻辑）
-  lib.rs          库门面
-  engine.rs       搜索与落笔规划（区间重叠裁决也在这）
-  pipeline.rs     目录遍历 / 并行 / 落盘 / 规则装载
-  rules.rs        规则模型、规则文件与 Excel 规则表解析
-  report.rs       运行日志与 .xlsx 替换报告
-  verify.rs       执行后验证（关卡 1+2、残留自检、结构指纹配对）
-  naming.rs       文件名同步改名（含重名消解）
-  probe.rs        目录侦察：候选项目编号与客户名
-  docx/
-    package.rs    zip 容器读写、part 分类（就地覆盖改写在这）
-    scan.rs       XML 解析：段落 → run 切分、文本承载元素
-    rewrite.rs    XML 就地重写（只动字符数据区间）
-  gui/            图形界面（eframe/egui，--features gui 才编）
-```
+> **没有产物的文件不验产物。** 写副本模式下未命中的文件默认不进输出目录，此时
+> 关卡 1/2 无从谈起（压根没有"产物 vs 源文件"这一对），残留自检退回源文件，
+> 备注写明 `未产出（无改动，未写输出目录）；残留自检按源文件做`。
+> 同一份文件在就地模式下也是这么验的 —— **验证结论不随落盘模式漂移**。
 
 ---
 

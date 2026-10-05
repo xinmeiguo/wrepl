@@ -48,6 +48,7 @@ fn run() -> Result<()> {
             rename_files,
             verify_after,
             longest_first,
+            mirror,
         } => cmd_apply(            &targets,
             &rules,
             out.as_deref(),
@@ -58,6 +59,7 @@ fn run() -> Result<()> {
             rename_files,
             verify_after,
             longest_first,
+            mirror,
         ),
         Cmd::Rules { sub } => cmd_rules(&sub),
         Cmd::Probe {
@@ -151,6 +153,7 @@ fn cmd_scan(t: &Targets, rs: &RuleSource) -> Result<()> {
         rename_files: false,
         verify_after: false,
         threads: t.threads,
+        mirror: false,
     };
 
     let (files, skipped) = pipeline::collect_targets(&t.paths, &opts)?;
@@ -192,6 +195,7 @@ fn cmd_apply(
     rename_files: bool,
     verify_after: bool,
     longest_first: bool,
+    mirror: bool,
 ) -> Result<()> {
     let (rl, book_sheet) = load_rules(rs)?;
     print_rules(&rl, rs.chain, longest_first);
@@ -233,6 +237,7 @@ fn cmd_apply(
         verify_after,
         threads: t.threads,
         longest_first,
+        mirror,
     };
 
     let out_desc = if dry {
