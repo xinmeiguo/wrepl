@@ -85,7 +85,9 @@ def build_body(text: str, version: str, repo: str) -> str:
 
     return "\n".join(
         [
-            "> 本版更新内容摘自仓库的 [`CHANGELOG.md`]"
+            "## 更新内容",
+            "",
+            "> 摘自仓库的 [`CHANGELOG.md`]"
             "(https://github.com/%s/blob/%s/CHANGELOG.md)。" % (repo, version),
             "",
             section,
