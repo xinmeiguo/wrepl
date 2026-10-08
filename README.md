@@ -218,8 +218,9 @@ CLI 加 `--verify-after`、GUI 执行时**恒开**。逐文件做三件事，全
   会出现"没改但报了残留"——这是设计如此，看报告备注里的
   `（可见文本 N）` 才是真漏改。
 - GUI 启动时可能往 stderr 打一行 `thread 'main' has overflowed its stack`：
-  **打印后进程继续正常运行、退出码 0**，是 eframe/OpenGL 建窗口路径上的既有现象，
-  双击运行看不到 stderr，不影响任何功能。
+  **打印后进程继续正常运行、退出码 0**，是 eframe/OpenGL 建窗口路径上的既有现象
+  （连 30 行的最小 egui 程序都会打），与替换功能无关。
+  双击运行看不到 stderr；**从 cmd / PowerShell 里运行才会看到，忽略即可**。
 
 ---
 

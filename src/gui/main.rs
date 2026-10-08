@@ -1,3 +1,16 @@
+// ★ 发布版走 Windows 图形子系统（PE Subsystem = 2）：双击**不再先弹一个黑色控制台窗口**。
+//   不写这一行时，bin 默认是「控制台子系统」（Subsystem = 3），双击会先开一个黑框，
+//   里面还可能打印 eframe/建窗路径上的 `thread 'main' has overflowed its stack`
+//   —— 那个提示既吓人、又与本工具无关（30 行最小 egui 程序同样会打）。
+//
+//   为什么限定 release：调试构建保留控制台，方便本地看 stderr 与 panic。
+//
+//   影响面已经核过，只有「看得见」这一项变了：
+//     · 输出重定向到文件/管道照旧 —— 回归脚本 `--selftest > log 2>&1` 不受影响；
+//     · 在 cmd / PowerShell 里手动跑，父进程的控制台句柄本来就会继承，输出照旧能看到；
+//     · 只有「双击」这一种启动方式会失去可见的 stderr。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! wrepl 图形界面入口。
 //!
 //! 只做三件事：读命令行 → 装中文字体 → 开窗。界面逻辑全在 [`app`] 里。
