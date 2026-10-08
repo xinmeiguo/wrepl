@@ -53,6 +53,7 @@ jobs:
           Copy-Item target/release/wrepl-gui.exe "$stage/"
           Copy-Item README.md                    "$stage/"
           Copy-Item LICENSE                      "$stage/"
+          Copy-Item CHANGELOG.md                 "$stage/"
 
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip" -Force
 
@@ -62,22 +63,29 @@ jobs:
           Write-Host "打好了："
           Get-ChildItem dist | Select-Object Name, Length
 
+      # Release 正文 = 本版更新内容（从 CHANGELOG.md 抽对应小节） + 下载说明。
+      #
+      # 抽取逻辑放在仓库里的脚本、由这一步调用，而不是内联在这里，理由只有一个：
+      # 脚本本机也能原样复跑，**推 tag 之前就能先看清正文长什么样**（本机 PowerShell
+      # 沙箱起不来，内联的 PS 没法本地验证）。
+      #
+      # ★ CHANGELOG.md 里找不到本 tag 对应的小节时，这一步会**失败**（脚本退出码 2）：
+      #   宁可发不出去，也不要静默发一个没有更新内容的 Release。
+      #   打 tag 之前先在 CHANGELOG.md 顶部补一节 `## [x.y.z] - <日期>`，提交后再打 tag。
+      - name: 生成 Release 正文
+        run: >-
+          python .github/scripts/make_release_notes.py
+          --version "${{ github.ref_name }}"
+          --repo "${{ github.repository }}"
+          --out dist/release-notes.md
+
       - name: 发布到 Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.zip
             dist/*.zip.sha256
+          # 正文取自上一步生成的文件。generate_release_notes 会把
+          # 「Full Changelog」比对链接追加在正文后面，两者不冲突。
+          body_path: dist/release-notes.md
           generate_release_notes: true
-          body: |
-            ## 下载
-
-            解压 `wrepl-*-x64-windows.zip`，里面是两个免安装的可执行文件：
-
-            | 文件 | 用途 |
-            |---|---|
-            | `wrepl.exe` | 命令行 |
-            | `wrepl-gui.exe` | 图形界面，双击即用 |
-
-            自带运行时，**不需要额外装 DLL，也不需要装 Word / Office**。
-            包内附 `README.md`、`LICENSE`，以及同目录的 `.sha256` 校验值。

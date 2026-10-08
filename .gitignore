@@ -11,6 +11,9 @@
 /.cargo/config.toml
 /rust-toolchain.toml
 
+# ── 发版中间产物（release.yml 里生成 Release 正文/打包用，不入库）──
+/dist/
+
 # ── 调试残留 ─────────────────────────────────────────────────────
 *.log
 *.tmp
