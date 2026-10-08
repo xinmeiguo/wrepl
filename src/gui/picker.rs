@@ -20,7 +20,7 @@
 //!    就是点一下假死一次（见 [`Picker::poll`]）。
 //! 2. **盘符 / 快捷位要缓存**。枚举盘符要调好几个 Win32 API，
 //!    每帧都做纯属浪费（见 [`Picker::refresh_places`]）。
-//! 3. **系统对话框不删**。右下角留了一个不显眼的「⋯」入口兜底
+//! 3. **系统对话框不删**。右下角留了一个不显眼的「...」入口兜底
 //!    （[`Outcome::Fallback`]），遇到自绘面板搞不定的场合能原地退回去。
 
 use std::collections::BTreeSet;
@@ -49,7 +49,7 @@ pub enum Mode {
 pub enum Outcome {
     /// 选好了。`Folder` / `Save` 一定是 1 个路径，`Files` 是 N 个。
     Picked(Vec<PathBuf>),
-    /// 用户点了右下角的「⋯」——调用方改用 `rfd` 原生对话框。
+    /// 用户点了右下角的「...」——调用方改用 `rfd` 原生对话框。
     Fallback,
     /// 用户取消（Esc / 取消按钮）。
     Cancelled,
