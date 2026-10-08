@@ -12,7 +12,9 @@ use std::path::PathBuf;
     version,
     about = "Word 批量替换工具（.docx 批量查找替换，原有格式保持不变）",
     long_about = "按规则批量替换 .docx 中的文本。未命中的内容原样保留，\
-                  不重新排版、不重建文档；执行后可选自动验证格式未被动过。"
+                  不重新排版、不重建文档；执行后可选自动验证格式未被动过。\n\
+                  \n\
+                  想用图形界面？双击同一文件夹里的 wrepl-gui.exe —— 与本工具共用同一套内核。"
 )]
 pub struct Cli {
     #[command(subcommand)]

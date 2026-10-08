@@ -12,6 +12,9 @@ on:
   push:
     tags:
       - 'v*'
+  # 手动触发：只编译 + 打包，把产物挂成 Actions artifact，**不发 Release**。
+  # 改了编译参数（例如静态链接 CRT）时可以先用它把产物验一遍，再决定打不打 tag。
+  workflow_dispatch:
 
 # softprops/action-gh-release 要写 Release，必须给 contents: write
 permissions:
@@ -20,8 +23,9 @@ permissions:
 jobs:
   build:
     name: 编译并发布 Windows 版
-    # windows-latest 自带 Visual Studio / MSVC，编出来的是自带运行时的独立 exe，
-    # 不像本机 GNU 工具链那样依赖 libgcc_s_seh-1.dll / libwinpthread-1.dll。
+    # windows-latest 自带 Visual Studio / MSVC。注意：MSVC 目标**默认动态**链接 CRT，
+    # 所以「自带运行时」这句话要靠下面那步的 +crt-static 才成立
+    #（本机 GNU 工具链是另一套依赖：libgcc_s_seh-1.dll / libwinpthread-1.dll）。
     runs-on: windows-latest
 
     steps:
@@ -38,19 +42,41 @@ jobs:
 
       - name: 编译命令行 + 图形界面
         # --locked 保证用的是仓库里那份 Cargo.lock，不会偷偷升级依赖
-        run: cargo build --release --locked --features gui
+        #
+        # ★★ 静态链接 CRT（2026-10-08 加）：MSVC 目标默认**动态**依赖 VCRUNTIME140.dll，
+        #    用户机器上没装 Visual C++ 2015-2022 Redistributable 时，双击就报
+        #    「找不到 VCRUNTIME140.dll」—— "免安装、不需要额外装 DLL" 的承诺当场破功。
+        #    +crt-static 之后产物才真的自带运行时（验证方法：解析 PE 导入表，
+        #    看 VCRUNTIME140.dll 是否消失，见 D:/test/pe_imports.py）。
+        # ★  同时必须显式给 --target：否则 RUSTFLAGS 会一并作用到 build script 与
+        #    proc-macro 的编译上，官方文档明确建议指定 target 来规避这一点。
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --features gui --target x86_64-pc-windows-msvc
+
+      - name: 校验产物不依赖 VC++ 运行库
+        # 上面那个 +crt-static 到底生效没有 —— 不看开发机装没装运行库，只解析 PE 导入表。
+        # ★ 这一步是「用户双击报缺 VCRUNTIME140.dll」那类问题的根治：
+        #   开发机早就装过 VC++ Redistributable，所以那个不一致在本机永远看不出来，
+        #   只有把断言放进 CI，编译参数退化才会当场变红（脚本头注释有完整来龙去脉）。
+        run: >-
+          python .github/scripts/check_pe_imports.py
+          target/x86_64-pc-windows-msvc/release/wrepl.exe
+          target/x86_64-pc-windows-msvc/release/wrepl-gui.exe
 
       - name: 打包（zip + SHA256）
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ver   = "${{ github.ref_name }}"
+          # 手动触发时 ref_name 是分支名，可能带 /（会让 zip 路径出错）→ 换成 -
+          $ver   = "${{ github.ref_name }}" -replace '/', '-'
           $name  = "wrepl-$ver-x64-windows"
           $stage = "dist/$name"
 
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target/release/wrepl.exe     "$stage/"
-          Copy-Item target/release/wrepl-gui.exe "$stage/"
+          # ★ 路径注意：显式给了 --target 之后，产物落在 target/<triple>/release/ 下
+          Copy-Item target/x86_64-pc-windows-msvc/release/wrepl.exe     "$stage/"
+          Copy-Item target/x86_64-pc-windows-msvc/release/wrepl-gui.exe "$stage/"
           Copy-Item README.md                    "$stage/"
           Copy-Item LICENSE                      "$stage/"
           Copy-Item CHANGELOG.md                 "$stage/"
@@ -75,6 +101,8 @@ jobs:
       #   打 tag 之前先在 CHANGELOG.md 顶部补一节 `## [x.y.z] - <日期>`，标题下面紧跟
       #   `> - 新增：……` 这样的引用行，提交后再打 tag。
       - name: 生成 Release 正文
+        # 手动触发（非 tag）时没有对应版本小节，跳过 —— 这一步只在发版时跑
+        if: github.ref_type == 'tag'
         run: >-
           python .github/scripts/make_release_notes.py
           --version "${{ github.ref_name }}"
@@ -82,6 +110,7 @@ jobs:
           --out dist/release-notes.md
 
       - name: 发布到 Release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -91,3 +120,14 @@ jobs:
           # 「Full Changelog」比对链接追加在正文后面，两者不冲突。
           body_path: dist/release-notes.md
           generate_release_notes: true
+
+      # 手动触发时不留 Release，把产物挂成 artifact 供下载检查（验编译参数用）
+      - name: 非 tag 时把产物挂成 artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrepl-x64-windows
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          retention-days: 7

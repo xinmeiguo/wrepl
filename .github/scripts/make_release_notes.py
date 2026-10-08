@@ -37,12 +37,12 @@ from pathlib import Path
 
 DOWNLOAD_BLOCK = """## 下载
 
-解压 `wrepl-*-x64-windows.zip`，里面是两个免安装的可执行文件：
+解压 `wrepl-*-x64-windows.zip`，里面有两个免安装的可执行文件：
 
-| 文件 | 用途 |
+| 文件 | 怎么用 |
 |---|---|
-| `wrepl.exe` | 命令行 |
-| `wrepl-gui.exe` | 图形界面，双击即用 |
+| **`wrepl-gui.exe`** | **图形界面 —— 双击这个** |
+| `wrepl.exe` | 命令行版，在 cmd / PowerShell 里运行（双击它只会一闪而过） |
 
 自带运行时，**不需要额外装 DLL，也不需要装 Word / Office**。
 包内附 `README.md`、`LICENSE`、`CHANGELOG.md`，以及同目录的 `.sha256` 校验值。"""

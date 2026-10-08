@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,44 @@ fn main() {
     }
 }
 
+/// 零参数运行时的提示 —— 主要服务于「在资源管理器里双击了 exe」的人。
+///
+/// 为什么要有它：命令行版双击后的行为本来就是「打印用法 → 退出」，
+/// 但那个控制台窗口会**一闪就关**，用户根本来不及看清任何字，
+/// 只留下「黑框闪退 = 这软件坏了」的印象。
+///
+/// 这里换成一段人话，并（只在连着终端时）等一个回车。
+/// 只在**零参数**这一种情况下触发 —— 脚本化调用一定带参数，不受影响。
+fn show_double_click_help() -> ! {
+    println!(
+        "\
+wrepl —— Word 批量替换工具（命令行版）
+
+你刚才运行的是「命令行版」，它不会自己弹出界面；
+黑框一闪而过是正常的，不是出错。
+
+  ▸ 想用图形界面：双击同一文件夹里的  wrepl-gui.exe
+  ▸ 想用命令行  ：在 cmd / PowerShell 里运行  wrepl.exe --help
+
+详细说明见同目录的 README.md。"
+    );
+
+    // 双击时 stdin 连着刚分配的控制台 → 停住等用户读完；
+    // 被重定向（脚本里调用）时 is_terminal() 为假 → 直接返回，不会挂住。
+    if std::io::stdin().is_terminal() {
+        println!("\n按回车键关闭本窗口…");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+    std::process::exit(2);
+}
+
 fn run() -> Result<()> {
+    // ★ 零参数：先给双击的人一段看得懂的提示，别让它一闪而过（见函数注释）。
+    if std::env::args_os().len() == 1 {
+        show_double_click_help();
+    }
+
     match Cli::parse().cmd {
         Cmd::Inspect { file } => cmd_inspect(&file),
         Cmd::Passthrough { input, output } => cmd_passthrough(&input, &output),
