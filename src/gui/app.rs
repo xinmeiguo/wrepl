@@ -58,10 +58,34 @@ use wrepl::pipeline::{self, Options, RunResult};
 use wrepl::rules::{self, Rule, Scope};
 use wrepl::{naming, report};
 
+use crate::picker::{Mode, Outcome, Picker};
+
 const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
 const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
 const ERR_C: Color32 = Color32::from_rgb(0xC0, 0x2B, 0x1D);
 const DIM_C: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
+
+/// 界面上的六个「选路径」入口。
+///
+/// 自绘面板是**同一个**（[`Picker`]），靠这个枚举记住"这一趟是替谁选的" ——
+/// 面板只负责把路径拿回来，填到哪个字段由这里决定。
+///
+/// 也用于「⋯ → 系统对话框」兜底：走 `rfd` 时按同一套分派。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PickFor {
+    /// 「输入」行的「选目录…」
+    InputDir,
+    /// 「输入」行的「选文件…」（可多选 .docx）
+    InputFiles,
+    /// 「输出」行的「选目录…」
+    OutputDir,
+    /// 规则区「从文本导入」
+    ImportTxt,
+    /// 规则区「从 Excel 导入」
+    ImportXlsx,
+    /// 规则区「导出到 Excel」
+    ExportXlsx,
+}
 
 /// 界面里的一行规则。
 ///
@@ -278,6 +302,17 @@ pub struct App {
     /// 本次执行的日志在 `log` 里的起点——落盘的「运行日志.txt」只取这一段，
     /// 不把开窗提示和上一次执行也捎进去。
     run_log_from: usize,
+
+    // ── 自绘文件选择器 ──
+    /// 自绘「选文件 / 选目录 / 另存为」面板。**常驻**——跨次打开记得上次停在哪儿，
+    /// 盘符表也不用每开一次重建。
+    ///
+    /// 不用系统对话框的原因见 `picker` 模块头：本机的企业管控套件会给
+    /// **每个新建的 OS 窗口**记一笔 0.8~2 秒的账，而系统文件对话框内部要建十几个。
+    /// 系统对话框没删干净——面板右下角「⋯」就是退回它的入口（[`PickFor`] 那套分派）。
+    picker: Picker,
+    /// 面板正在替哪个入口选（`None` = 面板没开）。
+    picker_for: Option<PickFor>,
 }
 
 impl Default for App {
@@ -327,6 +362,8 @@ impl App {
             confirm_inplace: false,
             inplace_confirmed: false,
             run_log_from: 0,
+            picker: Picker::new(),
+            picker_for: None,
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
         app
@@ -1213,6 +1250,10 @@ impl App {
 
         // 就地覆盖确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
         self.confirm_inplace_dialog(ctx);
+
+        // 自绘文件选择器比确认框还要靠前（`Foreground` 面板 + 全屏遮罩），
+        // 所以放在最后。它自带遮罩，两者不会同时被点到。
+        self.handle_picker(ctx);
     }
 
     /// 「就地覆盖」确认框。
@@ -1399,30 +1440,16 @@ impl App {
                 );
             });
 
-            // 对话框动作放在布局之后执行：避免在借用 self 的闭包里嵌套借用
+            // 选路径的动作放在布局之后执行：避免在借用 self 的闭包里嵌套借用。
+            // 三个入口都走**同一个自绘面板**，靠 `PickFor` 区分结果落到哪个字段。
             if pick_in_dir {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.input = p.display().to_string();
-                }
+                self.open_picker(PickFor::InputDir);
             }
             if pick_in_file {
-                // 多选：选中几个就是几个，一行写一个。
-                // 单选时结果与从前一样是一行，行为不变。
-                if let Some(ps) = rfd::FileDialog::new()
-                    .add_filter("Word 文档", &["docx"])
-                    .pick_files()
-                {
-                    self.input = ps
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                }
+                self.open_picker(PickFor::InputFiles);
             }
             if pick_out_dir {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.output = p.display().to_string();
-                }
+                self.open_picker(PickFor::OutputDir);
             }
             if use_sibling_out {
                 // 与「输出到子文件夹」留空时的默认落点同一条路（见 input_dir）
@@ -1713,67 +1740,209 @@ impl App {
             }
         });
 
-        // 文件对话框要借 &mut self，只能放在上面的闭包之外执行
+        // 选文件要借 &mut self，只能放在上面的闭包之外执行。
+        // 三个入口同样走自绘面板，导入/导出的**实际处理**在下面的三个 `do_*` 里，
+        // 面板与「⋯ 系统对话框」两条路共用同一份逻辑。
         if import_txt {
-            if let Some(p) = rfd::FileDialog::new()
-                .add_filter("文本规则文件", &["txt"])
-                .pick_file()
-            {
-                let s = p.display().to_string();
-                // load_rules_file 是**追加**语义（`--preset` 要它这样）；
-                // 按钮这里要的是"整表替换"，所以先取走原表，解析失败再还回去——
-                // 一次读文件失败不该把界面上已经填好的规则清空。
-                let kept = std::mem::take(&mut self.rows);
-                match self.load_rules_file(&s) {
-                    Ok(n) => {
-                        if !kept.is_empty() {
-                            self.push_log(format!(
-                                "原有 {} 条规则已清空，整表来自文本文件",
-                                kept.len()
-                            ));
-                        }
-                        self.push_log(format!("已从文本规则文件载入 {n} 条：{s}"));
-                        self.toast = Some((format!("已从文本文件导入 {n} 条规则"), true));
-                    }
-                    Err(e) => {
-                        self.rows = kept;
-                        self.error = Some(e);
-                    }
-                }
-            }
+            self.open_picker(PickFor::ImportTxt);
         }
         if import_xlsx {
-            if let Some(p) = rfd::FileDialog::new()
-                .add_filter("Excel 规则表", &["xlsx"])
-                .pick_file()
-            {
+            self.open_picker(PickFor::ImportXlsx);
+        }
+        if export_xlsx {
+            self.open_picker(PickFor::ExportXlsx);
+        }
+    }
+
+    // ─────────────────── 选路径：自绘面板 + 系统对话框兜底 ───────────────────
+
+    /// 打开自绘面板，替 `what` 这个入口选路径。
+    fn open_picker(&mut self, what: PickFor) {
+        // 起点目录：能猜一个合理的就猜，猜不出就交给面板用它自己记住的上次目录
+        // （`PathBuf::new()` = 空 → 面板回退到 `last_dir`）。
+        let in_first = first_path(&self.input);
+        let out_dir = {
+            let t = self.output.trim();
+            if t.is_empty() {
+                PathBuf::new()
+            } else {
+                PathBuf::from(t)
+            }
+        };
+
+        let (mode, title, start, exts, default_name): (Mode, &str, PathBuf, Vec<&str>, String) =
+            match what {
+                PickFor::InputDir => (Mode::Folder, "选择输入目录", in_first, vec![], String::new()),
+                PickFor::InputFiles => (
+                    Mode::Files,
+                    "选择输入文件（可多选）",
+                    in_first,
+                    vec!["docx"],
+                    String::new(),
+                ),
+                PickFor::OutputDir => {
+                    (Mode::Folder, "选择输出目录", out_dir, vec![], String::new())
+                }
+                PickFor::ImportTxt => (
+                    Mode::Files,
+                    "导入文本规则文件",
+                    PathBuf::new(),
+                    vec!["txt"],
+                    String::new(),
+                ),
+                PickFor::ImportXlsx => (
+                    Mode::Files,
+                    "导入 Excel 规则表",
+                    PathBuf::new(),
+                    vec!["xlsx"],
+                    String::new(),
+                ),
+                PickFor::ExportXlsx => (
+                    Mode::Save,
+                    "导出规则表到 Excel",
+                    PathBuf::new(),
+                    vec!["xlsx"],
+                    "规则.xlsx".to_string(),
+                ),
+            };
+
+        self.picker_for = Some(what);
+        self.picker
+            .open(mode, title, start, &exts, &default_name);
+    }
+
+    /// 每帧收一次面板结果。面板没开、或还没选完，什么都不做。
+    fn handle_picker(&mut self, ctx: &egui::Context) {
+        let Some(outcome) = self.picker.show(ctx) else {
+            return;
+        };
+        // 结果一定是刚才那个入口引起的；拿走 `picker_for` 就是"这一趟结了"。
+        let Some(what) = self.picker_for.take() else {
+            return;
+        };
+        match outcome {
+            Outcome::Cancelled => {}
+            // 「⋯」：自绘面板搞不定（比如要连一个没映射的网络位置），退回系统对话框。
+            Outcome::Fallback => self.fallback_dialog(what),
+            Outcome::Picked(paths) => self.apply_picked(what, paths),
+        }
+    }
+
+    /// 面板选好了 → 填到对应字段。
+    fn apply_picked(&mut self, what: PickFor, paths: Vec<PathBuf>) {
+        match what {
+            PickFor::InputDir | PickFor::OutputDir => {
+                let Some(p) = paths.into_iter().next() else {
+                    return;
+                };
                 let s = p.display().to_string();
-                match self.load_rules_xlsx(&s) {
-                    Ok((n, sheet)) => {
-                        self.push_log(format!(
-                            "已从 Excel 载入规则表（{n} 条，工作表「{sheet}」）：{s}"
-                        ));
-                        self.toast = Some((format!("已从 Excel 导入 {n} 条规则"), true));
-                    }
-                    Err(e) => self.error = Some(e),
+                if what == PickFor::InputDir {
+                    self.input = s;
+                } else {
+                    self.output = s;
+                }
+            }
+            PickFor::InputFiles => {
+                // 选中几个就是几个，一行写一个（和从前一样）
+                self.input = paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            PickFor::ImportTxt => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.do_import_txt(p.display().to_string());
+                }
+            }
+            PickFor::ImportXlsx => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.do_import_xlsx(p.display().to_string());
+                }
+            }
+            PickFor::ExportXlsx => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.do_export_xlsx(p.display().to_string());
                 }
             }
         }
-        if export_xlsx {
-            if let Some(p) = rfd::FileDialog::new()
+    }
+
+    /// 兜底：用系统原生对话框重来一遍（面板右下角「⋯」）。
+    ///
+    /// 逻辑与自绘面板**完全一致**，只是换了个选路径的壳 —— 结果都汇到
+    /// [`App::apply_picked`] 同一处，不会因为走了哪条路而产生行为差异。
+    fn fallback_dialog(&mut self, what: PickFor) {
+        let picked: Option<Vec<PathBuf>> = match what {
+            PickFor::InputDir | PickFor::OutputDir => {
+                rfd::FileDialog::new().pick_folder().map(|p| vec![p])
+            }
+            PickFor::InputFiles => rfd::FileDialog::new()
+                .add_filter("Word 文档", &["docx"])
+                .pick_files(),
+            PickFor::ImportTxt => rfd::FileDialog::new()
+                .add_filter("文本规则文件", &["txt"])
+                .pick_file()
+                .map(|p| vec![p]),
+            PickFor::ImportXlsx => rfd::FileDialog::new()
+                .add_filter("Excel 规则表", &["xlsx"])
+                .pick_file()
+                .map(|p| vec![p]),
+            PickFor::ExportXlsx => rfd::FileDialog::new()
                 .add_filter("Excel 规则表", &["xlsx"])
                 .set_file_name("规则.xlsx")
                 .save_file()
-            {
-                let s = p.display().to_string();
-                match self.export_rules_xlsx(&s) {
-                    Ok(n) => {
-                        self.push_log(format!("已导出 {n} 条规则到：{s}"));
-                        self.toast = Some((format!("已导出 {n} 条规则"), true));
-                    }
-                    Err(e) => self.error = Some(e),
+                .map(|p| vec![p]),
+        };
+        if let Some(paths) = picked {
+            self.apply_picked(what, paths);
+        }
+    }
+
+    /// 从文本规则文件导入（**整表替换**语义）。
+    ///
+    /// `load_rules_file` 是**追加**语义（`--preset` 要它这样）；按钮这里要的是
+    /// "整表替换"，所以先取走原表，解析失败再还回去——一次读文件失败不该把
+    /// 界面上已经填好的规则清空。
+    fn do_import_txt(&mut self, s: String) {
+        let kept = std::mem::take(&mut self.rows);
+        match self.load_rules_file(&s) {
+            Ok(n) => {
+                if !kept.is_empty() {
+                    self.push_log(format!(
+                        "原有 {} 条规则已清空，整表来自文本文件",
+                        kept.len()
+                    ));
                 }
+                self.push_log(format!("已从文本规则文件载入 {n} 条：{s}"));
+                self.toast = Some((format!("已从文本文件导入 {n} 条规则"), true));
             }
+            Err(e) => {
+                self.rows = kept;
+                self.error = Some(e);
+            }
+        }
+    }
+
+    fn do_import_xlsx(&mut self, s: String) {
+        match self.load_rules_xlsx(&s) {
+            Ok((n, sheet)) => {
+                self.push_log(format!(
+                    "已从 Excel 载入规则表（{n} 条，工作表「{sheet}」）：{s}"
+                ));
+                self.toast = Some((format!("已从 Excel 导入 {n} 条规则"), true));
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn do_export_xlsx(&mut self, s: String) {
+        match self.export_rules_xlsx(&s) {
+            Ok(n) => {
+                self.push_log(format!("已导出 {n} 条规则到：{s}"));
+                self.toast = Some((format!("已导出 {n} 条规则"), true));
+            }
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -1931,6 +2100,19 @@ fn short_name(p: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string()
+}
+
+/// 「输入」那一栏文本里的**第一个**路径。
+///
+/// 那一栏可能是一行一个的多个路径、也可能用 `;` / `；` 隔开（见 [`App::input_paths`]）。
+/// 打开选择器时拿它当起点，人就不用从 `C:\` 一层层点回去。取不出就返回空，
+/// 面板会回退到自己记住的上次目录。
+fn first_path(s: &str) -> PathBuf {
+    s.split(['\n', '\r', ';', '；'])
+        .map(str::trim)
+        .find(|x| !x.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 /// 明/暗主题。

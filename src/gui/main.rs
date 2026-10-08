@@ -30,6 +30,7 @@
 //! 一律走写副本，这样自动化路径不可能因为默认值的变化去改源样本。
 
 mod app;
+mod picker;
 
 use eframe::egui;
 
