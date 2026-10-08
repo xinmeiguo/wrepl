@@ -63,15 +63,17 @@ jobs:
           Write-Host "打好了："
           Get-ChildItem dist | Select-Object Name, Length
 
-      # Release 正文 = 本版更新内容（从 CHANGELOG.md 抽对应小节） + 下载说明。
+      # Release 正文 = 本版**重点**（CHANGELOG.md 里该小节开头的引用行） + 下载说明。
+      # 明细留在 CHANGELOG.md 里，正文只留一个链接过去 —— Release 页面保持一屏读得完。
       #
       # 抽取逻辑放在仓库里的脚本、由这一步调用，而不是内联在这里，理由只有一个：
       # 脚本本机也能原样复跑，**推 tag 之前就能先看清正文长什么样**（本机 PowerShell
       # 沙箱起不来，内联的 PS 没法本地验证）。
       #
-      # ★ CHANGELOG.md 里找不到本 tag 对应的小节时，这一步会**失败**（脚本退出码 2）：
-      #   宁可发不出去，也不要静默发一个没有更新内容的 Release。
-      #   打 tag 之前先在 CHANGELOG.md 顶部补一节 `## [x.y.z] - <日期>`，提交后再打 tag。
+      # ★ 找不到本 tag 的小节、或该小节里没有引用行摘要块，这一步会**失败**（脚本退出码 2）：
+      #   宁可发不出去，也不要静默发一个没有更新内容、或正文长得没法看的 Release。
+      #   打 tag 之前先在 CHANGELOG.md 顶部补一节 `## [x.y.z] - <日期>`，标题下面紧跟
+      #   `> - 新增：……` 这样的引用行，提交后再打 tag。
       - name: 生成 Release 正文
         run: >-
           python .github/scripts/make_release_notes.py
