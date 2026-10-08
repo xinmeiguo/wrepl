@@ -33,6 +33,16 @@ import struct
 import sys
 from pathlib import Path
 
+# ★ Windows 的 GitHub runner 上，Python 的 stdout 默认是 cp1252（不是 UTF-8），
+#   打印中文会直接 UnicodeEncodeError 崩掉。2026-10-08 这个脚本第一次在 CI 上跑
+#   就死在这里，而报错现场长得像"断言没通过"，极容易误判成 +crt-static 没生效。
+#   显式切 UTF-8，让本机与 CI 的行为一致。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001  老 Python 或非 TextIOWrapper
+        pass
+
 # ★ 这几个才是"要装 Redistributable，否则起不来"的
 VC_RUNTIME = {
     "vcruntime140.dll", "vcruntime140_1.dll", "vcruntime140d.dll",

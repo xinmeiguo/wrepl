@@ -35,6 +35,16 @@ import re
 import sys
 from pathlib import Path
 
+# ★ Windows 的 GitHub runner 上，Python 的 stdout 默认是 cp1252（不是 UTF-8），
+#   打印中文会直接 UnicodeEncodeError 崩掉。这个脚本末尾那句「已生成 …」带中文，
+#   在 CI 上会把发版步骤直接搞挂（2026-10-08 同批的 check_pe_imports.py 先踩到了）。
+#   显式切 UTF-8，让本机与 CI 的行为一致。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001  老 Python 或非 TextIOWrapper
+        pass
+
 DOWNLOAD_BLOCK = """## 下载
 
 解压 `wrepl-*-x64-windows.zip`，里面有两个免安装的可执行文件：
