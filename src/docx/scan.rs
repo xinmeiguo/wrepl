@@ -794,6 +794,27 @@ fn decode_entity(ent: &str) -> Option<char> {
     char::from_u32(cp)
 }
 
+/// XML 1.0 **不允许出现**的字符（写进文档会产出非法 XML）。
+///
+/// 判据取自 XML 1.0 的 `Char` 产生式：`#x9 | #xA | #xD | [#x20-#xD7FF] | …`。
+/// 也就是 0x00–0x08、0x0B、0x0C、0x0E–0x1F 全在禁止之列，外加两个非字符
+/// U+FFFE / U+FFFF。**制表、换行、回车是合法的**，不在这里面。
+///
+/// 这类字符可能从规则文件/Excel 单元格里混进来（从别处复制粘贴最容易带上）。
+/// 一旦原样写进 `<w:t>`，Word 打开时会报"发现不可读取的内容"，整份文档打不开——
+/// 所以必须在**写入**这一步挡掉，代价是静默丢弃（这类字符本来就没有可见含义）。
+fn is_xml_illegal(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0000}'..='\u{0008}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000E}'..='\u{001F}'
+            | '\u{FFFE}'
+            | '\u{FFFF}'
+    )
+}
+
 /// 把带 `&<>` 等字符的普通文本转成 XML 转义态（写入时用）。
 pub fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -802,6 +823,8 @@ pub fn escape_text(s: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            // XML 非法控制字符直接丢掉：留着会写出非法 XML，整份文档都读不开。
+            c if is_xml_illegal(c) => {}
             _ => out.push(ch),
         }
     }
@@ -818,4 +841,38 @@ pub fn display_visible(s: &str) -> String {
     s.replace('\t', "→")
         .replace('\n', "⏎")
         .replace('\u{00AD}', "·")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_text_escapes_xml_markup() {
+        assert_eq!(escape_text("a<b>&c"), "a&lt;b&gt;&amp;c");
+        assert_eq!(escape_text("原样保留"), "原样保留");
+    }
+
+    #[test]
+    fn escape_text_drops_xml_illegal_control_chars() {
+        // XML 1.0 禁止 0x00–0x08 / 0x0B / 0x0C / 0x0E–0x1F。这类字符多是从别处
+        // 复制粘贴带进规则表的；一旦原样写进 `<w:t>`，Word 打开会报"发现不可读取的
+        // 内容"，整份文档打不开——所以必须在写入这一步丢掉。
+        assert_eq!(
+            escape_text("a\u{0}b\u{1}c\u{8}d\u{b}e\u{c}f\u{e}g\u{1f}h"),
+            "abcdefgh"
+        );
+        // 非字符 U+FFFE / U+FFFF 同样非法
+        assert_eq!(escape_text("x\u{FFFE}y\u{FFFF}z"), "xyz");
+    }
+
+    #[test]
+    fn escape_text_keeps_legal_whitespace() {
+        // 制表 / 换行 / 回车是 XML 合法字符，必须原样保留（丢了会改掉正文排版）
+        assert_eq!(escape_text("a\tb\nc\rd"), "a\tb\nc\rd");
+        assert!(is_xml_illegal('\u{0B}'));
+        assert!(!is_xml_illegal('\t'));
+        assert!(!is_xml_illegal(' '));
+        assert!(!is_xml_illegal('中'));
+    }
 }

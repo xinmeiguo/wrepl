@@ -63,6 +63,15 @@ pub struct Outcome {
     /// 凡是要判断"产物路径上有没有本次写出来的文件"，都要走
     /// [`Outcome::produced`]——只看 `status == "OK"` 会把镜像产物漏掉。
     pub mirrored: bool,
+    /// **本轮是否真的往磁盘上写过**（就地覆盖 / 写副本 / 完整镜像复制都算）。
+    ///
+    /// 这是 [`Outcome::produced`] 的**唯一**依据。"有没有落盘"必须与
+    /// [`Outcome::status`] 分开，因为二者并不等价：一个文件可能**一部分规则落了笔、
+    /// 另一部分命中区间重叠**，此时 `status = CONFLICT`（表达"存在冲突"），可文件
+    /// 确实被改写了。若拿 `status == "OK"` 当判据，这种真产物会被误判成"未产出"——
+    /// 于是不改名、跳过格式验证，报告备注还会写成"输出目录里已有同名旧文件，
+    /// 本次未覆盖"，与磁盘实际状态正好相反。
+    pub written: bool,
 }
 
 impl Outcome {
@@ -73,13 +82,15 @@ impl Outcome {
 
     /// 本次运行**真的写出了** `dst`。
     ///
-    /// - `OK`：按规则改写后落盘；
-    /// - [`Outcome::mirrored`]：未改动，但按「完整镜像」原样复制到了输出目录。
+    /// 判据是"本轮真的落过盘"（[`Outcome::written`]），不是"路径上碰巧有文件"——
+    /// 输出目录里可能躺着上一轮留下的同名旧文件，那不是本次产物，不该被改名、
+    /// 也不该被拿去验证。
     ///
-    /// 判据是"本轮真的落过盘"，不是"路径上碰巧有文件"——输出目录里可能躺着
-    /// 上一轮留下的同名旧文件，那不是本次产物，不该被改名、也不该被拿去验证。
+    /// 落地形式有三种，**都算**：按规则改写后落盘（`OK`）、部分规则落笔又部分冲突
+    /// （`CONFLICT`——文件确实被改写过，详见 [`Outcome::written`]）、以及完整镜像的
+    /// 原样复制（[`Outcome::mirrored`]）。
     pub fn produced(&self) -> bool {
-        self.status == "OK" || self.mirrored
+        self.written
     }
 
     fn errored(src: &Path, rules: &[Rule], msg: String) -> Self {
@@ -104,6 +115,7 @@ impl Outcome {
             rule_count: rules.iter().filter(|r| r.enabled).count(),
             verdict: None,
             mirrored: false,
+            written: false,
         }
     }
 }
@@ -575,6 +587,9 @@ pub fn process_one(
     let mut verdict: Option<verify::PairVerdict> = None;
     let mut snap_err: Option<String> = None;
     let mut mirrored = false;
+    // ★ "本轮真写过盘"的独立记账 —— `produced()` 只看它，不看 `status`。
+    // 这样"部分落笔 + 部分冲突"（`status = CONFLICT`）的产物不会被当成"未产出"。
+    let mut written = false;
 
     if !dry && !replaced.is_empty() {
         // ★★ **就地替换的验证基准只能在这里扣下来。**
@@ -623,6 +638,11 @@ pub fn process_one(
                 } else {
                     package::write_with_replacements(src, d, &replaced)?;
                 }
+                // ★ 写盘成功才置位。上面的 `?` 一旦提前返回就走不到这里
+                //（那种情况由 `Outcome::errored` 兜底，`written` 保持 false）。
+                // 注意：这一支不看 `conflicts`——"部分落笔 + 部分冲突"也是真写了盘，
+                // 该由 `written` 如实反映，而不是被 `status` 的冲突语义盖过去。
+                written = true;
                 sha_after = file_sha(d)?;
 
                 // 写完立刻比、比完就丢。
@@ -661,6 +681,7 @@ pub fn process_one(
             }
             std::fs::copy(src, d)
                 .with_context(|| format!("复制到输出目录失败：{}", d.display()))?;
+            written = true;
             sha_after = file_sha(d)?;
             mirrored = true;
             note = "未改动，已原样复制到输出目录（完整镜像）".into();
@@ -695,6 +716,7 @@ pub fn process_one(
         rule_count: rl.iter().filter(|r| r.enabled).count(),
         verdict,
         mirrored,
+        written,
     })
 }
 

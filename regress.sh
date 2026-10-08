@@ -864,6 +864,80 @@ else
   bad "--mirror 缺少 --out 却没被拒绝：退出码 $rc —— 见 $MI/bad.log"
 fi
 
+# ───────── 18. 产物判据（真写过盘）与 CLI 退出码 ─────────
+#
+# ① 一个文件里既有"能落笔的命中"、又有"区间冲突的命中"时，它**是被改写过**的：
+#    状态是 CONFLICT（如实表达"有冲突"），但内容确实落了盘。产物判据必须是
+#    "本轮真写过盘"，不能是 `status == "OK"` —— 否则这种真产物会被当成"未产出"：
+#    不改名、跳过格式验证，报告备注还会写成"输出目录里已有同名旧文件"（与实际相反）。
+# ② 一批跑完但有文件报错时退出码必须是 2；全通过时是 0。
+#    否则 `wrepl apply ... && echo ok` 这类链条在有失败时照样"成功"。
+head1 "18. 产物判据（真写过盘）与 CLI 退出码"
+
+PJ=$WORK/product-judge; mkdir -p "$PJ/out"
+cp "$SAMPLES/T-选项矩阵.docx" "$PJ/T-选项矩阵.docx"
+# abc / bc 全部重叠（5+5=10 处冲突）；saddow 单独命中 1 处（能落笔）；
+# 选项→选择 只作用到文件名（样本正文里没有"选项"）。
+"$WREPL" apply "$PJ/T-选项矩阵.docx" \
+  --rule "abc=>X" --rule "bc=>Y" --rule "saddow=>S" --rule "选项=>选择" \
+  --out "$PJ/out" --rename-files --verify-after --report "$PJ/报告.xlsx" \
+  > "$PJ/run.log" 2>&1
+
+# ① 前提必须是"部分落笔 + 部分冲突"，否则后面两条等于空测
+pj_cnt=$(grep -oE "文件 [0-9]+ ｜ 命中 [0-9]+ ｜ 已替换 [0-9]+ ｜ 冲突 [0-9]+" "$PJ/run.log" | head -1)
+if [ "$pj_cnt" = "文件 1 ｜ 命中 11 ｜ 已替换 1 ｜ 冲突 10" ] \
+   && grep -q "状态：CONFLICT" "$PJ/run.log"; then
+  ok "前提成立：$pj_cnt（状态 CONFLICT，但文件确实被改写过）"
+else
+  bad "前提不成立：$pj_cnt —— 见 $PJ/run.log"
+fi
+
+# ② 产物必须被认成"真产出"：改名落盘 + 验证结论不误判
+pj_files=$(ls "$PJ"/out/*.docx 2>/dev/null | wc -l)
+PJ_OUT=$("$PY" - "$PJ/报告.xlsx" <<'PYEOF'
+import sys, openpyxl
+rows = list(openpyxl.load_workbook(sys.argv[1])["验证结论"].iter_rows(values_only=True))[1:]
+print("ROWS=%d NOTPROD=%d STALE=%d L1BAD=%d L2BAD=%d" % (
+    len(rows),
+    sum(1 for r in rows if "未产出" in str(r[4] or "")),
+    sum(1 for r in rows if "已有同名旧文件" in str(r[4] or "")),
+    sum(1 for r in rows if r[1] != "通过"),
+    sum(1 for r in rows if r[2] != "通过"),
+))
+PYEOF
+)
+if [ "$pj_files" = "1" ] && [ -f "$PJ/out/T-选择矩阵.docx" ] \
+   && [ ! -f "$PJ/out/T-选项矩阵.docx" ] \
+   && [ "$PJ_OUT" = "ROWS=1 NOTPROD=0 STALE=0 L1BAD=0 L2BAD=0" ]; then
+  ok "冲突文件仍算产出：产物已改名（T-选择矩阵.docx），验证结论未误判"
+else
+  bad "产物判据不对：输出 $pj_files 个 / $PJ_OUT —— 见 $PJ/run.log"
+fi
+
+# ③ 干净一批（有改动、无冲突、无残留）退出码必须是 0
+PJC=$WORK/product-judge-clean; mkdir -p "$PJC/out"
+cp "$SAMPLES/T-选项矩阵.docx" "$PJC/x.docx"
+"$WREPL" apply "$PJC/x.docx" --rule "saddow=>S" --out "$PJC/out" --verify-after \
+  > "$PJC/run.log" 2>&1
+clean_rc=$?
+if [ "$clean_rc" = "0" ] && grep -q "自动验证：1 个文件　通过 1 / 不通过 0" "$PJC/run.log"; then
+  ok "全部通过时退出码 0"
+else
+  bad "全部通过时退出码不是 0（实际 $clean_rc）—— 见 $PJC/run.log"
+fi
+
+# ④ 有文件处理失败时退出码必须是 2（损坏的 docx 真值触发 ERROR）
+PJB=$WORK/product-judge-broken; mkdir -p "$PJB/out"
+cp "$SAMPLES/T-选项矩阵.docx" "$PJB/ok.docx"
+printf 'this is not a zip file' > "$PJB/broken.docx"
+"$WREPL" apply "$PJB" --rule "saddow=>S" --out "$PJB/out" > "$PJB/run.log" 2>&1
+brk_rc=$?
+if [ "$brk_rc" = "2" ] && grep -q "状态：ERROR" "$PJB/run.log"; then
+  ok "有文件报错时退出码 2（实际 $brk_rc）"
+else
+  bad "有文件报错时退出码应为 2，实际 $brk_rc —— 见 $PJB/run.log"
+fi
+
 # ───────────────────── 汇总 ─────────────────────
 printf '\n\033[1m══════════ 汇总：通过 %d ／ 失败 %d ══════════\033[0m\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then

@@ -183,6 +183,7 @@ fn cmd_scan(t: &Targets, rs: &RuleSource) -> Result<()> {
 ///
 /// 实质动作（找文件 / 改写 / 改名 / 验证）全在 [`pipeline`] 里，
 /// 这里只做**参数映射**和**结果打印**——GUI 走的是同一条路。
+/// 跑完但存在失败项时以**退出码 2** 结束，见 [`exit_for_failures`]。
 #[allow(clippy::too_many_arguments)]
 fn cmd_apply(
     t: &Targets,
@@ -309,6 +310,7 @@ fn cmd_apply(
     }
 
     let Some(rp) = report_path else {
+        exit_for_failures(&res);
         return Ok(());
     };
 
@@ -520,7 +522,28 @@ fn cmd_apply(
     )?;
     println!("\n报告已写出：{}", rp.display());
 
+    exit_for_failures(&res);
     Ok(())
+}
+
+/// 一批跑完了，但有文件报错或验证不通过时，用**退出码 2** 结束。
+///
+/// 为什么要有它：`cmd_apply` 以前无论结果如何都返回 `Ok(())`，退出码恒为 0。
+/// 于是 `wrepl apply ... && echo 成功了` 这种链式调用，哪怕有文件处理失败、
+/// 有产物验证不合格，也照样打印"成功了"——自动化脚本据此判断会全盘误判。
+///
+/// 码值约定与 `wrepl verify` 一致：**2 = 跑完了但结论是失败**（1 留给"根本没跑起来"
+/// 的硬错误，见 `main`）。这样调用方既能区分"命令用错了"与"跑完了但有问题"，
+/// 又能用最简单的 `if ! wrepl apply ...; then` 拦住。
+fn exit_for_failures(res: &pipeline::RunResult) {
+    let failed = res.failed();
+    let verify_bad = res.verify_bad();
+    if failed > 0 || verify_bad > 0 {
+        println!(
+            "\n退出码 2：{failed} 个文件处理失败、{verify_bad} 个产物验证不通过"
+        );
+        std::process::exit(2);
+    }
 }
 
 fn short(s: &str) -> String {

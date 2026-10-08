@@ -295,7 +295,7 @@ pub fn write_xlsx(
                 Cell::text("（本次未开启文件名同步改名）"),
                 Cell::text(""),
                 Cell::text("否"),
-                Cell::text("如需文件名同步改动：命令行加 --rename-files，界面勾选「同步修改文件名」"),
+                Cell::text("如需文件名同步改动：命令行加 --rename-files，界面勾选「同步替换文件名」"),
             ]]
             .into_iter(),
             &[7.0, 46.0, 46.0, 10.0, 48.0],

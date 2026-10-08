@@ -11,10 +11,12 @@
 //!
 //! 任何"顺手在这里算一下"的念头都要压住——那正是两个前端行为漂移的起点。
 //!
-//! ## 关于"同步修改文件名"的默认值
+//! ## 关于"同步替换文件名"的默认值
 //!
-//! **默认不勾**。改名会动交付物文件名，属于容易被忽略的副作用；
-//! 需要时由人显式勾上，勾了之后报告里会多出「文件名对照」表。
+//! **默认勾上**（2026-10-08 起）。同一套规则也作用到文件名上是这套工具的常规用法，
+//! 勾了之后报告里会多出「文件名对照」表。
+//! 唯一的例外是 `--preset` / `--selftest` 预置模式（见 [`Preset::rename`]）：
+//! 它直接拿测试语料开跑，改名会动到语料文件名，所以那条路仍默认不勾。
 //!
 //! ## 关于执行方式
 //!
@@ -158,8 +160,10 @@ pub struct Preset {
     pub input: String,
     pub output: String,
     pub rules_file: Option<String>,
-    /// 是否预先勾上「同步修改文件名」。默认 **false**——与界面默认值一致，
-    /// 改名必须由人显式要求，哪怕在预置模式下也不替人做决定。
+    /// 是否预先勾上「同步替换文件名」。
+    ///
+    /// 默认 **false**，与界面默认值（**勾上**）不同：预置模式拿现成语料直接开跑，
+    /// 改名会连语料文件名一起改掉。要演示 / 截图改名效果时显式加 `--rename`。
     pub rename: bool,
     /// 是否按「就地替换源文件」开窗。
     ///
@@ -230,10 +234,11 @@ pub struct App {
     xlsx_cols: rules::XlsxLayout,
 
     // 输出与校验
-    /// 「同步修改文件名」：勾上后同一套规则也作用到文件名上。
+    /// 「同步替换文件名」：勾上后同一套规则也作用到文件名上。**默认勾上**。
     ///
     /// 这是文件名维度的**唯一**开关——勾了才动文件名，不勾一律不动，
     /// 规则文件里「作用域」写没写「文件名」都不影响这个判断。
+    /// （`--preset` / `--selftest` 预置模式由 [`Preset::rename`] 覆盖，仍是不勾。）
     rename_files: bool,
     /// 就地替换时是否保留一份 `.docx.bak`（默认**不勾**：源目录不留多余文件）。
     ///
@@ -255,8 +260,21 @@ pub struct App {
     /// 改名预览的缓存：`(输入+规则指纹, 预览行)`。逐帧重算会一直扫目录，
     /// 目录一大界面就"拖拉"，所以只在输入或规则真的变了时才重算。
     rename_preview: Option<(String, Vec<(String, Color32)>)>,
+
     /// 正在跑的那一批（None = 空闲）
     job: Option<Job>,
+    /// 「就地覆盖」确认框是否打开。
+    ///
+    /// 就地替换把源文件**直接覆盖、不可撤销**，而界面上触发它只是**一个单击**，
+    /// 默认又不留备份——所以点「执行替换」后先弹这个确认，人点了头才真跑
+    /// （见 [`App::confirm_inplace_dialog`]）。写副本不动源文件，不走这道确认。
+    confirm_inplace: bool,
+    /// 「就地覆盖」本次已获确认的放行票。
+    ///
+    /// 就地覆盖的确认**统一兜在 `start_run` 入口**（而不是散在各按钮里），
+    /// 这样不管从哪个入口触发都拦得住。对话框点「确认替换」时把这张票置位，
+    /// `start_run` 见到它就放行一次并立刻作废——于是下一次执行仍会再问一遍。
+    inplace_confirmed: bool,
     /// 本次执行的日志在 `log` 里的起点——落盘的「运行日志.txt」只取这一段，
     /// 不把开窗提示和上一次执行也捎进去。
     run_log_from: usize,
@@ -289,8 +307,10 @@ impl App {
             // ★ 默认不勾：保持了工具一贯的"不猜"——重叠时两条都不改，把冲突报出来。
             longest_first: false,
             xlsx_cols,
-            // ★ 默认不勾：改名会动交付物文件名，必须由人显式决定
-            rename_files: false,
+            // ★ 默认**勾上**：同一套规则也作用到文件名上，是这套工具的常规用法
+            // （2026-10-08 起由"默认不勾"改过来，按 xin 的要求）。
+            // 预置模式想不勾，走 [`Preset::rename`] 覆盖。
+            rename_files: true,
             // ★ 默认不勾：就地替换不留 .bak，源目录里一个多余文件都没有。
             // 换来的代价是"写盘失败时没有回退文件"，所以要留的人自己勾。
             backup: false,
@@ -304,6 +324,8 @@ impl App {
             toast: None,
             rename_preview: None,
             job: None,
+            confirm_inplace: false,
+            inplace_confirmed: false,
             run_log_from: 0,
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
@@ -493,13 +515,16 @@ impl App {
     /// 选两遍没有意义，内核虽然会去重，报告里却会留两条一样的「输入」。
     fn input_paths(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
+        // 去重走集合：以前是 `out.contains(&p)`（O(n²)），一次粘几十上百个路径时
+        // 会肉眼可见地慢。结果仍按粘贴顺序排列（报告里"输入"那一栏保持原样）。
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for piece in self.input.split(['\n', '\r', ';', '；']) {
             let s = piece.trim();
             if s.is_empty() {
                 continue;
             }
             let p = PathBuf::from(s);
-            if !out.contains(&p) {
+            if seen.insert(p.clone()) {
                 out.push(p);
             }
         }
@@ -552,7 +577,7 @@ impl App {
     /// 界面行 → 内核作用域。
     ///
     /// 作用域串本身来自规则文件（界面上没有这一列，新建的行是 `全部`）；
-    /// **「文件名」那一维由 「规则」区的「同步修改文件名」开关说了算**——
+    /// **「文件名」那一维由 「规则」区的「同步替换文件名」开关说了算**——
     /// 勾了才作用到文件名。这样规则文件里写没写「文件名」都不需要人去猜。
     fn scope_of(&self, r: &Row, i: usize) -> Result<Scope, String> {
         let mut sc = Scope::parse(r.scope.trim()).map_err(|e| {
@@ -565,7 +590,7 @@ impl App {
         sc.filename = self.rename_files;
         if sc.is_empty() {
             return Err(format!(
-                "第 {} 条规则没有可用作用域：它只作用到「文件名」，但「同步修改文件名」没勾上",
+                "第 {} 条规则没有可用作用域：它只作用到「文件名」，但「同步替换文件名」没勾上",
                 i + 1
             ));
         }
@@ -722,6 +747,18 @@ impl App {
         if self.job.is_some() {
             return; // 上一批还在跑（按钮此时是灰的，这里只是兜底）
         }
+        // ★ 就地覆盖不可逆：确认**统一兜在这个入口**，不散在各按钮里——
+        //   以后不管从哪儿触发（按钮、快捷键、将来的菜单）都拦得住。
+        //   预演不落盘、写副本不动源文件，两者都不需要确认。
+        //   走一趟确认框，人点「确认替换」→ 置 `inplace_confirmed` → 再进来放行一次。
+        if !dry && !self.out_to_subdir && !self.inplace_confirmed {
+            self.confirm_inplace = true;
+            return;
+        }
+        self.inplace_confirmed = false; // 放行票一次有效，用完立刻作废
+        // 新一轮开始：把上一轮的「执行结果」面板先撤掉。留着它的话，跑的过程中
+        // 人会以为那是这一轮的结论（数字都还在，只是过时了）。
+        self.result = None;
         if !self.precheck() {
             return;
         }
@@ -1060,7 +1097,6 @@ impl App {
         if self.job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-
         // 主题只在变化时应用一次（每帧都 set_visuals 会把用户的临时样式冲掉）
         if self.applied_light != Some(self.light_theme) {
             ctx.set_visuals(visuals_of(self.light_theme));
@@ -1090,11 +1126,17 @@ impl App {
                 let running = self.job.is_some();
                 let can_run = !self.input.trim().is_empty() && !running;
                 let label = if running { "执行中…" } else { "执行替换" };
+                // 就地覆盖的确认兜在 `start_run` 入口（见那里的注释），这里直接调。
                 if ui
                     .add_enabled(
                         can_run,
                         egui::Button::new(RichText::new(label).size(15.0).strong()),
                     )
+                    .on_hover_text(if self.out_to_subdir {
+                        "把产物写到输出目录，源文件不动"
+                    } else {
+                        "就地覆盖源文件（不可撤销）——点击后会先弹一次确认"
+                    })
                     .clicked()
                 {
                     self.start_run(false, ctx);
@@ -1168,6 +1210,94 @@ impl App {
                 self.section_log(ui);
             });
         });
+
+        // 就地覆盖确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
+        self.confirm_inplace_dialog(ctx);
+    }
+
+    /// 「就地覆盖」确认框。
+    ///
+    /// 只做一件事：在真的动源文件之前停一下。就地替换把源文件**直接覆盖、不可撤销**，
+    /// 而触发它只是界面上的一个单击——所以这里**只说清"改源文件、不可撤销"**，
+    /// 再给个当场勾备份的口子，问一句就走（文字从简）。
+    ///
+    /// egui 0.29 没有 `Modal`，用两层 `Area` 模拟：底层遮罩铺满屏幕并吞掉点击
+    /// （不然确认框开着的时候，人还能点到后面的「执行替换」和输入框），
+    /// 上层放对话框本体。两层用**不同**的 `Order` 定序，不依赖同层内的绘制顺序。
+    fn confirm_inplace_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_inplace {
+            return;
+        }
+        let mut go = false;
+        let mut cancel = false;
+
+        // ① 遮罩：铺满整屏、吞掉所有点击。`Order::Middle` 高于页面所在的
+        //    `Background`、低于对话框的 `Foreground`，正好夹在中间。
+        egui::Area::new(egui::Id::new("wrepl-confirm-veil"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let full = ctx.screen_rect();
+                ui.allocate_response(full.size(), egui::Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(full, 0.0, Color32::from_black_alpha(70));
+            });
+
+        // ② 对话框本体：居中，浮在遮罩之上。**文字从简**。
+        egui::Area::new(egui::Id::new("wrepl-confirm-dialog"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(340.0);
+                    ui.label(
+                        RichText::new("将在源文件上直接替换，此操作不可撤销。")
+                            .strong()
+                            .color(ERR_C),
+                    );
+                    // 没备份时给一条退路：勾一下就行，不必取消回主界面。
+                    if !self.backup {
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.backup, "替换前先保留 .bak 备份").on_hover_text(
+                            "每个文件改写前先留一份 .docx.bak（只首次生成，重复跑不会覆盖最初那版）",
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        // 按钮文字**不用红色**：上面那句警告已经是红的，红色只用来
+                        // 说"有风险"，不该同时用来标"按钮"。按钮用正文色
+                        // （浅色主题下即黑色）——强调靠加粗，不靠颜色。
+                        // 取 `text_color()` 而不是写死黑色：换深色主题时不会变成黑底黑字。
+                        let btn_fg = ui.visuals().text_color();
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("确认替换").strong().color(btn_fg),
+                            ))
+                            .clicked()
+                        {
+                            go = true;
+                        }
+                        // 「确认替换」是放行破坏性操作的按钮，「取消」紧挨着它右侧。
+                        // 用默认的 8px 间距时两个按钮几乎贴在一起，鼠标偏一格就点错——
+                        // 而这两个动作的结果正好相反（真改文件 / 什么都不做）。
+                        // 这里额外拉开一段，别让相反的动作挤在同一片区域里。
+                        ui.add_space(12.0);
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if go {
+            // 先关框、再置"放行票"，否则下一帧还会画这个确认框。
+            self.confirm_inplace = false;
+            self.inplace_confirmed = true;
+            self.start_run(false, ctx);
+        } else if cancel {
+            self.confirm_inplace = false;
+        }
     }
 
     fn section_io(&mut self, ui: &mut egui::Ui) {
@@ -1195,7 +1325,7 @@ impl App {
                         pick_in_dir = true;
                     }
                     if ui
-                        .button("选文件…（可多选）")
+                        .button("选文件…")
                         .on_hover_text(
                             "按住 Ctrl / Shift 一次选多个 .docx；选中几个就处理几个。\n\
                              也可以直接把多个路径粘进左边的框里（一行一个，或用分号隔开）。",
@@ -1233,7 +1363,14 @@ impl App {
                     if ui.button("选目录…").clicked() {
                         pick_out_dir = true;
                     }
-                    if ui.button("用输入旁 out").clicked() {
+                    if ui
+                        .button("源文件目录")
+                        .on_hover_text(
+                            "把输出目录一键填成「源文件目录旁的 out 子文件夹」。\n\
+                             （源文件目录＝上面「输入」那行指向的目录）",
+                        )
+                        .clicked()
+                    {
                         use_sibling_out = true;
                     }
                 });
@@ -1405,7 +1542,7 @@ impl App {
                     );
                 });
                 ui.add_space(20.0);
-                ui.checkbox(&mut self.rename_files, "同步修改文件名");
+                ui.checkbox(&mut self.rename_files, "同步替换文件名");
             });
             ui.add_space(4.0);
 
@@ -1445,7 +1582,9 @@ impl App {
                     ui.horizontal(|ui| {
                         // 撑满整行：否则底色横条只包住三列文字，看着不像表头
                         ui.set_min_width(ui.available_width());
-                        for (w, h) in [(w_find, "查找内容"), (w_repl, "替换为"), (W_HIT, "命中")] {
+                        for (w, h) in
+                            [(w_find, "查找内容"), (w_repl, "替换为"), (W_HIT, "命中")]
+                        {
                             fixed_cell(ui, w, 20.0, RichText::new(h).strong());
                         }
                     });
@@ -1453,54 +1592,88 @@ impl App {
             ui.add_space(4.0);
 
             let mut delete: Option<usize> = None;
-            for (i, r) in self.rows.iter_mut().enumerate() {
-                // 隔行淡底：规则一多，行与行会糊成一片
-                let row_bg = if i % 2 == 1 {
-                    stripe_bg(ui)
-                } else {
-                    Color32::TRANSPARENT
-                };
-                egui::Frame::none()
-                    .fill(row_bg)
-                    .inner_margin(egui::Margin {
-                        left: 0.0,
-                        right: 0.0,
-                        top: 3.0,
-                        bottom: 3.0,
-                    })
-                    .rounding(egui::Rounding::same(3.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // 隔行底色同样撑满整行
-                            ui.set_min_width(ui.available_width());
-                            ui.add_sized(
-                                [w_find, 26.0],
-                                egui::TextEdit::singleline(&mut r.find).hint_text("查找内容"),
-                            );
-                            ui.add_sized(
-                                [w_repl, 26.0],
-                                egui::TextEdit::singleline(&mut r.replace).hint_text("替换为"),
-                            );
-                            let resp = fixed_cell(ui, W_HIT, 26.0, match r.hits {
-                                Some(n) if n > 0 => {
-                                    RichText::new(n.to_string()).color(OK_C).strong()
-                                }
-                                Some(_) => RichText::new("0").color(DIM_C),
-                                None => RichText::new("—").color(DIM_C),
+            // ★ 规则表**虚拟化**：只渲染滚动窗口内的那几行。
+            //
+            // 以前这里是 `for (i, r) in self.rows.iter_mut().enumerate()`，把整张表
+            // **每一行**每帧都铺一遍。egui 不做虚拟化，规则一上百条（从 Excel 导一张
+            // 大表很容易到几百条），每帧就要建几百个输入框，界面立刻发卡。
+            //
+            // `show_rows` 按固定行高算出"此刻可见的是第几行到第几行"，只把这段 range
+            // 交给闭包渲染。行高一致（下面每行都是固定高），所以滚动条长度与位置仍准确。
+            //
+            // 每行再用 `push_id(i)` 圈一个独立 id 空间：show_rows 会按"每行一个 id"
+            // 去跳过前面的行（`skip_ahead_auto_ids`），而我们有输入框+按钮好几个控件，
+            // 靠它推不准；显式按行号定 id，滚动时输入框的光标/焦点才不会跳到别的行上。
+            if !self.rows.is_empty() {
+                // 行高 = 内容 26 + 上下内边距 3+3 = 32；**不含行间距**（show_rows 自己加）。
+                const ROW_H: f32 = 32.0;
+                // 表格最多占这么高，再多就自己滚；12 行够看，也不至于把整页挤没。
+                const MAX_H: f32 = 420.0;
+                let n_rows = self.rows.len();
+                let rows = &mut self.rows;
+                egui::ScrollArea::vertical()
+                    .id_salt("rules-table")
+                    .max_height(MAX_H)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, ROW_H, n_rows, |ui, range| {
+                        for i in range {
+                            ui.push_id(i, |ui| {
+                                let r = &mut rows[i];
+                                // 隔行淡底：规则一多，行与行会糊成一片
+                                let row_bg = if i % 2 == 1 {
+                                    stripe_bg(ui)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                egui::Frame::none()
+                                    .fill(row_bg)
+                                    .inner_margin(egui::Margin {
+                                        left: 0.0,
+                                        right: 0.0,
+                                        top: 3.0,
+                                        bottom: 3.0,
+                                    })
+                                    .rounding(egui::Rounding::same(3.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // 隔行底色同样撑满整行
+                                            ui.set_min_width(ui.available_width());
+                                            ui.add_sized(
+                                                [w_find, 26.0],
+                                                egui::TextEdit::singleline(&mut r.find)
+                                                    .hint_text("查找内容"),
+                                            );
+                                            ui.add_sized(
+                                                [w_repl, 26.0],
+                                                egui::TextEdit::singleline(&mut r.replace)
+                                                    .hint_text("替换为"),
+                                            );
+                                            let resp = fixed_cell(ui, W_HIT, 26.0, match r.hits {
+                                                Some(n) if n > 0 => {
+                                                    RichText::new(n.to_string()).color(OK_C).strong()
+                                                }
+                                                Some(_) => RichText::new("0").color(DIM_C),
+                                                None => RichText::new("—").color(DIM_C),
+                                            });
+                                            // 从规则表读进来的行可能带备注，鼠标停在命中数上能看到
+                                            if !r.note.is_empty() {
+                                                resp.on_hover_text(&r.note);
+                                            }
+                                            // 用 U+00D7（乘号）而不是 U+2715：后者在装入的
+                                            // 中文字体里没有字形，实测渲染成豆腐块。
+                                            if ui
+                                                .add_sized(
+                                                    [W_DEL, 26.0],
+                                                    egui::Button::new("×").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                delete = Some(i);
+                                            }
+                                        });
+                                    });
                             });
-                            // 从规则表读进来的行可能带备注，鼠标停在命中数上能看到
-                            if !r.note.is_empty() {
-                                resp.on_hover_text(&r.note);
-                            }
-                            // 用 U+00D7（乘号）而不是 U+2715：后者在装入的中文字体里没有字形，
-                            // 实测渲染成豆腐块。
-                            if ui
-                                .add_sized([W_DEL, 26.0], egui::Button::new("×").small())
-                                .clicked()
-                            {
-                                delete = Some(i);
-                            }
-                        });
+                        }
                     });
             }
             if let Some(i) = delete {
@@ -1517,7 +1690,7 @@ impl App {
                 ui.add_space(16.0);
             }
 
-            // 文件名改名预览：勾了「同步修改文件名」就先把新名字摆出来。
+            // 文件名改名预览：勾了「同步替换文件名」就先把新名字摆出来。
             //
             // 这段以前**每帧**重算一遍：扫目录（walkdir）+ 对每个文件跑规则。
             // 目录一大，界面就会一直有 I/O，看起来"拖拉"。现在按

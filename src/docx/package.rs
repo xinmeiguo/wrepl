@@ -416,13 +416,33 @@ fn build_zip_bytes(src_bytes: &[u8], replaced: &HashMap<String, Vec<u8>>) -> Res
 /// 原来中转 + 同目录 rename 是原子的：要么换成功，要么原件原封不动。
 /// 直接覆盖没有这个性质——中途失败会留下半个文件。所以：
 /// ① 调用方可以先用 `backup` 留一份 `.bak`（默认不留，留不留是调用方的选择）；
-/// ② 这里写失败会先尝试把原件写回去，再报错。
+/// ② 这里写失败会先尝试把原件写回去，再**把回滚结果如实报出去**——回滚也失败时
+///   会明说"源文件可能已损坏"，而不是留下一句含糊的"改写失败"。
 pub fn rewrite_in_place(path: &Path, replaced: &HashMap<String, Vec<u8>>) -> Result<()> {
     let orig = std::fs::read(path).with_context(|| format!("读取失败：{}", path.display()))?;
     let out = build_zip_bytes(&orig, replaced)?;
     if let Err(e) = write_at(path, 0, &out, true) {
-        let _ = write_at(path, 0, &orig, true);
-        return Err(e).with_context(|| format!("就地改写 {} 失败", path.display()));
+        // ★ 回滚的结果**必须看**，不能 `let _ =` 吞掉。
+        //
+        // 这一步失败时源文件已经不是原件了（写了一半）；能不能写回原样，
+        // 决定用户接下来该做什么。回滚成功 → 文件没坏，重跑即可；
+        // 回滚也失败 → **文件可能已损坏**，得立刻说清楚，让他去用 .bak 或
+        // 版本控制恢复，而不是只看到一句"就地改写失败"以为文件还好好的。
+        return match write_at(path, 0, &orig, true) {
+            Ok(()) => Err(e).with_context(|| {
+                format!(
+                    "就地改写 {} 失败（已把原件写回，源文件应保持原样；修好原因后重跑即可）",
+                    path.display()
+                )
+            }),
+            Err(rb) => Err(e).with_context(|| {
+                format!(
+                    "就地改写 {} 失败，且**把原件写回也失败**（{rb:#}）——\
+                     该源文件可能已损坏，请用 .docx.bak 备份或版本控制里的版本恢复",
+                    path.display()
+                )
+            }),
+        };
     }
     Ok(())
 }
