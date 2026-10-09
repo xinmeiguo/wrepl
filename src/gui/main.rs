@@ -30,16 +30,23 @@
 //! 一律走写副本，这样自动化路径不可能因为默认值的变化去改源样本。
 
 mod app;
+mod diag;
 mod picker;
 
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // 第一件事就是装日志与 panic 钩子：后面任何一步出问题都要有记录。
+    // （图形子系统没有控制台，否则用户只能看到窗口凭空消失，见 `diag`。）
+    diag::init("wrepl-gui");
+
     let args: Vec<String> = std::env::args().collect();
 
     // 无窗口自检：不开窗，真跑字体加载 + 布局 + 一次完整批量。用于回归。
     if args.iter().any(|a| a == "--selftest") {
-        std::process::exit(app::selftest(&args));
+        let code = app::selftest(&args);
+        diag::log(format!("自检结束，退出码 {code}"));
+        std::process::exit(code);
     }
 
     let preset = app::Preset::from_args(&args);
@@ -52,7 +59,8 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    diag::log("开始建窗（eframe::run_native）");
+    let r = eframe::run_native(
         "wrepl",
         native,
         Box::new(move |cc| {
@@ -63,5 +71,12 @@ fn main() -> eframe::Result<()> {
                 None => app::App::new(),
             }))
         }),
-    )
+    );
+    // 走到这里说明主循环退出了 —— 这一条能把「正常关窗」和「被外部杀掉」
+    // 区分开：日志里没有它就说明进程是被硬干掉的，不是自己退的。
+    diag::log(format!(
+        "主循环结束（run_native 是否正常返回 = {}）—— 进程即将退出",
+        r.is_ok()
+    ));
+    r
 }

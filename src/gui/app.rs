@@ -366,6 +366,20 @@ impl App {
             picker_for: None,
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
+        // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save` 时启动就把选择器
+        // 打开，再配合 `WREPL_DEBUG_CLICK` 就能无人值守地复现"点一下"。
+        // 本机的合成鼠标输入进不来窗口（见 `diag` 里的说明），只能让程序自己做。
+        // 不设这个环境变量时，下面整段是空转。
+        match crate::diag::debug_picker_mode().as_deref() {
+            Some("dir") => app.open_picker(PickFor::InputDir),
+            Some("file") => app.open_picker(PickFor::InputFiles),
+            Some("out") => app.open_picker(PickFor::OutputDir),
+            Some("save") => app.open_picker(PickFor::ExportXlsx),
+            Some(other) => {
+                crate::diag::log(format!("[诊断] 未知的 WREPL_DEBUG_PICKER={other:?}，忽略"))
+            }
+            None => {}
+        }
         app
     }
 
@@ -1818,8 +1832,10 @@ impl App {
         };
         // 结果一定是刚才那个入口引起的；拿走 `picker_for` 就是"这一趟结了"。
         let Some(what) = self.picker_for.take() else {
+            crate::diag::log("选择器有结果但没有对应的入口（picker_for 为空），忽略");
             return;
         };
+        crate::diag::log(format!("选择器结果：{outcome:?}  入口={what:?}"));
         match outcome {
             Outcome::Cancelled => {}
             // 「...」：自绘面板搞不定（比如要连一个没映射的网络位置），退回系统对话框。
@@ -1830,6 +1846,7 @@ impl App {
 
     /// 面板选好了 → 填到对应字段。
     fn apply_picked(&mut self, what: PickFor, paths: Vec<PathBuf>) {
+        crate::diag::log(format!("应用选择结果：入口={what:?} 路径={paths:?}"));
         match what {
             PickFor::InputDir | PickFor::OutputDir => {
                 let Some(p) = paths.into_iter().next() else {

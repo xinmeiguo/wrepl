@@ -239,6 +239,12 @@ impl Picker {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(home_dir)
         };
+        crate::diag::log(format!(
+            "打开选择器：模式={mode:?} 标题={:?} 筛选={:?} 起点={}",
+            self.title,
+            self.exts,
+            dir.display()
+        ));
         self.navigate(dir);
     }
 
@@ -293,6 +299,7 @@ impl Picker {
 
         match act {
             Some(Act::Close(o)) => {
+                crate::diag::log(format!("选择器关闭：{o:?}"));
                 self.open = false;
                 self.load = None;
                 Some(o)
@@ -320,15 +327,29 @@ impl Picker {
                 }
                 match res {
                     Ok((dir, list)) => {
+                        crate::diag::log(format!("读取完成：{} 项  {}", list.len(), dir.display()));
                         self.all = list;
                         self.cwd = dir.clone();
                         self.addr = dir.display().to_string();
                         self.last_dir = dir;
                         self.err = None;
-                        self.rebuild_view();
+                        // 这里 self.all 就是权威数据，本可以直接 `self.refresh_view(&self.all)`，
+                        // 但那会同时借 `&mut self` 和 `&self.all`（同一个 self）——借不过去。
+                        // 所以就地展开；排序/过滤仍走同一个 build_view，保证与面板内一致。
+                        let view = Self::build_view(
+                            &self.all,
+                            &self.exts,
+                            self.show_hidden,
+                            self.sort,
+                            self.sort_desc,
+                        );
+                        self.view = view;
+                        self.sel.clear();
+                        self.anchor = None;
                     }
                     Err(e) => {
                         // 读不到就停在原地，把原因说清楚（权限 / 网络 / 路径不存在）
+                        crate::diag::log(format!("读取失败：{e}"));
                         self.err = Some(e);
                         self.addr = self.cwd.display().to_string();
                     }
@@ -345,6 +366,7 @@ impl Picker {
 
     /// 跳到某个目录（**不在 UI 线程上读**）。
     fn navigate(&mut self, dir: PathBuf) {
+        crate::diag::log(format!("导航 → {}", dir.display()));
         let seq = self.load.as_ref().map_or(1, |l| l.seq + 1);
         let (tx, rx) = mpsc::channel();
         let d = dir.clone();
@@ -376,18 +398,33 @@ impl Picker {
         }
     }
 
-    /// 按当前过滤 + 排序重建可见列表。**过滤条件 / 排序键一变就要调**。
-    fn rebuild_view(&mut self) {
-        let mut idx: Vec<usize> = (0..self.all.len())
+    /// 按当前过滤 + 排序算出「可见条目在 `all` 里的下标」。
+    ///
+    /// ⚠️ 刻意写成**关联函数**（数据从 `entries` 参数进）而不是 `&mut self` 方法，
+    /// 因为调用点分两种完全不同的处境：
+    ///
+    /// * `poll()` 里 —— `self.all` 是权威数据；
+    /// * `body()` 里 —— `self.all` 已经被 [`Picker::show`] 借出去给绘制用了，
+    ///   那一刻**它是空的**。
+    ///
+    /// 做成方法就必然有一边对着空表算。v0.2.0「点一下就退出」正是这么来的：
+    /// 原来这里只吃 `self.all`，面板打开期间被调用就得到空视图 / 越界。**
+    fn build_view(
+        entries: &[Entry],
+        exts: &[String],
+        show_hidden: bool,
+        sort: SortKey,
+        sort_desc: bool,
+    ) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..entries.len())
             .filter(|&i| {
-                let e = &self.all[i];
-                (self.show_hidden || !e.hidden) && (e.is_dir || self.ext_ok(&e.name))
+                let e = &entries[i];
+                (show_hidden || !e.hidden) && (e.is_dir || ext_ok(exts, &e.name))
             })
             .collect();
 
-        let (key, desc) = (self.sort, self.sort_desc);
         idx.sort_by(|&a, &b| {
-            let (ea, eb) = (&self.all[a], &self.all[b]);
+            let (ea, eb) = (&entries[a], &entries[b]);
             // 目录永远排在文件前面，这一层不受 asc/desc 影响
             if ea.is_dir != eb.is_dir {
                 return if ea.is_dir {
@@ -396,32 +433,41 @@ impl Picker {
                     std::cmp::Ordering::Greater
                 };
             }
-            let o = match key {
+            let o = match sort {
                 SortKey::Name => ea.name.to_lowercase().cmp(&eb.name.to_lowercase()),
                 SortKey::Size => ea.size.cmp(&eb.size),
                 SortKey::Time => ea.mtime.cmp(&eb.mtime),
             };
-            if desc { o.reverse() } else { o }
+            if sort_desc { o.reverse() } else { o }
         });
+        idx
+    }
 
-        self.view = idx;
-        // 行号会变，选中跟着清掉免得指错人
+    /// 就地刷新视图，并清掉选中（行号会变，留着旧行号会指错人）。
+    /// `entries` 该传哪一份，见 [`Picker::build_view`] 上面的说明。
+    fn refresh_view(&mut self, entries: &[Entry]) {
+        self.view = Self::build_view(
+            entries,
+            &self.exts,
+            self.show_hidden,
+            self.sort,
+            self.sort_desc,
+        );
         self.sel.clear();
         self.anchor = None;
     }
 
-    fn ext_ok(&self, name: &str) -> bool {
-        if self.exts.is_empty() {
-            return true;
-        }
-        match name.rsplit_once('.') {
-            Some((_, e)) => self.exts.iter().any(|x| x.eq_ignore_ascii_case(e)),
-            None => false,
-        }
-    }
-
     /// 确认。返回 `None` 表示当前状态下没什么可确认（按钮会置灰）。
-    fn confirm(&self) -> Option<Vec<PathBuf>> {
+    ///
+    /// ⚠️ 数据从 `entries` 参数进，**不碰 `self.all`** —— 原因见
+    /// [`Picker::build_view`]：本方法会在 `body()` 里被调用，那时 `self.all`
+    /// 已经被借走、是空的。v0.2.0 的崩溃就出在这里（原来写的是
+    /// `&self.all[i]`，而 `view` 里的下标还指着被借走的那份表 → 越界）。
+    ///
+    /// 另外一律走 `entries.get(i)` 而不是 `entries[i]`：视图下标与数据表
+    /// 万一对不上（用户在面板开着时换了目录等），也只该"这一项不算数"，
+    /// 而不是把整个程序带走。
+    fn confirm(&self, entries: &[Entry]) -> Option<Vec<PathBuf>> {
         match self.mode {
             Mode::Folder => {
                 // 恰好选中一个目录 → 选它；否则 → 当前所在目录
@@ -429,7 +475,7 @@ impl Picker {
                     .sel
                     .iter()
                     .filter_map(|&v| self.view.get(v))
-                    .map(|&i| &self.all[i])
+                    .filter_map(|&i| entries.get(i))
                     .filter(|e| e.is_dir)
                     .map(|e| self.cwd.join(&e.name))
                     .collect();
@@ -444,7 +490,7 @@ impl Picker {
                     .sel
                     .iter()
                     .filter_map(|&v| self.view.get(v))
-                    .map(|&i| &self.all[i])
+                    .filter_map(|&i| entries.get(i))
                     .filter(|e| !e.is_dir)
                     .map(|e| self.cwd.join(&e.name))
                     .collect();
@@ -613,7 +659,8 @@ impl Picker {
                 self.sort = k;
                 self.sort_desc = false;
             }
-            self.rebuild_view();
+            // 数据要传 entries：此刻 self.all 是被 show() 借走的空壳
+            self.refresh_view(entries);
         }
 
         ui.separator();
@@ -706,10 +753,24 @@ impl Picker {
                     }
                 });
 
+            // 诊断开关：这台机器上合成鼠标输入到不了窗口（`SendInput` 与
+            // `PostMessage` 都被管控套件拦掉），要复现"点一下"只能让程序自己做。
+            // 不设 `WREPL_DEBUG_CLICK` 时这一整段空转，不影响正常使用。
+            if clicked.is_none() && !self.view.is_empty() {
+                if let Some((row, dbl)) = crate::diag::debug_click() {
+                    let row = row.min(self.view.len() - 1);
+                    crate::diag::log(format!("[诊断] 模拟点击第 {row} 行（双击={dbl}）"));
+                    clicked = Some((row, dbl, false, false));
+                }
+            }
+
             if let Some((row, dbl, ctrl, shift)) = clicked {
                 let ei = self.view[row];
                 let is_dir = entries[ei].is_dir;
                 let name = entries[ei].name.clone();
+                crate::diag::log(format!(
+                    "点击行 {row}：{name:?} 是目录={is_dir} 双击={dbl} ctrl={ctrl} shift={shift}"
+                ));
 
                 if dbl {
                     if is_dir {
@@ -719,7 +780,7 @@ impl Picker {
                     // 双击文件 = 直接确认
                     self.sel.clear();
                     self.sel.insert(row);
-                    if let Some(paths) = self.confirm() {
+                    if let Some(paths) = self.confirm(entries) {
                         return Some(Act::Close(Outcome::Picked(paths)));
                     }
                 } else if shift {
@@ -781,7 +842,7 @@ impl Picker {
                     if !t.is_empty() && sub.is_dir() {
                         // 敲的是目录名 → 进目录，比报错友好
                         self.navigate(sub);
-                    } else if let Some(paths) = self.confirm() {
+                    } else if let Some(paths) = self.confirm(entries) {
                         act = Some(Act::Close(Outcome::Picked(paths)));
                     }
                 }
@@ -789,7 +850,8 @@ impl Picker {
             }
             ui.label(RichText::new(self.filter_label.clone()).small().color(DIM));
             if ui.checkbox(&mut self.show_hidden, "显示隐藏项").changed() {
-                self.rebuild_view();
+                // 同上：self.all 此刻是空的，必须用 entries
+                self.refresh_view(entries);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -798,12 +860,12 @@ impl Picker {
                     Mode::Files => "打开",
                     Mode::Save => "保存",
                 };
-                let can = self.confirm().is_some();
+                let can = self.confirm(entries).is_some();
                 if ui
                     .add_enabled(can, egui::Button::new(RichText::new(ok_label).strong()))
                     .clicked()
                 {
-                    if let Some(paths) = self.confirm() {
+                    if let Some(paths) = self.confirm(entries) {
                         act = Some(Act::Close(Outcome::Picked(paths)));
                     }
                 }
@@ -831,7 +893,7 @@ impl Picker {
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
             && ctx.memory(|m| m.focused().is_none())
         {
-            if let Some(paths) = self.confirm() {
+            if let Some(paths) = self.confirm(entries) {
                 act = Some(Act::Close(Outcome::Picked(paths)));
             }
         }
@@ -890,6 +952,20 @@ fn is_hidden(_md: &std::fs::Metadata) -> bool {
 const DIM: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
 const DIR_C: Color32 = Color32::from_rgb(0x1F, 0x4E, 0x79);
 const ERR_C: Color32 = Color32::from_rgb(0xB0, 0x30, 0x30);
+
+/// 扩展名白名单判定。空表 = 全部放行；目录不该走到这里（调用方先判 `is_dir`）。
+///
+/// 是**模块级自由函数**而不是 `&self` 方法：`build_view` 是关联函数、没有 `self`，
+/// 而它必须能调到这里。
+fn ext_ok(exts: &[String], name: &str) -> bool {
+    if exts.is_empty() {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((_, e)) => exts.iter().any(|x| x.eq_ignore_ascii_case(e)),
+        None => false,
+    }
+}
 
 fn stripe_bg(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
@@ -1136,6 +1212,14 @@ mod tests {
         }
     }
 
+    /// 测试里刷新视图，等价于 `poll()` 里那段（数据取 `p.all`）。
+    fn refresh(p: &mut Picker) {
+        let view = Picker::build_view(&p.all, &p.exts, p.show_hidden, p.sort, p.sort_desc);
+        p.view = view;
+        p.sel.clear();
+        p.anchor = None;
+    }
+
     /// 面板要能在**无窗口**环境下跑若干帧而不 panic。
     ///
     /// egui 的 `Context` 是纯 CPU 的（字体光栅 + 布局），不需要 GPU ——
@@ -1164,14 +1248,14 @@ mod tests {
     fn 扩展名过滤() {
         let mut p = Picker::new();
         p.exts = vec!["docx".to_string()];
-        assert!(p.ext_ok("a.docx"));
-        assert!(p.ext_ok("A.DOCX"), "扩展名比较要不区分大小写");
-        assert!(!p.ext_ok("a.xlsx"));
-        assert!(!p.ext_ok("没有扩展名"));
+        assert!(ext_ok(&p.exts, "a.docx"));
+        assert!(ext_ok(&p.exts, "A.DOCX"), "扩展名比较要不区分大小写");
+        assert!(!ext_ok(&p.exts, "a.xlsx"));
+        assert!(!ext_ok(&p.exts, "没有扩展名"));
 
         p.all = vec![entry("子目录", true), entry("a.docx", false), entry("b.xlsx", false)];
         p.show_hidden = false;
-        p.rebuild_view();
+        refresh(&mut p);
         // 目录 + docx，xlsx 被挡在外面
         assert_eq!(p.view.len(), 2);
         assert!(p.all[p.view[0]].is_dir, "目录要排在前面");
@@ -1186,10 +1270,10 @@ mod tests {
             e.hidden = true;
             e
         }];
-        p.rebuild_view();
+        refresh(&mut p);
         assert_eq!(p.view.len(), 1, "默认不显示隐藏项");
         p.show_hidden = true;
-        p.rebuild_view();
+        refresh(&mut p);
         assert_eq!(p.view.len(), 2, "勾上之后要看得见");
     }
 
@@ -1202,13 +1286,13 @@ mod tests {
         let mut p = Picker::new();
         p.mode = Mode::Folder;
         p.cwd = cwd.clone();
-        assert_eq!(p.confirm(), Some(vec![cwd.clone()]));
+        assert_eq!(p.confirm(&p.all), Some(vec![cwd.clone()]));
 
         // ② 选目录：恰好选中一个子目录 → 选它，而不是当前目录
         p.all = vec![entry("子目录", true)];
         p.view = vec![0];
         p.sel.insert(0);
-        assert_eq!(p.confirm(), Some(vec![PathBuf::from(r"C:\proj\子目录")]));
+        assert_eq!(p.confirm(&p.all), Some(vec![PathBuf::from(r"C:\proj\子目录")]));
 
         // ③ 选文件：多选两个文件
         let mut p = Picker::new();
@@ -1219,21 +1303,68 @@ mod tests {
         p.sel.insert(0);
         p.sel.insert(1);
         assert_eq!(
-            p.confirm(),
+            p.confirm(&p.all),
             Some(vec![PathBuf::from(r"C:\proj\a.docx"), PathBuf::from(r"C:\proj\b.docx")])
         );
 
         // ④ 选文件：一个都没选、文件名框也空 → 没什么可确认（按钮置灰）
         p.sel.clear();
         p.file_name = String::new();
-        assert_eq!(p.confirm(), None);
+        assert_eq!(p.confirm(&p.all), None);
 
         // ⑤ 另存为：不要求文件已存在，直接拼路径
         let mut p = Picker::new();
         p.mode = Mode::Save;
         p.cwd = cwd.clone();
         p.file_name = "新规则.xlsx".to_string();
-        assert_eq!(p.confirm(), Some(vec![PathBuf::from(r"C:\proj\新规则.xlsx")]));
+        assert_eq!(p.confirm(&p.all), Some(vec![PathBuf::from(r"C:\proj\新规则.xlsx")]));
+    }
+
+    /// **回归**：面板打开期间（`self.all` 被借走、当场是空的）确认与刷新都不能崩。
+    ///
+    /// v0.2.0 的「点一下就退出」就是这么来的：`confirm()` 原来读 `&self.all[i]`，
+    /// 而 `body()` 执行时 `self.all` 已经被 `show()` take 出去给绘制用了，
+    /// `view` 里的下标却还指着那份表 → 越界 panic。
+    ///
+    /// 为什么一"点"就中：底部那排按钮**每帧**都要调 `confirm()` 来判断
+    /// 「打开/保存」按钮该不该置灰（`let can = self.confirm(...).is_some()`），
+    /// 所以只要面板里有任何选中项，下一帧就必崩。
+    /// 而双击目录反而不会 —— 那条路 `navigate()` 之后直接 `return`，
+    /// 走不到底部按钮。（用户报的正是"单击目录就退出"。）
+    #[test]
+    fn 数据被借走时确认与刷新都不能越界() {
+        let mut p = Picker::new();
+        p.mode = Mode::Folder;
+        p.cwd = PathBuf::from(r"C:\proj");
+        p.all = vec![entry("子目录", true)];
+        p.view = vec![0];
+        p.sel.insert(0);
+
+        // 模拟 show() 把 all take 出去、交给 body 绘制的那一刻
+        let entries = std::mem::take(&mut p.all);
+        assert!(p.all.is_empty(), "这一刻 self.all 必须是空的（复现前提）");
+
+        // ① 数据从 entries 进来 —— 照样能算出结果
+        assert_eq!(
+            p.confirm(&entries),
+            Some(vec![PathBuf::from(r"C:\proj\子目录")])
+        );
+
+        // ② 兜底：调用方一份空表都没给，也只能"没有选中"，绝不能 panic
+        assert_eq!(
+            p.confirm(&[]),
+            Some(vec![PathBuf::from(r"C:\proj")]),
+            "Folder 模式没选中目录时退化为「当前目录」"
+        );
+        p.mode = Mode::Files;
+        assert_eq!(p.confirm(&[]), None, "Files 模式没有文件可选时按钮该置灰");
+        p.mode = Mode::Folder;
+
+        // ③ 面板打开期间刷新视图（勾「显示隐藏项」/ 点表头）同样必须基于 entries，
+        //    否则列表会被清空 —— 那是同一个错误的另一副面孔。
+        p.show_hidden = true;
+        p.refresh_view(&entries);
+        assert_eq!(p.view, vec![0], "视图该按 entries 重建，而不是对着空的 self.all 算");
     }
 
     /// 只写文件名 → 补到当前目录；绝对路径 / UNC → 原样用。
@@ -1256,6 +1387,60 @@ mod tests {
         assert_eq!(letter_of("C:"), "C:");
         assert_eq!(letter_of("Z: 项目盘"), "Z:");
         assert_eq!(letter_of("Y: · 网络"), "Y:");
+    }
+
+    /// **栈预算**：面板必须能在 **1 MB** 线程栈上跑得动。
+    ///
+    /// 为什么死钉 1 MB —— 这是 v0.2.0 用户端「点一下就退出」的根因所在：
+    ///
+    /// * 本机 GNU 工具链产物主线程栈是 **2 MB**（PE 头 `SizeOfStackReserve`）
+    /// * CI 的 MSVC 产物只有 **1 MB**（rustc 对 MSVC 目标的默认值）
+    ///
+    /// 同一个面板在开发机（2 MB）从不出事，到用户手里（1 MB）一开就
+    /// 「窗口凭空消失」—— 因为 Windows 上栈溢出是**立即终止进程**，
+    /// 图形子系统又没有控制台，Rust 那句 "has overflowed its stack"
+    /// 写进了丢失的 stderr：没有对话框、没有崩溃转储、什么都没有。
+    /// 而且本机的企业管控套件（AppInit_DLLs 全局注入）会在每个进程上
+    /// 额外吃一截栈，余量比正常机器更紧。
+    ///
+    /// 所以这个测试是**回归防线**：面板的布局层级一旦又变深，它会当场变红。
+    #[test]
+    fn 一兆栈上也要跑得动() {
+        let n = std::thread::Builder::new()
+            .name("one-mb-stack".to_string())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let ctx = egui::Context::default();
+                let mut p = Picker::new();
+                p.open(
+                    Mode::Files,
+                    "栈预算",
+                    PathBuf::from(r"C:\Windows"),
+                    &["docx"],
+                    "",
+                );
+                for _ in 0..300 {
+                    let _ = ctx.run(egui::RawInput::default(), |c| {
+                        let _ = p.show(c);
+                    });
+                    if p.load.is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // 列表就绪后再多跑几帧：真正吃栈的是「有内容的完整布局」，
+                // 空列表那几帧反而轻。
+                for _ in 0..20 {
+                    let _ = ctx.run(egui::RawInput::default(), |c| {
+                        let _ = p.show(c);
+                    });
+                }
+                p.view.len()
+            })
+            .expect("线程起不来")
+            .join()
+            .expect("1 MB 栈上的面板把线程搞崩了 —— 多半就是栈溢出");
+        assert!(n > 0, "面板一个条目都没列出，测试没跑到位");
     }
 
     /// 体积格式化。
