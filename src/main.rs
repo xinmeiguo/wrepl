@@ -209,7 +209,7 @@ fn cmd_scan(t: &Targets, rs: &RuleSource) -> Result<()> {
         let _guard = out_lock.lock().unwrap_or_else(|e| e.into_inner());
         println!("─── [{i}/{total}] {} ───", o.src.display());
         render_outcome(o);
-    })?;
+    }, &|_, _, _| {})?;
 
     println!("并行：{} 线程", res.threads);
     print_totals(&res.outcomes);
@@ -300,7 +300,7 @@ fn cmd_apply(
         }
         println!("─── [{i}/{total}] {} ───", o.src.display());
         render_outcome(o);
-    })?;
+    }, &|_, _, _| {})?;
 
     if res.outcomes.is_empty() {
         println!("没有找到可处理的 .docx 文件。");

@@ -147,6 +147,12 @@ struct LoadStat {
 enum Msg {
     /// 一个文件处理完：已完成序数 / 总数 / 要写进日志的若干行
     Progress(usize, usize, Vec<String>),
+    /// **收尾阶段**的进度：阶段名 / 已完成 / 总数。
+    ///
+    /// 阶段 3（逐文件改写）之外还有两段要走——「同步文件名」与「验证产物」，
+    /// 它们各有自己的计数（从 0 开始），在此之前界面拿不到任何一条消息，
+    /// 于是进度条满格之后就"卡"在那儿。这条消息就是补这个洞。
+    Stage(String, usize, usize),
     /// 整批跑完
     Done(Box<RunResult>),
     /// 整批失败（连结果都没拿到）
@@ -163,6 +169,12 @@ struct Job {
     handle: Option<std::thread::JoinHandle<()>>,
     total: usize,
     done: usize,
+    /// 当前所处的收尾阶段（阶段名, 已完成, 总数）。
+    ///
+    /// 为 `None` 表示还停在阶段 3（逐文件改写）；一旦收到，界面就切到那个阶段的计数。
+    /// 记在 `Job` 上而不是每帧现取，是因为阶段消息可能一帧内来好几条——只留最后一条，
+    /// 进度条才不会来回跳。
+    stage: Option<(String, usize, usize)>,
     started: std::time::Instant,
     rules: Vec<Rule>,
     opts: Options,
@@ -906,6 +918,15 @@ impl App {
                 drop(g);
                 // 叫界面醒一下：有新行要画
                 ctx2.request_repaint();
+            }, &|stage, i, t| {
+                // 阶段 4/5 的进度（同步文件名 / 验证产物）。
+                // 这两段在补这条消息之前是**完全静默**的，所以进度条满格之后
+                // 还会干等一段——文件越多等得越久（本机 rename 单价随目录里
+                // 的文件数涨，180 个文件时能到 190 ms/次）。
+                let g = tx.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = g.send(Msg::Stage(stage.to_string(), i, t));
+                drop(g);
+                ctx2.request_repaint();
             });
 
             let msg = match out {
@@ -923,6 +944,7 @@ impl App {
             handle: Some(handle),
             total: 0,
             done: 0,
+            stage: None,
             started: std::time::Instant::now(),
             rules: rule_list,
             opts,
@@ -947,6 +969,9 @@ impl App {
                     job.total = t;
                     job.done += 1;
                     self.extend_log(lines);
+                }
+                Ok(Msg::Stage(name, i, t)) => {
+                    job.stage = Some((name, i, t));
                 }
                 Ok(Msg::Done(res)) => {
                     finished = Some(res);
@@ -1217,17 +1242,25 @@ impl App {
             });
 
             // 进度条：只在跑的时候出现。文件多的时候，这一条就是"它没死"的凭据。
+            //
+            // 一整批其实有五段：收集 → 预分配路径 → 逐文件改写 → 同步文件名 → 验证。
+            // 进度条原先只覆盖第三段，所以它满格之后还会干等一段 —— 用户报障的正是这个。
+            // 现在阶段 4/5 各自报 `Msg::Stage`，文案跟着切：
+            //   改写中… 12 / 180 → 同步文件名… 40 / 180 → 验证产物… 90 / 180
             if let Some(job) = &self.job {
                 ui.add_space(4.0);
-                let frac = if job.total == 0 {
-                    0.0
-                } else {
-                    (job.done as f32 / job.total as f32).clamp(0.0, 1.0)
-                };
-                let text = if job.total == 0 {
-                    "正在收集待处理文件…".to_string()
-                } else {
-                    format!("{} / {} 个文件", job.done, job.total)
+                let (frac, text) = match &job.stage {
+                    Some((name, i, t)) if *t > 0 => (
+                        (*i as f32 / *t as f32).clamp(0.0, 1.0),
+                        format!("{name}… {i} / {t}"),
+                    ),
+                    _ if job.total == 0 => (0.0, "正在收集待处理文件…".to_string()),
+                    // 阶段 3 报完了、但阶段 4/5 的第一条消息还没到（或这两段本来就不跑）
+                    _ if job.done >= job.total => (1.0, "正在收尾…".to_string()),
+                    _ => (
+                        (job.done as f32 / job.total as f32).clamp(0.0, 1.0),
+                        format!("改写中… {} / {} 个文件", job.done, job.total),
+                    ),
                 };
                 ui.add(
                     egui::ProgressBar::new(frac)

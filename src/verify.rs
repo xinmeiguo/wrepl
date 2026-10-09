@@ -108,34 +108,37 @@ pub struct SkelSnap {
 }
 
 /// 采集一个包的验证快照。
+///
+/// ★ **一个包只开一次容器。**
+///
+/// 原实现是 `inspect(path)`（开 1 次、解压全包算 SHA）＋ 对**每个文本 part 各调一次
+/// `read_part(path, name)`** —— 而 `read_part` 每次都重开容器、重解一遍中央目录，
+/// 一个包被打开 `1 + N` 次（N ＝ 文本 part 数）。
+/// `package::read_parts_where` 的文档注释早把规矩写死了：
+/// 「**需要读一个以上条目时一律走这里，只开一次**」，这里补上。
+///
+/// 行为与旧实现一致：全部 part 都进 `parts`（关卡 1 要全量指纹），
+/// 只有文本容器做骨架（关卡 2）；非 UTF-8 的文本 part 仍然报错而非静默跳过。
 pub fn snapshot(path: &Path) -> Result<PkgSnap> {
-    let info = package::inspect(path)?;
+    let raw = package::read_parts_where(path, |_, _| true)?;
+    let mut parts = Vec::with_capacity(raw.len());
     let mut skel = BTreeMap::new();
-    for x in &info {
-        if !x.kind.is_text_bearing() {
-            continue;
+    for (name, kind, bytes) in raw {
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let size = bytes.len() as u64;
+        if kind.is_text_bearing() {
+            let s = std::str::from_utf8(&bytes).with_context(|| format!("{name} 不是 UTF-8"))?;
+            let (tokens, carriers) = skeleton(s).with_context(|| format!("{name} 骨架解析失败"))?;
+            skel.insert(name.clone(), SkelSnap { tokens, carriers });
         }
-        let raw = match package::read_part(path, &x.name) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let s = std::str::from_utf8(&raw).with_context(|| format!("{} 不是 UTF-8", x.name))?;
-        let (tokens, carriers) =
-            skeleton(s).with_context(|| format!("{} 骨架解析失败", x.name))?;
-        skel.insert(x.name.clone(), SkelSnap { tokens, carriers });
+        parts.push(PartSnap {
+            name,
+            kind,
+            sha256,
+            size,
+        });
     }
-    Ok(PkgSnap {
-        parts: info
-            .into_iter()
-            .map(|p| PartSnap {
-                name: p.name,
-                kind: p.kind,
-                sha256: p.sha256,
-                size: p.uncompressed_size,
-            })
-            .collect(),
-        skel,
-    })
+    Ok(PkgSnap { parts, skel })
 }
 
 /// 执行关卡 1（按路径读两侧）。
