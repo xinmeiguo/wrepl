@@ -51,6 +51,11 @@ fn main() -> eframe::Result<()> {
 
     let preset = app::Preset::from_args(&args);
 
+    // 尺寸**回到 0.2.2 的原值**：1360×920 那次放大是跟着字号一起做的，
+    // 实测偏大（1920×1080 上占掉大半屏），字号保持放大就够看了。
+    //
+    // 下限 940×640 按 **1366×768 的笔记本**定：640 加标题栏(~31) 与任务栏(~40)
+    // 约 711 < 768，在那种机器上不会被屏幕裁掉；再往上取就会。
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("wrepl —— Word 批量替换")
@@ -60,7 +65,30 @@ fn main() -> eframe::Result<()> {
     };
 
     diag::log("开始建窗（eframe::run_native）");
-    let r = eframe::run_native(
+    // ★ 窗口建不出来时**必须出声**。
+    //
+    //   图形子系统没有 stderr：`eframe::run_native` 返回 Err（显卡驱动只给
+    //   OpenGL 1.1、远程桌面、虚拟机没有 3D 加速时就是这样）、或者 `main`
+    //   返回 Err 之后，进程会**安安静静地退出** —— 用户看到的就是"双击没反应"。
+    //   这个函数把 Err 接住，写日志、给命令行留一行 stderr、再弹一个说人话的对话框。
+    let r = run_and_report(preset, native);
+    // 走到这里说明主循环退出了 —— 这一条能把「正常关窗」和「被外部杀掉」
+    // 区分开：日志里没有它就说明进程是被硬干掉的，不是自己退的。
+    diag::log(format!(
+        "主循环结束（run_native 是否正常返回 = {}）—— 进程即将退出",
+        r.is_ok()
+    ));
+    r
+}
+
+/// 跑窗口，并且**保证任何失败都看得见**。
+///
+/// 返回 `eframe::Result<()>` 让 `main` 保持原来的退出语义（失败 = 非零退出码）。
+fn run_and_report(
+    preset: Option<app::Preset>,
+    native: eframe::NativeOptions,
+) -> eframe::Result<()> {
+    let ran = eframe::run_native(
         "wrepl",
         native,
         Box::new(move |cc| {
@@ -72,11 +100,17 @@ fn main() -> eframe::Result<()> {
             }))
         }),
     );
-    // 走到这里说明主循环退出了 —— 这一条能把「正常关窗」和「被外部杀掉」
-    // 区分开：日志里没有它就说明进程是被硬干掉的，不是自己退的。
-    diag::log(format!(
-        "主循环结束（run_native 是否正常返回 = {}）—— 进程即将退出",
-        r.is_ok()
-    ));
-    r
+
+    let Err(e) = &ran else { return ran };
+
+    // 三路同时告知，哪条路通就走哪条：
+    //   ① 日志（唯一一份完整的现场）
+    //   ② stderr（从 cmd / PowerShell 启动时父控制台会继承，能直接看到）
+    //   ③ 对话框（双击启动时**唯一**看得见的那条）
+    let detail = format!("{e}");
+    diag::log(format!("!!! 建窗失败 !!!\n  {detail}\n  {e:?}"));
+    eprintln!("wrepl 图形界面没能打开窗口：{detail}");
+    eprintln!("（同一个包里的 wrepl.exe 命令行版做的是同一件事，且不需要显卡）");
+    diag::startup_failure_box(&detail);
+    ran
 }

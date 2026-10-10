@@ -1,7 +1,15 @@
 [package]
 name = "wrepl"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
+# 用 build.rs 把主线程栈预留**钉死在 1 MB** —— 见 build.rs 文件头。
+#
+# 这里曾经写过"故意没有 build.rs"，因为当时那个 build.rs 是在**调大**栈
+# （1 MB → 16 MB），而调大栈会让窗口永远建不出来。方向搞反了：
+# 正确做法不是"别碰"，而是"**显式钉死在 1 MB**"，否则 mingw 默认给 2 MB，
+# 同一版本的界面版就会比 MSVC 产物慢 2.4 倍（实测 5.5 s vs 2.1 s）。
+# 详见 build.rs 文件头与 CHANGELOG [0.2.3]。
+build = "build.rs"
 
 [features]
 # 图形界面。**默认不编**——CLI 构建完全不拉 eframe/winit/glow，
@@ -29,6 +37,21 @@ rfd = { version = "0.15.4", optional = true }
 [lib]
 name = "wrepl"
 path = "src/lib.rs"
+
+# ── 发布构建 ──────────────────────────────────────────────────────────────
+# 这个工具的热点全在依赖里（quick-xml 的解析循环、flate2 的 inflate、
+# sha2 的压缩函数、zip 的搬运），跨 crate 内联是唯一能把它们缝进主流程的手段；
+# `codegen-units = 1` 再让优化器看见整个 crate。
+#
+# 刻意**不**开 `panic = "abort"`、也**不**开 `strip`：
+#   · 界面版靠 panic 钩子把出错位置与调用栈写进 `%LOCALAPPDATA%\wrepl\wrepl-gui.log`
+#     （日志末尾的 `!!! PANIC !!!` 是用户报问题时唯一的线索），
+#     `strip` 会把符号表删掉、`panic = "abort"` 会让线程里的 panic 直接带走整个进程；
+#   · 这两项省下的那点体积/时间，换不来"崩溃了查不出原因"。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
 
 [[bin]]
 name = "wrepl"

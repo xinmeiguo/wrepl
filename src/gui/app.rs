@@ -723,6 +723,9 @@ impl App {
             // 注意这里判 `in_place` 而不是 `out_dir`——`out_dir` 在同一条结构体字面量里
             // 已经先被移进字段，再读它就是 use-after-move。
             mirror: self.mirror && !dry && !in_place,
+            // 界面**每次执行完都会写报告**（`write_report`），报告的「文件清单」
+            // 要填处理前后的整文件 SHA256 —— 所以这里必须恒开，否则报告那两列会是空的。
+            file_sha: true,
         }
     }
 
@@ -1184,7 +1187,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("wrepl")
-                        .size(22.0)
+                        .size(ui_scale::TITLE)
                         .strong()
                         .color(Color32::from_rgb(0x1F, 0x4E, 0x79)),
                 );
@@ -1206,7 +1209,7 @@ impl App {
                 if ui
                     .add_enabled(
                         can_run,
-                        egui::Button::new(RichText::new(label).size(15.0).strong()),
+                        egui::Button::new(RichText::new(label).size(ui_scale::BUTTON).strong()),
                     )
                     .on_hover_text(if self.out_to_subdir {
                         "把产物写到输出目录，源文件不动"
@@ -1283,6 +1286,16 @@ impl App {
             ui.add_space(6.0);
         });
 
+        // 运行日志**排在页面里**（中央滚动区的最后一块），与 0.2.2 一致。
+        //
+        // 0.2.3 中间把它改成过「贴底的独立面板」，想消掉"日志下面那片空白"。
+        // 结果是撞上 egui 0.29 的一个坑：`TopBottomPanel` 存进 state 的是**内容矩形**
+        // 的高度（不是面板矩形），下一帧又把它当面板高度读回来；而日志里那个
+        // `auto_shrink([false, false])` 的 ScrollArea 会把"可用高度"整块吃掉 ——
+        // 于是内容矩形每帧比面板高一截，形成正反馈。实测**强制重绘 5 帧，面板就从
+        // 168 涨到填满整个窗口**，「运行日志」的标题直接顶到标题栏下面。
+        // 教训：底部面板里不要放"吃满可用高度"的东西；固定高度也压不住（会变成
+        // 一条死横条），不如回到原位置 —— 日志跟着页面滚，最简单也最稳。
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.section_io(ui);
@@ -1404,7 +1417,7 @@ impl App {
                 // 高度封顶 6 行——一次选了几十个文件时不再往长里撑，框内自己滚。
                 let rows = self.input.lines().count().clamp(1, 6) as f32;
                 ui.add_sized(
-                    [F, 26.0 * rows],
+                    [F, ui_scale::ROW_H * rows],
                     egui::TextEdit::multiline(&mut self.input)
                         .hint_text("目录，或若干 .docx（一行一个）"),
                 );
@@ -1482,7 +1495,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.label("排除");
                 ui.add_sized(
-                    [180.0, 24.0],
+                    [180.0, ui_scale::EDIT_H],
                     egui::TextEdit::singleline(&mut self.exclude).hint_text("*_bak*"),
                 );
             });
@@ -1713,16 +1726,16 @@ impl App {
                                             // 隔行底色同样撑满整行
                                             ui.set_min_width(ui.available_width());
                                             ui.add_sized(
-                                                [w_find, 26.0],
+                                                [w_find, ui_scale::ROW_H],
                                                 egui::TextEdit::singleline(&mut r.find)
                                                     .hint_text("查找内容"),
                                             );
                                             ui.add_sized(
-                                                [w_repl, 26.0],
+                                                [w_repl, ui_scale::ROW_H],
                                                 egui::TextEdit::singleline(&mut r.replace)
                                                     .hint_text("替换为"),
                                             );
-                                            let resp = fixed_cell(ui, W_HIT, 26.0, match r.hits {
+                                            let resp = fixed_cell(ui, W_HIT, ui_scale::ROW_H, match r.hits {
                                                 Some(n) if n > 0 => {
                                                     RichText::new(n.to_string()).color(OK_C).strong()
                                                 }
@@ -1737,7 +1750,7 @@ impl App {
                                             // 中文字体里没有字形，实测渲染成豆腐块。
                                             if ui
                                                 .add_sized(
-                                                    [W_DEL, 26.0],
+                                                    [W_DEL, ui_scale::ROW_H],
                                                     egui::Button::new("×").small(),
                                                 )
                                                 .clicked()
@@ -2057,14 +2070,33 @@ impl App {
             // 只读：渲染成可选中的标签，不给文本框——可编辑的日志框会让人
             // 误以为改动有意义，而下一帧就会被真实轨迹覆盖掉。
             // 完整的一份在每次执行后落到产物目录的「运行日志.txt」里。
-            const SHOW: usize = 120;
+            //
+            // **不再给日志套 ScrollArea**（0.2.3 试过）：日志区跟着页面滚就行，
+            // 套一层内滚动条只会让人以为日志被截断了 —— 而且正是它把底部面板
+            // 撑爆的（见 `render` 里那段）。
+            const SHOW: usize = 240;
             let total = self.log.len();
             let start = total.saturating_sub(SHOW);
+            if start > 0 {
+                ui.label(
+                    RichText::new(format!("……（前面还有 {start} 行，省略）"))
+                        .small()
+                        .color(DIM_C),
+                );
+            }
             for line in &self.log[start..] {
-                ui.label(RichText::new(line).monospace().size(13.0));
+                ui.label(RichText::new(line).monospace().size(ui_scale::LOG));
             }
             if total == 0 {
-                ui.label(RichText::new("空").color(DIM_C));
+                // 空态：写清"日志是什么、会去哪"，比一个「空」字有用。
+                ui.label(
+                    RichText::new(
+                        "尚未运行 —— 点「执行替换」后这里逐行显示过程；\
+                         结束后完整的日志会写到产物目录的「运行日志.txt」",
+                    )
+                    .small()
+                    .color(DIM_C),
+                );
             }
         });
     }
@@ -2087,7 +2119,7 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new(title)
-                    .size(16.0)
+                    .size(ui_scale::SECTION)
                     .strong()
                     .color(Color32::from_rgb(0x1F, 0x4E, 0x79)),
             );
@@ -2098,12 +2130,12 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 /// 表格里的标签列（固定宽，保证每行对齐）。内容左对齐，与规则表表头一致。
 fn cell_label(ui: &mut egui::Ui, w: f32, s: &str) {
-    let _ = fixed_cell(ui, w, 24.0, RichText::new(s));
+    let _ = fixed_cell(ui, w, ui_scale::EDIT_H, RichText::new(s));
 }
 
 /// 路径输入框：固定宽高，不被父级布局压缩。
 fn path_edit(ui: &mut egui::Ui, w: f32, s: &mut String, hint: &str) {
-    let _ = ui.add_sized([w, 24.0], egui::TextEdit::singleline(s).hint_text(hint));
+    let _ = ui.add_sized([w, ui_scale::EDIT_H], egui::TextEdit::singleline(s).hint_text(hint));
 }
 
 /// 表头 / 隔行的淡底色。
@@ -2381,15 +2413,82 @@ fn short_sha(s: &str) -> String {
     }
 }
 
-// ─────────────────────── 字体 ───────────────────────
+// ─────────────────────── 字号与字体 ───────────────────────
 
-/// 运行时加载系统中文字体（不打包字体，避免授权与体积问题）。
+/// 界面度量：**所有字号、以及"必须跟着字号走"的行高，只在这里定义**。
+///
+/// 别处一律引用这些常量。想整体调大/调小界面，改这一个模块就够 —— 不必再去
+/// `app.rs` / `picker.rs` 里翻散落的数字。**那正是改字号最常见的事故来源**：
+/// 字放大了、装它的格子没放大，文字就被裁掉（本文件里有一堆 `add_sized`
+/// 是显式给宽高的，不跟着改就会溢出）。
+///
+/// 取值理由（2026-10-09，本机 1920×1080、缩放 100%）：egui 的默认值偏小 ——
+/// `Body` 12.5、`Button` 12.5、**`Small` 只有 9.0**，而 `Small` 正是表头、计数、
+/// 路径提示和 `.small()` 按钮在用的字号（本仓库 11 处），9 点几乎要凑近看。
+/// 这里整体比默认放大 15%~30%。**只动数值，不动布局结构。**
+pub mod ui_scale {
+    /// 窗口标题「wrepl」。
+    pub const TITLE: f32 = 24.0;
+    /// 分区标题（「替换规则」「输出」…）。
+    pub const SECTION: f32 = 17.0;
+    /// 正文：输入框、列表、普通标签。
+    pub const BODY: f32 = 16.0;
+    /// 按钮（含「执行替换」）。
+    pub const BUTTON: f32 = 16.0;
+    /// 日志与等宽文本。
+    pub const LOG: f32 = 14.0;
+    /// 辅助小字：表头、计数、提示、`.small()` 按钮。**egui 默认 9.0，太小了。**
+    pub const SMALL: f32 = 11.5;
+    /// 文件选择器：文件名 / 次要信息。
+    pub const PICK_NAME: f32 = 14.5;
+    pub const PICK_META: f32 = 13.0;
+    /// 文件选择器左侧导航栏的宽度（分区标题 + 「图标 + 文字」行）。
+    pub const PICK_SIDE_W: f32 = 172.0;
+
+    /// 规则表格一行的高度（里面装的是 `BODY` 号单行输入框）。
+    pub const ROW_H: f32 = 28.0;
+    /// 单个紧凑输入框/标签的高度（路径、排除、下拉）。
+    pub const EDIT_H: f32 = 26.0;
+    /// 文件选择器列表的一行。**28 而不是 24**：对着 Files 的观感调过 ——
+    /// 24 点在放大后的字号下显得挤，行与行的呼吸感不够。
+    pub const PICK_ROW_H: f32 = 28.0;
+    /// 文件选择器里自绘导航图标（后退 / 前进 / 上一级 / 刷新）的边长。
+    pub const NAV_BTN: f32 = 26.0;
+}
+
+/// 运行时加载系统中文字体（不打包字体，避免授权与体积问题），并设定界面字号与间距。
+///
+/// 字号一律取自 [`ui_scale`]；字体只做**插入**、不替换 egui 自带字体 ——
+/// egui 的字体表里还留着 Latin/emoji/符号（`✓`、`→`、`×` 之外的箭头等），
+/// 把整个 `Proportional` 家族换掉会让这些字形变成豆腐块。
 ///
 /// 优先微软雅黑 `msyh.ttc`——它是字体集合（`.ttc`），
 /// `epaint` 会把 `FontData::index` 透传给 `ab_glyph::FontRef::try_from_slice_and_index`，
 /// 所以索引 0 取第一张字面即可。找不到就退到黑体 / 宋体。
 pub fn install_fonts(ctx: &egui::Context) {
+    // 候选字体：**按"更现代"排，前面的优先**。
+    //
+    // 只读系统已装的字体、**不打包进产物** —— 零体积增长、无字体授权问题，
+    // 也解释了为什么产物一直是 6~7 MB（对比：嵌一个中文字体要 +5~10 MB）。
+    //
+    // 前 8 项是更现代的中文无衬线（小米 MiSans / 华为 HarmonyOS Sans / 思源黑体 /
+    // Noto Sans SC / 阿里普惠体 / OPPO Sans）。**本机一个都没装**，所以行为与以前
+    // 完全一致；哪天装了，重启程序就自动用上，不用改代码。
+    // 后面五项是 Windows 保底，尤其 `msyh.ttc`（微软雅黑）—— 简体中文系统的标配，
+    // 字形覆盖最全，作为兜底最稳。
+    //
+    // 注意 `.ttc` 是字体集合，靠 `FontData::index` 选第几张字面（见下方注释）。
     const CANDIDATES: &[(&str, u32)] = &[
+        // ── 更现代的中文黑体（装了才生效，都是免费商用授权）──
+        ("C:/Windows/Fonts/MiSans-Regular.ttf", 0),
+        ("C:/Windows/Fonts/MiSans-Regular.otf", 0),
+        ("C:/Windows/Fonts/HarmonyOS_Sans_SC_Regular.ttf", 0),
+        ("C:/Windows/Fonts/SourceHanSansSC-Regular.otf", 0),
+        ("C:/Windows/Fonts/SourceHanSansCN-Regular.otf", 0),
+        ("C:/Windows/Fonts/NotoSansSC-Regular.otf", 0),
+        ("C:/Windows/Fonts/AlibabaPuHuiTi-3-55-Regular.ttf", 0),
+        ("C:/Windows/Fonts/OPPOSans-R.ttf", 0),
+        // ── Windows 保底 ──
         ("C:/Windows/Fonts/msyh.ttc", 0),
         ("C:/Windows/Fonts/msyhbd.ttc", 0),
         ("C:/Windows/Fonts/simhei.ttf", 0),
@@ -2422,20 +2521,48 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::new(15.0, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        egui::FontId::new(15.0, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Monospace,
-        egui::FontId::new(13.5, egui::FontFamily::Monospace),
-    );
+    // 五个内置字号**全部**显式给值，不留 egui 默认 —— 取值理由见 `ui_scale`。
+    //   · 不给 `Small` 会漏掉表头/计数/提示/`.small()` 按钮这 11 处；
+    //   · 不给 `Heading` 则将来谁写一句 `.heading()` 又会掉回默认的 18.0。
+    for (which, size, family) in [
+        (
+            egui::TextStyle::Small,
+            ui_scale::SMALL,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Body,
+            ui_scale::BODY,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Button,
+            ui_scale::BUTTON,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Heading,
+            ui_scale::SECTION,
+            egui::FontFamily::Proportional,
+        ),
+        (
+            egui::TextStyle::Monospace,
+            ui_scale::LOG,
+            egui::FontFamily::Monospace,
+        ),
+    ] {
+        style.text_styles.insert(which, egui::FontId::new(size, family));
+    }
+    // 间距跟着字号一起放宽。只放大字号而不动间距，界面会比原来**更挤**：
+    // 字与字的留白是按 egui 默认的小字号配的（item_spacing.y 只有 3.0）。
+    style.spacing.item_spacing = egui::vec2(9.0, 5.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    // 按钮/复选框等的默认最小高度（egui 默认 18.0），要容纳 `BUTTON` 号字 + 上下内边距。
+    style.spacing.interact_size = egui::vec2(44.0, 24.0);
     ctx.set_style(style);
-    let _ = used;
+    // 把实际选中的字体写进日志 —— 以后有人问"为什么看着不一样"，
+    // 这一行能直接回答（而不是靠猜他机器上装了什么）。
+    crate::diag::log(format!("界面字体：{used}"));
 }
 
 // ─────────────────────── 无窗口自检 ───────────────────────

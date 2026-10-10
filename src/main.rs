@@ -192,6 +192,8 @@ fn cmd_scan(t: &Targets, rs: &RuleSource) -> Result<()> {
         verify_after: false,
         threads: t.threads,
         mirror: false,
+        // scan 不落盘、不出报告，文件级 SHA256 没有任何消费者
+        file_sha: false,
     };
 
     let (files, skipped) = pipeline::collect_targets(&t.paths, &opts)?;
@@ -277,6 +279,11 @@ fn cmd_apply(
         threads: t.threads,
         longest_first,
         mirror,
+        // 文件级 SHA256 是**报告**与**完整镜像自证**才用得上的东西，
+        // 为它每个文件要整读两遍、算两次 SHA256（8.8 MB 的文件约 40 ms/次）。
+        // 不给 --report、也不开 --mirror 时没人消费这两个值，就不算。
+        // （mirror 那一支在 pipeline::run 里还会再强制打开一次，双保险。）
+        file_sha: report_path.is_some() || mirror,
     };
 
     let out_desc = if dry {

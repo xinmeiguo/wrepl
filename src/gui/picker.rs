@@ -22,6 +22,11 @@
 //!    每帧都做纯属浪费（见 [`Picker::refresh_places`]）。
 //! 3. **系统对话框不删**。右下角留了一个不显眼的「...」入口兜底
 //!    （[`Outcome::Fallback`]），遇到自绘面板搞不定的场合能原地退回去。
+//! 4. **界面是按帧重绘的**（egui 是立即模式），所以绘制路径上**不许有分配和 IO**。
+//!    面包屑的分段、每行的图标类型这类"能提前算的"，一律在
+//!    [`Picker::set_loc`] / 读目录那一次算好存下来；每帧只查表。
+//!    同理**不去抽 Windows 的真实壳图标/缩略图** —— 那是每个文件一次
+//!    GDI/COM 调用，几百个文件的目录会让打开面板肉眼可见地变慢。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -31,7 +36,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use egui::{Align2, Color32, FontId, RichText, Sense, Vec2};
 
+// 字号与行高统一取自 `app::ui_scale` —— 别在这里写裸数字（见那个模块的说明）。
+use crate::app::ui_scale;
+
 // ─────────────────────────── 对外接口 ───────────────────────────
+
+/// 面板尺寸（点）。居中位置由它算出来，别在别处硬编码偏移量。
+///
+/// **与 0.2.2 一致（920×600）**：1000×640 那次放大跟着整体字号一起做，
+/// 实际看着偏大。字号保持放大，面板回到原尺寸即可。
+const PANEL_W: f32 = 920.0;
+const PANEL_H: f32 = 600.0;
 
 /// 面板要干什么。三种模式决定「确认」按钮的含义与返回什么。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,6 +79,67 @@ struct Entry {
     /// Unix 秒；读不到（权限等）就是 `None`，界面显示 `—`。
     mtime: Option<i64>,
     hidden: bool,
+    /// 图标类型。**在后台线程读目录那次就算好**，绘制时只是查表 ——
+    /// 每帧按扩展名去 `match` 一次字符串也能跑，但有 N 行就是 N 次；
+    /// 放在这里等于零成本（见 [`RowIcon`] 的说明）。
+    icon: RowIcon,
+}
+
+/// 行图标类型 —— 参照 Files / Windows 资源管理器，**Office 系按各自的品牌色**，
+/// 其余文件保持灰色描边文档。
+///
+/// 判定只看扩展名（不碰注册表、不抽系统壳图标）：真去抽 `.ico` 是每个文件一次
+/// GDI/COM 调用，一个目录几百个文件就会让"打开选择器"明显变慢 —— 那条路不走。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowIcon {
+    Dir,
+    Word,
+    Excel,
+    Ppt,
+    Pdf,
+    Other,
+}
+
+impl RowIcon {
+    fn of(name: &str) -> Self {
+        let ext = match name.rsplit_once('.') {
+            Some((_, e)) => e,
+            None => return Self::Other,
+        };
+        // 不分配：`eq_ignore_ascii_case` 直接比切片。
+        if ext.eq_ignore_ascii_case("docx") || ext.eq_ignore_ascii_case("doc") {
+            Self::Word
+        } else if ext.eq_ignore_ascii_case("xlsx") || ext.eq_ignore_ascii_case("xls") {
+            Self::Excel
+        } else if ext.eq_ignore_ascii_case("pptx") || ext.eq_ignore_ascii_case("ppt") {
+            Self::Ppt
+        } else if ext.eq_ignore_ascii_case("pdf") {
+            Self::Pdf
+        } else {
+            Self::Other
+        }
+    }
+
+    /// 实心方块的底色。`None` = 画成灰色描边文档（不做实心块）。
+    fn solid(self) -> Option<Color32> {
+        match self {
+            Self::Word => Some(Color32::from_rgb(0x2B, 0x57, 0x9A)),
+            Self::Excel => Some(Color32::from_rgb(0x21, 0x73, 0x46)),
+            Self::Ppt => Some(Color32::from_rgb(0xC4, 0x3E, 0x1C)),
+            Self::Pdf => Some(Color32::from_rgb(0xB0, 0x2B, 0x2B)),
+            _ => None,
+        }
+    }
+
+    /// 方块上一个白色字母（PDF 用三条横线，见 [`paint_row_icon`]）。
+    fn letter(self) -> Option<&'static str> {
+        match self {
+            Self::Word => Some("W"),
+            Self::Excel => Some("X"),
+            Self::Ppt => Some("P"),
+            _ => None,
+        }
+    }
 }
 
 /// 排序键。点表头切换。
@@ -115,6 +191,23 @@ pub struct Picker {
     cwd: PathBuf,
     /// 地址栏文本。与 `cwd` 分开：可以敲一半、敲错、粘 UNC 而不影响 `cwd`。
     addr: String,
+    /// 地址栏是「正在手输路径」还是「面包屑」。默认面包屑；点空白处 /
+    /// 右边那枚小图标切到手输（UNC 路径得靠它）。
+    addr_editing: bool,
+    /// 刚切进手输状态、**还需要抢一次焦点**。只在切换那一帧为真 ——
+    /// 见 [`Picker::addr_bar`] 里为什么不每帧 `request_focus`。
+    addr_focus: bool,
+    /// 面包屑分段：`(显示名, 该段指向的路径)`。
+    ///
+    /// **必须缓存**：`body()` 每帧都会画它，若在绘制处现场切路径，
+    /// 每帧都要新建 `Vec` 和一堆 `String`。改在 [`Picker::set_loc`] 里算一次。
+    crumbs: Vec<(String, PathBuf)>,
+    /// 浏览历史 + 当前位置（后退 / 前进）。
+    history: Vec<PathBuf>,
+    hist_idx: usize,
+    /// 本次会话走过的目录（「最近使用」分区）。**只存内存**，不落盘 ——
+    /// 启动时读一个历史文件就要碰磁盘，那才是真的会影响打开速度。
+    recent: Vec<PathBuf>,
 
     // ── 内容 ──
     /// 全量条目（不过滤、不排序，保持 `read_dir` 的顺序）。
@@ -161,6 +254,12 @@ impl Picker {
             filter_label: String::new(),
             cwd: home.clone(),
             addr: String::new(),
+            addr_editing: false,
+            addr_focus: false,
+            crumbs: Vec::new(),
+            history: Vec::new(),
+            hist_idx: 0,
+            recent: Vec::new(),
             all: Vec::new(),
             view: Vec::new(),
             sel: BTreeSet::new(),
@@ -218,6 +317,8 @@ impl Picker {
         self.err = None;
         self.sel.clear();
         self.anchor = None;
+        // 每次打开都从"面包屑"开始 —— 上次可能停在手输状态，留着会让人以为坏了。
+        self.addr_editing = false;
         self.open = true;
         // 盘符可能刚刚挂载/断开（插 U 盘、映射网盘），每次打开重扫一遍。
         self.refresh_places();
@@ -279,19 +380,21 @@ impl Picker {
             });
 
         // ② 面板本体。`all` 先 take 出来，免得闭包里同时借 `&mut self` 和 `&self.all`。
+        //    尺寸用常量，居中偏移由它算出来 —— 否则改了宽度忘了改那个 `-470.0`，
+        //    面板就会偏在屏幕一边（宽度一改，居中量就跟着变）。
         let entries = std::mem::take(&mut self.all);
         egui::Area::new(egui::Id::new("wrepl-picker"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(
-                (screen.center().x - 470.0).max(8.0),
-                (screen.center().y - 310.0).max(8.0),
+                (screen.center().x - PANEL_W / 2.0).max(8.0),
+                (screen.center().y - PANEL_H / 2.0).max(8.0),
             ))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
-                        ui.set_width(920.0);
-                        ui.set_height(600.0);
+                        ui.set_width(PANEL_W);
+                        ui.set_height(PANEL_H);
                         act = self.body(ui, ctx, &entries);
                     });
             });
@@ -329,10 +432,13 @@ impl Picker {
                     Ok((dir, list)) => {
                         crate::diag::log(format!("读取完成：{} 项  {}", list.len(), dir.display()));
                         self.all = list;
-                        self.cwd = dir.clone();
-                        self.addr = dir.display().to_string();
-                        self.last_dir = dir;
+                        self.set_loc(&dir);
+                        self.last_dir = dir.clone();
                         self.err = None;
+                        // 历史与「最近使用」只在**读成功**之后记 —— 路径不存在时
+                        // 读会失败，那时不该往历史里塞一条点不回来的记录。
+                        self.push_history(dir.clone());
+                        self.push_recent(dir);
                         // 这里 self.all 就是权威数据，本可以直接 `self.refresh_view(&self.all)`，
                         // 但那会同时借 `&mut self` 和 `&self.all`（同一个 self）——借不过去。
                         // 所以就地展开；排序/过滤仍走同一个 build_view，保证与面板内一致。
@@ -351,7 +457,8 @@ impl Picker {
                         // 读不到就停在原地，把原因说清楚（权限 / 网络 / 路径不存在）
                         crate::diag::log(format!("读取失败：{e}"));
                         self.err = Some(e);
-                        self.addr = self.cwd.display().to_string();
+                        // 回到"真的在这儿"的位置：`navigate` 是乐观更新的，失败就得撤。
+                        self.set_loc(&self.cwd.clone());
                     }
                 }
                 self.load = None;
@@ -364,8 +471,72 @@ impl Picker {
         }
     }
 
+    /// 把「当前在哪」这组展示状态一次性写好：`cwd` / 地址栏文本 / 面包屑分段。
+    ///
+    /// 面包屑**只在这里算**（每帧几十次 `String` 分配是没必要的开销），
+    /// 绘制时直接读 `self.crumbs`。见结构体上 `crumbs` 字段的说明。
+    fn set_loc(&mut self, dir: &Path) {
+        self.cwd = dir.to_path_buf();
+        self.addr = dir.display().to_string();
+        self.crumbs = crumbs_of(dir);
+    }
+
+    /// 记一条浏览历史。**同一目录不重复记**（后退/前进落回原地时不该再压栈）。
+    fn push_history(&mut self, dir: PathBuf) {
+        if self.history.get(self.hist_idx) == Some(&dir) {
+            return;
+        }
+        self.history.truncate(self.hist_idx + 1);
+        self.history.push(dir);
+        // 上限 64 条：够用，且不会因为长时间乱逛无限长大。
+        if self.history.len() > 64 {
+            self.history.remove(0);
+        }
+        self.hist_idx = self.history.len() - 1;
+    }
+
+    /// 记一条「最近使用」，新的在前、去重、最多 5 条。
+    fn push_recent(&mut self, dir: PathBuf) {
+        self.recent.retain(|p| p != &dir);
+        self.recent.insert(0, dir);
+        self.recent.truncate(5);
+    }
+
+    fn can_back(&self) -> bool {
+        self.hist_idx > 0
+    }
+
+    fn can_forward(&self) -> bool {
+        self.hist_idx + 1 < self.history.len()
+    }
+
+    fn go_back(&mut self) {
+        if self.can_back() {
+            self.hist_idx -= 1;
+            let d = self.history[self.hist_idx].clone();
+            // 走「不压栈」的路径，否则后退会被当成新导航、把前进记录截断。
+            self.navigate_hist(d);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if self.can_forward() {
+            self.hist_idx += 1;
+            let d = self.history[self.hist_idx].clone();
+            self.navigate_hist(d);
+        }
+    }
+
     /// 跳到某个目录（**不在 UI 线程上读**）。
     fn navigate(&mut self, dir: PathBuf) {
+        // 展示状态**乐观更新**：面包屑与地址栏立刻跟着走，不等读目录回来。
+        // 读失败时 `poll()` 会把 `set_loc` 撤回到真正所在的目录。
+        self.set_loc(&dir);
+        self.navigate_hist(dir);
+    }
+
+    /// `navigate` 的"不动展示状态"版本 —— 后退 / 前进用它。
+    fn navigate_hist(&mut self, dir: PathBuf) {
         crate::diag::log(format!("导航 → {}", dir.display()));
         let seq = self.load.as_ref().map_or(1, |l| l.seq + 1);
         let (tx, rx) = mpsc::channel();
@@ -373,7 +544,6 @@ impl Picker {
         std::thread::spawn(move || {
             let _ = tx.send((seq, read_dir_entries(&d)));
         });
-        self.addr = dir.display().to_string();
         self.load = Some(Load {
             rx,
             seq,
@@ -389,13 +559,19 @@ impl Picker {
 
     fn reload(&mut self) {
         let d = self.cwd.clone();
-        self.navigate(d);
+        self.navigate_hist(d);
     }
 
     fn go_up(&mut self) {
         if let Some(p) = self.cwd.parent().map(Path::to_path_buf) {
             self.navigate(p);
         }
+    }
+
+    /// 切到目录树里的某一段（面包屑 / 左侧导航）。与 [`Self::navigate`] 同义，
+    /// 单独留个名字只是为了调用点读起来清楚。
+    fn jump(&mut self, dir: PathBuf) {
+        self.navigate(dir);
     }
 
     /// 按当前过滤 + 排序算出「可见条目在 `all` 里的下标」。
@@ -519,139 +695,463 @@ impl Picker {
 
     // ─────────────────────────── 界面 ───────────────────────────
 
-    fn body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, entries: &[Entry]) -> Option<Act> {
+    fn body(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context, entries: &[Entry]) -> Option<Act> {
         let mut act: Option<Act> = None;
-        let mut enter_used = false;
+        let mut jump: Option<PathBuf> = None;
 
-        // ⓪ 标题
+        let full_h = ui.available_height();
+        let side_w = ui_scale::PICK_SIDE_W;
+        let pal = palette(ui);
+
+        ui.horizontal_top(|ui| {
+            // ① 左导航（固定宽）。底色在这里画：`nav_side` 只负责内容，
+            //    绘制顺序决定 Z 序 —— 先铺底再摆行，字不会被盖住。
+            let side_rect =
+                egui::Rect::from_min_size(ui.cursor().min, Vec2::new(side_w, full_h));
+            ui.painter().rect_filled(side_rect, 6.0, pal.side);
+            ui.allocate_ui_with_layout(
+                Vec2::new(side_w, full_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    jump = self.nav_side(ui);
+                },
+            );
+
+            ui.add_space(12.0);
+
+            // ② 右内容（吃掉剩下的宽度）
+            let w = ui.available_width();
+            ui.allocate_ui_with_layout(
+                Vec2::new(w, full_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    act = self.content(ui, entries);
+                },
+            );
+        });
+
+        // 跳转放在闭包外面做：闭包里 `self` 已经被借给 `nav_side` / `content` 了。
+        if let Some(p) = jump {
+            self.jump(p);
+        }
+        act
+    }
+
+    /// 左侧导航栏：标题 + 「分区标题 / 图标行」两级。
+    ///
+    /// 数据全部来自**已缓存**的 `drives_cache` / `places_cache`（外加内存里的
+    /// `recent`）—— 这里不扫盘、不碰文件系统，见模块头第 2、4 条约束。
+    /// 返回被点中的目标目录。
+    fn nav_side(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        let pal = palette(ui);
+        let mut pick: Option<PathBuf> = None;
+
+        // 标题：原来横贯面板顶部一整行，现在收进侧栏 —— 内容区因此多出一行的高度。
         let title = self.title.clone();
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(15.0).strong().color(DIR_C));
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(title)
+                    .size(ui_scale::SMALL + 1.5)
+                    .strong()
+                    .color(DIR_C),
+            );
         });
-        ui.add_space(6.0);
+        ui.add_space(12.0);
 
-        // ① 盘符 + 快捷位
-        let drv = self.drives_cache.clone();
+        let cwd = self.cwd.clone();
         let places = self.places_cache.clone();
-        ui.horizontal_wrapped(|ui| {
-            let mut jump: Option<PathBuf> = None;
-            for d in &drv {
-                let label = match &d.remote {
-                    Some(_) => format!("{} · 网络", d.letter),
-                    None => d.letter.clone(),
-                };
-                let b = match &d.remote {
-                    Some(r) => ui
-                        .small_button(label)
-                        .on_hover_text(format!("映射到 {r}")),
-                    None => ui.small_button(label).on_hover_text(d.kind),
-                };
-                if b.clicked() {
-                    jump = Some(PathBuf::from(format!("{}\\", letter_of(&d.letter))));
+        let drives_v = self.drives_cache.clone();
+        let recent = self.recent.clone();
+        // 当前目录的归一化文本（去尾部 `\`）。算一次，行内只做比较 ——
+        // 每行都 `display()` 一遍会有十几次小分配，没必要（见模块头第 4 条）。
+        let cwd_s = cwd.display().to_string();
+        let cur_norm = cwd_s.trim_end_matches(['\\', '/']);
+
+        // ── 快速访问 ──
+        nav_section(ui, "快速访问");
+        for &(label, ref p) in &places {
+            // 图标随位置变：用户 / 桌面 / 文档 / 下载各一个字形与颜色。
+            let (glyph, color) = match label {
+                "用户" => (NavGlyph::Home, 0x378ADD),
+                "桌面" => (NavGlyph::Desktop, 0x7F77DD),
+                "文档" => (NavGlyph::Doc, 0x185FA5),
+                _ => (NavGlyph::Download, 0x1D9E75),
+            };
+            if nav_row(
+                ui,
+                &pal,
+                glyph,
+                Color32::from_rgb(
+                    (color >> 16) as u8,
+                    ((color >> 8) & 0xFF) as u8,
+                    (color & 0xFF) as u8,
+                ),
+                label,
+                same_dir(cur_norm, p),
+                &p.display().to_string(),
+            ) {
+                pick = Some(p.clone());
+            }
+        }
+
+        // ── 此电脑（盘符）── 映射网盘单独标出它指向的 UNC。
+        ui.add_space(8.0);
+        nav_section(ui, "此电脑");
+        for d in &drives_v {
+            let target = PathBuf::from(format!("{}\\", letter_of(&d.letter)));
+            let (glyph, color, tip) = match &d.remote {
+                Some(r) => (NavGlyph::Net, Color32::from_rgb(0x0F, 0x6E, 0x56), format!("映射到 {r}")),
+                None => (
+                    NavGlyph::Drive,
+                    Color32::from_rgb(0x5F, 0x5E, 0x5A),
+                    d.kind.to_string(),
+                ),
+            };
+            let short = drive_short(&d.letter);
+            if nav_row(ui, &pal, glyph, color, &short, same_dir(cur_norm, &target), &tip) {
+                pick = Some(target);
+            }
+        }
+
+        // ── 最近使用（只记本次会话，不落盘）──
+        //    先滤掉当前目录再决定要不要出这个小节 —— 否则首次打开时
+        //    「最近使用」里只有当前目录这一条，滤完就剩一个**空标题**。
+        let others: Vec<&PathBuf> = recent.iter().filter(|p| !same_dir(cur_norm, p)).collect();
+        if !others.is_empty() {
+            ui.add_space(8.0);
+            nav_section(ui, "最近使用");
+            for p in others {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string());
+                if nav_row(
+                    ui,
+                    &pal,
+                    NavGlyph::Clock,
+                    Color32::from_rgb(0x88, 0x87, 0x80),
+                    &name,
+                    false,
+                    &p.display().to_string(),
+                ) {
+                    pick = Some(p.clone());
                 }
             }
-            ui.separator();
-            for (label, p) in &places {
-                if ui.small_button(*label).clicked() {
-                    jump = Some(p.clone());
-                }
-            }
-            if let Some(p) = jump {
-                self.navigate(p);
-            }
-        });
-        ui.add_space(6.0);
+        }
 
-        // ② 地址栏
-        ui.horizontal(|ui| {
-            let up_ok = self.cwd.parent().is_some();
-            if ui
-                .add_enabled(up_ok, egui::Button::new("↑"))
-                .on_hover_text("上一级")
-                .clicked()
-            {
-                self.go_up();
-            }
-            if ui
-                .button("⟳")
-                .on_hover_text("刷新（网络路径可能较慢）")
-                .clicked()
-            {
-                self.reload();
-            }
+        pick
+    }
 
-            let w = (ui.available_width() - 76.0).max(160.0);
+    /// 地址栏。两档：
+    ///
+    /// * **面包屑**（默认）—— 路径按 `\` 分段，点哪段跳哪段；太长时从前面省略，
+    ///   保留离当前目录最近的几段。点空白处或右端那枚小图标切到手输。
+    /// * **手输**（`addr_editing`）—— 一个普通文本框。这一档必须留：
+    ///   局域网 UNC（`\\server\share`）只能敲进来或粘进来。
+    fn addr_bar(&mut self, ui: &mut egui::Ui, enter_used: &mut bool) {
+        let w = ui.available_width();
+        let h = ui_scale::EDIT_H;
+
+        if self.addr_editing {
             let resp = ui.add_sized(
-                [w, 24.0],
+                [w, h],
                 egui::TextEdit::singleline(&mut self.addr)
                     .hint_text(r"目录，或 \\服务器\共享\子目录"),
             );
-            // 地址栏回车 = 转到（**吃掉这次 Enter**，不再触发底部的确认）
-            let mut go_addr = false;
+            // 只在刚切进来的那一帧抢焦点。每帧都 `request_focus` 会和"点别处"
+            // 打架：egui 先把焦点交出去、我们下一帧又抢回来，文本框就摘不掉了。
+            //
+            // 抢到焦点这一帧**直接返回**：不然后面那句 `lost_focus` 判定的
+            // 是"焦点还没到手"的状态，刚切成手输就被判成"失去焦点"退出去了。
+            if self.addr_focus {
+                resp.request_focus();
+                self.addr_focus = false;
+                return;
+            }
+            // 回车 = 转到（**吃掉这次 Enter**，不再触发底部的确认）
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                enter_used = true;
-                go_addr = true;
-            }
-            if ui.button("转到").clicked() {
-                go_addr = true;
-            }
-            if go_addr {
+                *enter_used = true;
                 let t = self.addr.trim().to_string();
+                self.addr_editing = false;
                 if !t.is_empty() {
-                    self.navigate(PathBuf::from(t));
+                    self.jump(PathBuf::from(t));
                 }
+            } else if resp.lost_focus() {
+                // 焦点走掉（点了别处）就退回面包屑，并把没提交的草稿丢掉
+                self.addr_editing = false;
+                self.addr = self.cwd.display().to_string();
             }
-        });
-        ui.add_space(6.0);
+            return;
+        }
 
-        // ③ 表头（可点：切换排序）
-        let row_h = 22.0;
+        let pal = palette(ui);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+        ui.painter()
+            .rect_filled(rect, 5.0, pal.bg);
+        ui.painter().rect_stroke(
+            rect,
+            5.0,
+            egui::Stroke::new(1.0_f32, pal.border),
+        );
+
+        let font = FontId::proportional(ui_scale::SMALL + 1.0);
+        let txt_c = ui.visuals().text_color();
+
+        // 先量宽（一次），再决定要不要从前面省略。
+        let n = self.crumbs.len();
+        let mut widths: Vec<f32> = Vec::with_capacity(n);
+        for (i, (name, _)) in self.crumbs.iter().enumerate() {
+            let col = if i + 1 == n { DIR_C } else { txt_c };
+            let g = ui.painter().layout_no_wrap(name.clone(), font.clone(), col);
+            widths.push(g.size().x);
+        }
+
+        /// 段与段之间的分隔箭头占的宽。
+        const CHEV: f32 = 15.0;
+        /// 每段左右各留的内边距合计。
+        const PAD: f32 = 12.0;
+        let avail = (rect.width() - 40.0).max(60.0);
+        let mut from = 0usize;
+        loop {
+            let mut total = if from > 0 { 20.0 } else { 0.0 }; // 省出来的那个「…」
+            for x in &widths[from..] {
+                total += x + PAD + CHEV;
+            }
+            if total <= avail || from + 2 >= n {
+                break;
+            }
+            from += 1;
+        }
+
+        let mut x = rect.left() + 8.0;
+        let cy = rect.center().y;
+        let mut hit: Option<PathBuf> = None;
+        if from > 0 {
+            ui.painter().text(
+                egui::pos2(x + 2.0, cy),
+                Align2::LEFT_CENTER,
+                "…",
+                font.clone(),
+                DIM,
+            );
+            x += 18.0;
+        }
+        for i in from..n {
+            let last = i + 1 == n;
+            let col = if last { DIR_C } else { txt_c };
+            let bw = widths[i] + PAD;
+            let brect = egui::Rect::from_min_size(
+                egui::pos2(x, rect.top() + 2.0),
+                Vec2::new(bw, rect.height() - 4.0),
+            );
+            // 自绘的段没有 egui 自动生成的 id，得自己给一个（还要唯一）。
+            let cr = ui
+                .interact(brect, ui.id().with(("crumb", i)), Sense::click())
+                .on_hover_text(self.crumbs[i].1.display().to_string());
+            if cr.hovered() {
+                ui.painter().rect_filled(brect, 3.0, pal.hover);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            ui.painter().text(
+                brect.center(),
+                Align2::CENTER_CENTER,
+                &self.crumbs[i].0,
+                font.clone(),
+                col,
+            );
+            if cr.clicked() {
+                hit = Some(self.crumbs[i].1.clone());
+            }
+            x += bw;
+            if !last {
+                ui.painter().add(egui::Shape::line(
+                    vec![
+                        egui::pos2(x + 4.5, cy - 3.0),
+                        egui::pos2(x + 7.5, cy),
+                        egui::pos2(x + 4.5, cy + 3.0),
+                    ],
+                    egui::Stroke::new(1.2_f32, DIM),
+                ));
+                x += CHEV;
+            }
+        }
+
+        // 右端的「编辑路径」小按钮（铅笔）。UNC 路径就是从这儿进去敲的。
+        let ebr = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 26.0, rect.top() + 3.0),
+            Vec2::new(22.0, rect.height() - 6.0),
+        );
+        let er = ui
+            .interact(ebr, ui.id().with("crumb-edit"), Sense::click())
+            .on_hover_text("输入路径（局域网 UNC 粘这里）");
+        if er.hovered() {
+            ui.painter().rect_filled(ebr, 3.0, pal.hover);
+        }
+        paint_pencil(ui.painter(), ebr.center(), er.hovered());
+
+        let mut edit = er.clicked();
+        // 点在段之间的空白上 = 直接进编辑（与资源管理器一致）
+        if resp.clicked() && hit.is_none() {
+            edit = true;
+        }
+        if edit {
+            self.addr_editing = true;
+            self.addr_focus = true;
+        }
+        if let Some(p) = hit {
+            self.jump(p);
+        }
+    }
+
+    /// 右侧内容区：工具栏（导航 + 地址栏）→ 表头 → 列表 → 状态栏 → 动作条。
+    fn content(&mut self, ui: &mut egui::Ui, entries: &[Entry]) -> Option<Act> {
+        let mut act: Option<Act> = None;
+        let mut enter_used = false;
+
+        // ① 工具栏：四枚自绘导航图标 + 地址栏，同占一行（Files 也是这么摆的）。
+        ui.horizontal(|ui| {
+            if nav_button(ui, NavIcon::Back, self.can_back(), "后退").clicked() {
+                self.go_back();
+            }
+            if nav_button(ui, NavIcon::Forward, self.can_forward(), "前进").clicked() {
+                self.go_forward();
+            }
+            let up_ok = self.cwd.parent().is_some();
+            if nav_button(ui, NavIcon::Up, up_ok, "上一级").clicked() {
+                self.go_up();
+            }
+            if nav_button(ui, NavIcon::Refresh, true, "刷新（网络路径可能较慢）").clicked() {
+                self.reload();
+            }
+            ui.add_space(4.0);
+            self.addr_bar(ui, &mut enter_used);
+        });
+        ui.add_space(8.0);
+
+        // ② 表头（可点：切换排序）
+        let row_h = ui_scale::PICK_ROW_H;
         let full_w = ui.available_width();
         let col_size = 92.0;
         let col_time = 132.0;
         let name_w = (full_w - col_size - col_time - 30.0).max(120.0);
+        let head_h = ui_scale::PICK_ROW_H;
 
         let mut sort_click: Option<SortKey> = None;
+        let pal = palette(ui);
+        // 表头底纹：先占一个空绘制槽，等表头排完版、知道它实际占了多高，
+        // 再回填成一块底色 —— 底色的 Z 序按 `add` 的时间点算，所以仍在按钮**下面**。
+        // （直接先画会画错高度：表头高度得排完版才知道。）
+        let head_shape = ui.painter().add(egui::Shape::Noop);
+        let head_top = ui.cursor().min;
         ui.horizontal(|ui| {
-            let arrow = |k: SortKey, s: &Self| -> &'static str {
-                if s.sort == k {
-                    // ★ 只用 ↑ ↓（U+2191/2193）。`▴`/`▾`(U+25B4/BE) 在本机的字体里
-                    //   是**豆腐块** —— 实测表头会显示成「名称 □」，与 §5.3 同一类坑。
-                    if s.sort_desc { " ↓" } else { " ↑" }
-                } else {
-                    ""
+            // 表头**自己画**，不用 Button：Button 会把文字摆在自己正中，
+            // 于是「名称」比下面的文件名缩进半个列宽（字号小的时候看不出来，
+            // 放大之后一眼就不齐）。这里三格与数据走同一条基准线：
+            // 名称左对齐到 `NAME_DX`、大小右对齐、时间左对齐。
+            let name_r = ui
+                .allocate_response(Vec2::new(name_w, head_h), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let size_r = ui
+                .allocate_response(Vec2::new(col_size, head_h), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let time_r = ui
+                .allocate_response(Vec2::new(col_time, head_h), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let p = ui.painter();
+            // 悬停的那一列压一层淡底（Files 的表头就是这样提示"这列能点"）。
+            for r in [&name_r, &size_r, &time_r] {
+                if r.hovered() {
+                    p.rect_filled(r.rect, 3.0, pal.hover);
                 }
+            }
+            let f = FontId::proportional(ui_scale::SMALL);
+            let (n_txt, s_txt, t_txt) = ("名称", "大小", "修改时间");
+            p.text(
+                egui::pos2(name_r.rect.left() + NAME_DX, name_r.rect.center().y),
+                Align2::LEFT_CENTER,
+                n_txt,
+                f.clone(),
+                DIM,
+            );
+            p.text(
+                egui::pos2(size_r.rect.right() - 10.0, size_r.rect.center().y),
+                Align2::RIGHT_CENTER,
+                s_txt,
+                f.clone(),
+                DIM,
+            );
+            p.text(
+                egui::pos2(time_r.rect.left() + 8.0, time_r.rect.center().y),
+                Align2::LEFT_CENTER,
+                t_txt,
+                f.clone(),
+                DIM,
+            );
+            // 排序指示：**自己画一个小三角**，不用 `↑`/`↓` 字符 ——
+            // 字符的字重跟着字体走，且 `▴`/`▾`(U+25B4/BE) 在本机是豆腐块
+            // （表头会显示成「名称 □」）。画出来的三角跨机器都长一样。
+            let tri = |cx: f32, cy: f32, up: bool| {
+                let (a, b) = (4.0_f32, 2.6_f32);
+                let pts = if up {
+                    vec![
+                        egui::pos2(cx - a, cy + b),
+                        egui::pos2(cx + a, cy + b),
+                        egui::pos2(cx, cy - b),
+                    ]
+                } else {
+                    vec![
+                        egui::pos2(cx - a, cy - b),
+                        egui::pos2(cx + a, cy - b),
+                        egui::pos2(cx, cy + b),
+                    ]
+                };
+                p.add(egui::Shape::convex_polygon(pts, DIR_C, egui::Stroke::NONE));
             };
-            let mut hdr = |ui: &mut egui::Ui, w: f32, txt: String, k: SortKey| {
-                if ui
-                    .add_sized(
-                        [w, 20.0],
-                        egui::Button::new(RichText::new(txt).small().color(DIM)).frame(false),
-                    )
-                    .clicked()
-                {
+            // 三角摆在各自列标题的右侧（名称列按文字宽估个位）。
+            let w_txt = |s: &str, ui: &egui::Ui| -> f32 {
+                ui.painter()
+                    .layout_no_wrap(s.to_string(), FontId::proportional(ui_scale::SMALL), DIM)
+                    .size()
+                    .x
+            };
+            let cy = name_r.rect.center().y;
+            if self.sort == SortKey::Name {
+                tri(
+                    name_r.rect.left() + NAME_DX + w_txt(n_txt, ui) + 10.0,
+                    cy,
+                    !self.sort_desc,
+                );
+            }
+            if self.sort == SortKey::Size {
+                tri(size_r.rect.right() - 10.0 + 12.0, cy, !self.sort_desc);
+            }
+            if self.sort == SortKey::Time {
+                tri(
+                    time_r.rect.left() + 8.0 + w_txt(t_txt, ui) + 10.0,
+                    cy,
+                    !self.sort_desc,
+                );
+            }
+            for (r, k) in [
+                (name_r, SortKey::Name),
+                (size_r, SortKey::Size),
+                (time_r, SortKey::Time),
+            ] {
+                if r.clicked() {
                     sort_click = Some(k);
                 }
-            };
-            hdr(
-                ui,
-                name_w,
-                format!("名称{}", arrow(SortKey::Name, self)),
-                SortKey::Name,
-            );
-            hdr(
-                ui,
-                col_size,
-                format!("大小{}", arrow(SortKey::Size, self)),
-                SortKey::Size,
-            );
-            hdr(
-                ui,
-                col_time,
-                format!("修改时间{}", arrow(SortKey::Time, self)),
-                SortKey::Time,
-            );
+            }
         });
+        ui.painter().set(
+            head_shape,
+            egui::Shape::rect_filled(
+                egui::Rect::from_min_max(head_top, egui::pos2(head_top.x + full_w, ui.cursor().min.y)),
+                3.0,
+                pal.head,
+            ),
+        );
         if let Some(k) = sort_click {
             if self.sort == k {
                 self.sort_desc = !self.sort_desc;
@@ -666,7 +1166,17 @@ impl Picker {
         ui.separator();
 
         // ④ 列表
-        let list_h = (ui.available_height() - 78.0).max(120.0);
+        //    扣掉的 100 是**下面还要摆的东西**：状态栏 + 分隔线 + 底部动作条。
+        let list_h = (ui.available_height() - 100.0).max(120.0);
+        // 列表底板 + 外框。**必须在内容之前画**（Z 序 = 绘制顺序），
+        // 否则这块实心底会把行里的文字整个盖住。
+        let list_rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(full_w, list_h));
+        ui.painter().rect_filled(list_rect, 4.0, pal.bg);
+        ui.painter().rect_stroke(
+            list_rect,
+            4.0,
+            egui::Stroke::new(1.0_f32, pal.border),
+        );
         let loading = self
             .load
             .as_ref()
@@ -688,70 +1198,105 @@ impl Picker {
         } else {
             // (可见行号, 是否双击, ctrl, shift)
             let mut clicked: Option<(usize, bool, bool, bool)> = None;
-            egui::ScrollArea::vertical()
-                .max_height(list_h)
-                .auto_shrink([false, false])
-                .show_rows(ui, row_h, self.view.len(), |ui, range| {
-                    let stripe = stripe_bg(ui);
-                    let txt_c = ui.visuals().text_color();
-                    for row in range {
-                        let ei = self.view[row];
-                        let e = &entries[ei];
-                        let (rect, resp) =
-                            ui.allocate_exact_size(Vec2::new(full_w, row_h), Sense::click());
-                        if !ui.is_rect_visible(rect) {
-                            continue;
-                        }
-                        let selected = self.sel.contains(&row);
-                        if selected {
-                            ui.painter()
-                                .rect_filled(rect, 2.0, Color32::from_rgb(0xCF, 0xE0, 0xF5));
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(rect, 2.0, stripe);
-                        }
-
-                        let p = ui.painter();
-                        let f_name = FontId::proportional(13.5);
-                        let f_meta = FontId::proportional(12.0);
-                        let cy = rect.center().y;
-                        let (label, color) = if e.is_dir {
-                            (format!("{}\\", e.name), DIR_C)
-                        } else {
-                            (e.name.clone(), txt_c)
-                        };
-                        p.text(
-                            egui::pos2(rect.left() + 8.0, cy),
-                            Align2::LEFT_CENTER,
-                            &label,
-                            f_name,
-                            color,
-                        );
-                        if !e.is_dir {
-                            p.text(
-                                egui::pos2(rect.left() + name_w + 8.0, cy),
-                                Align2::LEFT_CENTER,
-                                fmt_size(e.size),
-                                f_meta.clone(),
-                                DIM,
-                            );
-                        }
-                        if let Some(t) = e.mtime {
-                            p.text(
-                                egui::pos2(rect.left() + name_w + col_size + 8.0, cy),
-                                Align2::LEFT_CENTER,
-                                fmt_mtime(t),
-                                f_meta,
-                                DIM,
-                            );
-                        }
-
-                        if resp.clicked() {
-                            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-                            let shift = ui.input(|i| i.modifiers.shift);
-                            clicked = Some((row, resp.double_clicked(), ctrl, shift));
-                        }
-                    }
+            if self.view.is_empty() {
+                // 空目录：给一句话，否则列表底板就是一整块空白，看着像没读出来。
+                let msg = if self.show_hidden || self.exts.is_empty() {
+                    "此文件夹是空的"
+                } else {
+                    "此文件夹里没有符合条件的文件"
+                };
+                ui.allocate_ui(Vec2::new(full_w, list_h), |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((list_h / 2.0 - 14.0).max(0.0));
+                        ui.label(RichText::new(msg).small().color(DIM));
+                    });
                 });
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, self.view.len(), |ui, range| {
+                        let txt_c = ui.visuals().text_color();
+                        // 图标高度跟着行高走 —— 改行高时图标不会脱节。
+                        let icon_h = (row_h * 0.62).max(12.0);
+                        for row in range {
+                            let ei = self.view[row];
+                            let e = &entries[ei];
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::new(full_w, row_h), Sense::click());
+                            if !ui.is_rect_visible(rect) {
+                                continue;
+                            }
+                            // 行底色四周内缩 1 px：不去压列表外框那一条边线。
+                            let bg = rect.shrink2(egui::vec2(1.0, 0.5));
+                            let selected = self.sel.contains(&row);
+                            let p = ui.painter();
+                            if selected {
+                                p.rect_filled(bg, 4.0, pal.sel);
+                                // 左侧强调条：选中的是哪几行一眼能认出来。
+                                p.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        bg.left_top(),
+                                        Vec2::new(3.0, bg.height()),
+                                    ),
+                                    1.5,
+                                    DIR_C,
+                                );
+                            } else if resp.hovered() {
+                                p.rect_filled(bg, 4.0, pal.hover);
+                            } else if row % 2 == 1 {
+                                p.rect_filled(bg, 0.0, pal.zebra);
+                            }
+
+                            let f_name = FontId::proportional(ui_scale::PICK_NAME);
+                            let f_meta = FontId::proportional(ui_scale::PICK_META);
+                            let cy = rect.center().y;
+                            // 图标列定宽 → 目录与文件的**文件名左边缘对齐**。
+                            // 目录不再靠结尾的 `\` 表示（图标已经说明），那样对齐才干净。
+                            match e.icon {
+                                RowIcon::Dir => {
+                                    paint_dir_icon(p, rect.left() + ICON_DX, cy, icon_h)
+                                }
+                                other => {
+                                    paint_row_icon(p, rect.left() + ICON_DX, cy, icon_h, other, DIM)
+                                }
+                            }
+                            let color = if e.is_dir { DIR_C } else { txt_c };
+                            p.text(
+                                egui::pos2(rect.left() + NAME_DX, cy),
+                                Align2::LEFT_CENTER,
+                                &e.name,
+                                f_name,
+                                color,
+                            );
+                            if !e.is_dir {
+                                // 大小**右对齐** —— 位数不同也能对齐，与系统资源管理器一致。
+                                p.text(
+                                    egui::pos2(rect.left() + name_w + col_size - 10.0, cy),
+                                    Align2::RIGHT_CENTER,
+                                    fmt_size(e.size),
+                                    f_meta.clone(),
+                                    DIM,
+                                );
+                            }
+                            if let Some(t) = e.mtime {
+                                p.text(
+                                    egui::pos2(rect.left() + name_w + col_size + 8.0, cy),
+                                    Align2::LEFT_CENTER,
+                                    fmt_mtime(t),
+                                    f_meta,
+                                    DIM,
+                                );
+                            }
+
+                            if resp.clicked() {
+                                let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                clicked = Some((row, resp.double_clicked(), ctrl, shift));
+                            }
+                        }
+                    });
+            }
 
             // 诊断开关：这台机器上合成鼠标输入到不了窗口（`SendInput` 与
             // `PostMessage` 都被管控套件拦掉），要复现"点一下"只能让程序自己做。
@@ -812,23 +1357,46 @@ impl Picker {
             }
         }
 
-        // 读取失败的原因（权限 / 网络 / 路径不存在）
-        if let Some(e) = &self.err {
-            ui.add_space(4.0);
-            ui.label(RichText::new(format!("× {e}")).small().color(ERR_C));
-        } else {
-            ui.add_space(4.0);
-        }
+        // ⑤ 状态栏：左边「几个项目」（筛选时补一句筛出多少）、右边「选了几项」，
+        //    读取失败的原因也挂在这一行。参照 Files 的 "N items / 1 item selected"。
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let n_all = entries.len();
+            let n_view = self.view.len();
+            let line = if n_view != n_all {
+                format!("{n_all} 个项目　已筛出 {n_view}")
+            } else {
+                format!("{n_all} 个项目")
+            };
+            ui.label(RichText::new(line).size(ui_scale::SMALL).color(DIM));
+            if let Some(e) = &self.err {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("× {e}"))
+                        .size(ui_scale::SMALL)
+                        .color(ERR_C),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.sel.is_empty() {
+                    ui.label(
+                        RichText::new(format!("已选 {} 项", self.sel.len()))
+                            .size(ui_scale::SMALL)
+                            .color(DIM),
+                    );
+                }
+            });
+        });
         ui.separator();
 
-        // ⑤ 底部：文件名 + 过滤说明 + 按钮
+        // ⑥ 底部：文件名 + 过滤说明 + 按钮
         ui.horizontal(|ui| {
             let need_name = matches!(self.mode, Mode::Save | Mode::Files);
             if need_name {
                 ui.label("文件名");
                 let w = if self.mode == Mode::Save { 360.0 } else { 260.0 };
                 let resp = ui.add_sized(
-                    [w, 24.0],
+                    [w, ui_scale::EDIT_H],
                     egui::TextEdit::singleline(&mut self.file_name).hint_text("可直接敲名字"),
                 );
                 let mut enter_name = false;
@@ -887,11 +1455,13 @@ impl Picker {
             });
         });
 
-        // ⑥ 全局 Enter（地址栏 / 文件名框已经吃掉的除外）
+        // ⑦ 全局 Enter（地址栏 / 文件名框已经吃掉的除外）。
+        //    这里用 `ui.input` / `ui.memory` 而不是 `ctx` —— 绘制已经挪进
+        //    `content(&mut self, ui, entries)`，不再往外接 `Context`。
         if !enter_used
             && act.is_none()
-            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-            && ctx.memory(|m| m.focused().is_none())
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && ui.memory(|m| m.focused().is_none())
         {
             if let Some(paths) = self.confirm(entries) {
                 act = Some(Act::Close(Outcome::Picked(paths)));
@@ -919,12 +1489,19 @@ fn read_dir_entries(dir: &Path) -> Result<(PathBuf, Vec<Entry>), String> {
             ),
             Err(_) => (false, 0, None, false),
         };
+        // 图标类型先算（`name` 马上要被 move 进结构体）。
+        let icon = if is_dir {
+            RowIcon::Dir
+        } else {
+            RowIcon::of(&name)
+        };
         v.push(Entry {
             name,
             is_dir,
             size,
             mtime,
             hidden,
+            icon,
         });
     }
     Ok((dir.to_path_buf(), v))
@@ -953,6 +1530,609 @@ const DIM: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
 const DIR_C: Color32 = Color32::from_rgb(0x1F, 0x4E, 0x79);
 const ERR_C: Color32 = Color32::from_rgb(0xB0, 0x30, 0x30);
 
+/// 列表行内两个横向锚点（都相对行的左边缘）：图标中心、文件名起点。
+///
+/// 放到模块级是因为**表头的「名称」也必须用同一个 `NAME_DX`** ——
+/// 表头与列里的数据差半格，正是「表头看着不齐」的成因。
+const ICON_DX: f32 = 15.0;
+const NAME_DX: f32 = 29.0;
+
+/// 列表区的一套配色。
+///
+/// 单独拎出来是因为**浅色/深色主题必须各给一套** —— 深色主题下沿用浅灰底
+/// 会变成一块刺眼的白斑（`stripe_bg` 早就踩过同一个坑）。
+struct Palette {
+    /// 列表空白处的底色。
+    bg: Color32,
+    /// 隔行底色（斑马纹）。
+    zebra: Color32,
+    /// 鼠标悬停行。
+    hover: Color32,
+    /// 选中行。
+    sel: Color32,
+    /// 列表外框。
+    border: Color32,
+    /// 表头底。
+    head: Color32,
+    /// 左侧导航栏的底色（比列表底略灰一档，才分得出两栏）。
+    side: Color32,
+}
+
+fn palette(ui: &egui::Ui) -> Palette {
+    if ui.visuals().dark_mode {
+        Palette {
+            bg: Color32::from_rgb(0x1B, 0x1E, 0x23),
+            zebra: Color32::from_rgb(0x21, 0x25, 0x2B),
+            hover: Color32::from_rgb(0x2A, 0x30, 0x39),
+            sel: Color32::from_rgb(0x27, 0x3E, 0x5C),
+            border: Color32::from_rgb(0x3B, 0x42, 0x4D),
+            head: Color32::from_rgb(0x2C, 0x31, 0x39),
+            side: Color32::from_rgb(0x20, 0x24, 0x2A),
+        }
+    } else {
+        Palette {
+            bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            zebra: Color32::from_rgb(0xF7, 0xF9, 0xFC),
+            hover: Color32::from_rgb(0xEC, 0xF2, 0xFB),
+            sel: Color32::from_rgb(0xDC, 0xE9, 0xFA),
+            border: Color32::from_rgb(0xD2, 0xD9, 0xE2),
+            head: Color32::from_rgb(0xEA, 0xEF, 0xF6),
+            side: Color32::from_rgb(0xF6, 0xF7, 0xF9),
+        }
+    }
+}
+
+/// 当前目录与某个落脚点是不是同一处。
+///
+/// 只比文本、**不碰文件系统**（`canonicalize` 要做 IO，绘制路径上不能用）；
+/// 末尾分隔符的差异不算不同（`D:` 与 `D:\` 是同一处）。
+fn same_dir(cur_norm: &str, p: &Path) -> bool {
+    let s = p.display().to_string();
+    s.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(cur_norm)
+}
+
+/// 太长就砍掉尾巴加省略号（侧栏一行的宽度是死的）。
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 侧栏里盘符那一行的显示名。卷标可能很长（「C: 本地磁盘」甚至更长），
+/// 但侧栏一行就 172 px，超了直接截断 —— 完整信息在悬停提示里。
+fn drive_short(label: &str) -> String {
+    ellipsize(label, 11)
+}
+
+/// 侧栏的分区小标题（「快速访问」「此电脑」…）。
+fn nav_section(ui: &mut egui::Ui, label: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(label)
+                .size(ui_scale::SMALL - 0.5)
+                .color(DIM),
+        );
+    });
+    ui.add_space(3.0);
+}
+
+/// 侧栏行的图标类型。**手绘，不用任何字体符号** ——
+/// `📁`、`▸` 这类在本机是豆腐块（见 `body` 里 arrow 那段注释）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavGlyph {
+    Home,
+    Download,
+    Doc,
+    Desktop,
+    Drive,
+    /// 映射网盘：两个叠起来的方块，像「共享」。
+    Net,
+    /// 最近使用：钟面。
+    Clock,
+}
+
+/// 侧栏一行「图标 + 文字」。返回是否被点中。
+///
+/// 选中 = 淡蓝底 + 左侧 3 px 强调条；悬停 = 淡底。与 Files 的 NavigationView 一致。
+fn nav_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    glyph: NavGlyph,
+    color: Color32,
+    label: &str,
+    selected: bool,
+    tip: &str,
+) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(w, ui_scale::PICK_ROW_H),
+        Sense::click(),
+    );
+    let resp = resp.on_hover_text(tip);
+    let txt_c = ui.visuals().text_color();
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 4.0, pal.sel);
+        // 左侧强调条：与列表里的选中行同一套语言。
+        p.rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), Vec2::new(3.0, rect.height())),
+            1.5,
+            DIR_C,
+        );
+    } else if resp.hovered() {
+        p.rect_filled(rect, 4.0, pal.hover);
+    }
+    let cy = rect.center().y;
+    paint_place_icon(p, rect.left() + 16.0, cy, 15.0, glyph, color);
+    p.text(
+        egui::pos2(rect.left() + 32.0, cy),
+        Align2::LEFT_CENTER,
+        ellipsize(label, 13),
+        FontId::proportional(ui_scale::SMALL + 1.0),
+        txt_c,
+    );
+    resp.clicked()
+}
+
+/// 画侧栏行图标：一个圆角实心方块 + 白色细线字形。
+///
+/// 方块颜色区分"哪一类位置"，字形说明"是什么" —— 两者都靠 `painter` 的
+/// 矩形/折线，不依赖字体。
+fn paint_place_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, g: NavGlyph, color: Color32) {
+    p.rect_filled(
+        egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(h, h)),
+        h * 0.26,
+        color,
+    );
+    let st = egui::Stroke::new((h * 0.10).max(1.1), Color32::WHITE);
+    let s = h * 0.27;
+    match g {
+        NavGlyph::Home => {
+            p.add(egui::Shape::line(
+                vec![
+                    egui::pos2(cx - s, cy - s * 0.15),
+                    egui::pos2(cx, cy - s * 0.95),
+                    egui::pos2(cx + s, cy - s * 0.15),
+                ],
+                st,
+            ));
+            p.line_segment(
+                [egui::pos2(cx - s * 0.6, cy - s * 0.15), egui::pos2(cx - s * 0.6, cy + s * 0.85)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(cx + s * 0.6, cy - s * 0.15), egui::pos2(cx + s * 0.6, cy + s * 0.85)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(cx - s * 0.6, cy + s * 0.85), egui::pos2(cx + s * 0.6, cy + s * 0.85)],
+                st,
+            );
+        }
+        NavGlyph::Download => {
+            p.line_segment([egui::pos2(cx, cy - s * 0.9), egui::pos2(cx, cy + s * 0.45)], st);
+            p.line_segment(
+                [egui::pos2(cx - s * 0.55, cy - s * 0.1), egui::pos2(cx, cy + s * 0.45)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(cx + s * 0.55, cy - s * 0.1), egui::pos2(cx, cy + s * 0.45)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(cx - s * 0.7, cy + s * 0.85), egui::pos2(cx + s * 0.7, cy + s * 0.85)],
+                st,
+            );
+        }
+        NavGlyph::Doc => {
+            let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(s * 1.35, s * 1.8));
+            p.rect_stroke(r, 0.5, st);
+            p.line_segment(
+                [egui::pos2(r.left() + s * 0.2, r.center().y), egui::pos2(r.right() - s * 0.2, r.center().y)],
+                st,
+            );
+        }
+        NavGlyph::Desktop => {
+            let r = egui::Rect::from_center_size(
+                egui::pos2(cx, cy - s * 0.18),
+                egui::vec2(s * 2.0, s * 1.3),
+            );
+            p.rect_stroke(r, 0.5, st);
+            p.line_segment([egui::pos2(cx, r.bottom()), egui::pos2(cx, cy + s * 0.8)], st);
+            p.line_segment(
+                [egui::pos2(cx - s * 0.5, cy + s * 0.8), egui::pos2(cx + s * 0.5, cy + s * 0.8)],
+                st,
+            );
+        }
+        NavGlyph::Drive => {
+            let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(s * 2.0, s * 1.4));
+            p.rect_stroke(r, 0.8, st);
+            p.line_segment(
+                [
+                    egui::pos2(r.left() + s * 0.3, r.center().y + s * 0.3),
+                    egui::pos2(r.left() + s * 0.7, r.center().y + s * 0.3),
+                ],
+                st,
+            );
+        }
+        NavGlyph::Net => {
+            let a = egui::Rect::from_min_size(
+                egui::pos2(cx - s, cy - s * 0.9),
+                egui::vec2(s * 1.25, s * 1.25),
+            );
+            let b = egui::Rect::from_min_size(
+                egui::pos2(cx - s * 0.25, cy - s * 0.35),
+                egui::vec2(s * 1.25, s * 1.25),
+            );
+            p.rect_stroke(a, 0.4, st);
+            p.rect_stroke(b, 0.4, st);
+        }
+        NavGlyph::Clock => {
+            p.circle_stroke(egui::pos2(cx, cy), s * 0.95, st);
+            p.line_segment([egui::pos2(cx, cy), egui::pos2(cx, cy - s * 0.55)], st);
+            p.line_segment([egui::pos2(cx, cy), egui::pos2(cx + s * 0.45, cy)], st);
+        }
+    }
+}
+
+/// 地址栏右端那只「编辑路径」的小铅笔。
+fn paint_pencil(p: &egui::Painter, c: egui::Pos2, hot: bool) {
+    let col = if hot {
+        Color32::from_rgb(0x10, 0x14, 0x1A)
+    } else {
+        DIM
+    };
+    let s = 5.5;
+    p.line_segment(
+        [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s * 0.7, c.y - s * 0.7)],
+        egui::Stroke::new(1.5_f32, col),
+    );
+    // 笔尖：左下角一个小三角
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - s, c.y + s),
+            egui::pos2(c.x - s + 3.4, c.y + s),
+            egui::pos2(c.x - s, c.y + s - 3.4),
+        ],
+        col,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// 把一块**凸多边形**按 `col(点)` 的线性渐变填满。
+///
+/// 实现是「重心 + 轮廓」的三角扇。之所以能用它做渐变：颜色只要取成位置的
+/// **仿射**函数（这里是 `lerp(浅, 深, 0.42u + 0.58v)`），重心插值出来的就正是
+/// 这个函数本身 —— 三角形之间不会有接缝，圆角也是真的圆弧。
+/// （逐条画横带的做法在圆角处会露出方角，也做不出斜向的渐变。）
+fn fill_shaded(
+    p: &egui::Painter,
+    pts: &[egui::Pos2],
+    col: impl Fn(egui::Pos2) -> Color32,
+) {
+    if pts.len() < 3 {
+        return;
+    }
+    let n = pts.len() as f32;
+    let (mut sx, mut sy) = (0.0, 0.0);
+    for q in pts {
+        sx += q.x;
+        sy += q.y;
+    }
+    let center = egui::pos2(sx / n, sy / n);
+    let mut m = egui::Mesh::default();
+    m.colored_vertex(center, col(center));
+    for q in pts {
+        m.colored_vertex(*q, col(*q));
+    }
+    let k = pts.len() as u32;
+    for i in 0..k {
+        m.add_triangle(0, 1 + i, 1 + (i + 1) % k);
+    }
+    p.add(egui::Shape::mesh(m));
+}
+
+/// 圆角矩形的**轮廓点**（顺时针，从左上角起），四角半径可以分别给 —— 画文件夹时
+/// 主体的左上角要留成直角（与标签共用同一条左边线），另外三角才圆。
+///
+/// `seg` 是每个圆弧分几段；半径小到看不清时自动退化成 1 段（直角）。
+fn rr_outline(rect: egui::Rect, r: [f32; 4], seg: usize) -> Vec<egui::Pos2> {
+    // 顺序：左上 / 右上 / 右下 / 左下
+    let lim = (rect.width() * 0.5).min(rect.height() * 0.5);
+    let r = [r[0].min(lim), r[1].min(lim), r[2].min(lim), r[3].min(lim)];
+    let c = [
+        egui::pos2(rect.left() + r[0], rect.top() + r[0]),
+        egui::pos2(rect.right() - r[1], rect.top() + r[1]),
+        egui::pos2(rect.right() - r[2], rect.bottom() - r[2]),
+        egui::pos2(rect.left() + r[3], rect.bottom() - r[3]),
+    ];
+    // 每角顺时针扫 90°：左上 180°→270°、右上 -90°→0°、右下 0°→90°、左下 90°→180°。
+    let a0 = [
+        std::f32::consts::PI,
+        -std::f32::consts::FRAC_PI_2,
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+    ];
+    let mut out = Vec::with_capacity(4 * seg);
+    for i in 0..4 {
+        let steps = if r[i] < 0.35 { 1 } else { seg };
+        for k in 0..steps {
+            let a = a0[i] + std::f32::consts::FRAC_PI_2 * (k as f32) / (steps as f32);
+            out.push(egui::pos2(
+                c[i].x + r[i] * a.cos(),
+                c[i].y + r[i] * a.sin(),
+            ));
+        }
+    }
+    out
+}
+
+/// 两色线性插值（`t` 会被夹到 0..1）。画文件夹的渐变用。
+fn lerp_c(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// 画一个**文件夹**，造型与配色照 Files（`files-community/files`）/ Windows 11
+/// 资源管理器量出来的：左上凸起的**斜肩标签**（深金）+ 主体（**左上浅 → 右下深**
+/// 的斜向渐变）+ 左边一条贯通的直线，**通体无描边**。
+///
+/// 与上一版（后板 / 前盖 / 一道暗金分隔线的三层矩形）的区别就在这：那版有硬边、
+/// 像两块积木叠起来；Fluent 这版是一整块带体积感的色块，缩小之后更干净。
+///
+/// 配色固定、**不跟深浅主题走** —— Windows / Files 在深色底上同样是这只金色文件夹，
+/// 且金在白底与深灰底上对比都够。
+///
+/// **仍然手绘**：`📁`、`▸`、`⋯` 这类符号在本机字体里缺字形会渲染成豆腐块
+/// （表头那个 `▴` 就是这么翻车的，见 `body` 里 arrow 的注释），自己画不挑字体。
+fn paint_dir_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32) {
+    /// 标签：比主体深一整档，两者之间靠这个色差分开（不靠描边）。
+    const TAB: Color32 = Color32::from_rgb(0xFC, 0xBB, 0x19);
+    /// 主体的浅端（左上）。
+    const LIGHT: Color32 = Color32::from_rgb(0xFF, 0xE8, 0xA5);
+    /// 主体的深端（右下）。
+    const DEEP: Color32 = Color32::from_rgb(0xFF, 0xCA, 0x34);
+
+    let w = h * 1.24;
+    let left = cx - w / 2.0;
+    let right = cx + w / 2.0;
+    let top = cy - h / 2.0;
+    let bottom = cy + h / 2.0;
+    let r = h * 0.13; // 圆角：按高度取，改行高时不会走形
+    // 下面三个比例都是拿 Files 的截图逐像素量出来的（不是估的）：
+    let body_top = top + h * 0.20; // 标签比主体高出这一截
+    let tab_end = left + w * 0.35; // 标签顶边的右端
+    let shoulder = w * 0.11; // 斜肩的水平投影（落进主体顶边）
+
+    // ① 标签（后层）。底边多压 0.03h 进主体，免得两层色块之间露出一条发丝缝。
+    let over = h * 0.03;
+    let tab_h = (body_top - top + over).max(1.0);
+    let rr_t = r.min(tab_h);
+    let mut tab = Vec::with_capacity(10);
+    tab.push(egui::pos2(left + rr_t, top));
+    tab.push(egui::pos2(tab_end, top));
+    tab.push(egui::pos2(tab_end + shoulder, body_top + over));
+    tab.push(egui::pos2(left, body_top + over));
+    tab.push(egui::pos2(left, top + rr_t));
+    // 左上圆角（180°→270°），与主体左下角同一半径 → 左边是一条连贯的直线。
+    for k in 1..4 {
+        let a = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * (k as f32) / 4.0;
+        tab.push(egui::pos2(
+            left + rr_t + rr_t * a.cos(),
+            top + rr_t + rr_t * a.sin(),
+        ));
+    }
+    fill_shaded(p, &tab, |_| TAB);
+
+    // ② 主体（前层）：左上角**直角**（与标签共用左边线），另外三角圆。
+    let body = egui::Rect::from_min_max(egui::pos2(left, body_top), egui::pos2(right, bottom));
+    let pts = rr_outline(body, [0.0, r, r, r], 4);
+    let span = (bottom - body_top).max(1.0);
+    fill_shaded(p, &pts, |q| {
+        // 斜向渐变：横向 0.42 + 纵向 0.58（比例是按截图逐像素采样拟合的）。
+        let u = ((q.x - left) / w).clamp(0.0, 1.0);
+        let v = ((q.y - body_top) / span).clamp(0.0, 1.0);
+        lerp_c(LIGHT, DEEP, 0.42 * u + 0.58 * v)
+    });
+}
+
+/// 画一个「文档」图标（空心矩形 + 右上折角），中心在 `cx/cy`，整体高 `h`。
+///
+/// 非 Office 类型的文件用它（灰色描边）。
+fn paint_doc_outline(p: &egui::Painter, cx: f32, cy: f32, h: f32, color: Color32) {
+    let w = h * 0.84;
+    let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(w, h));
+    p.rect_stroke(r, 1.5, egui::Stroke::new(1.2_f32, color));
+    // 折角：右上角那块实心三角。
+    let c = h * 0.34;
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            r.right_top(),
+            egui::pos2(r.right() - c, r.top()),
+            egui::pos2(r.right(), r.top() + c),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// 画非目录行的图标：**Office 系按各自的品牌色**（Word 蓝 / Excel 绿 / PPT 橙），
+/// PDF 用红底 + 三条白线，其余文件保持灰色描边文档。
+///
+/// 这是从 Files（Windows 资源管理器那套）借来的观感：一眼就能分出文件类型。
+/// **完全自绘**，不去抽系统壳图标 —— 那是每个文件一次 GDI/COM 调用，
+/// 一个几百文件的目录会让打开面板肉眼可见地变慢（见模块头第 4 条）。
+fn paint_row_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, kind: RowIcon, dim: Color32) {
+    let Some(fill) = kind.solid() else {
+        paint_doc_outline(p, cx, cy, h, dim);
+        return;
+    };
+    let side = h * 0.98;
+    let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(side, side));
+    p.rect_filled(r, side * 0.20, fill);
+    match kind {
+        RowIcon::Pdf => {
+            // 三条白横线。**画出来而不是写 `≡`** —— 那类符号在本机是豆腐块。
+            let st = egui::Stroke::new((side * 0.11).max(1.0), Color32::WHITE);
+            for k in [-1.0_f32, 0.0, 1.0] {
+                let y = cy + k * side * 0.21;
+                p.line_segment(
+                    [
+                        egui::pos2(cx - side * 0.27, y),
+                        egui::pos2(cx + side * 0.27, y),
+                    ],
+                    st,
+                );
+            }
+        }
+        _ => {
+            if let Some(l) = kind.letter() {
+                p.text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    l,
+                    FontId::proportional(side * 0.70),
+                    Color32::WHITE,
+                );
+            }
+        }
+    }
+}
+
+/// 导航图标（自绘，见 [`nav_button`]）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavIcon {
+    /// 后退（历史栈往回）。
+    Back,
+    /// 前进（历史栈往前）。
+    Forward,
+    /// 上一级：向上的箭头。
+    Up,
+    /// 刷新：带缺口的圆环 + 箭头。
+    Refresh,
+}
+
+/// 自绘一枚导航图标按钮，返回它的 `Response`（调用方自己判 `clicked()`）。
+///
+/// **为什么不用 `↑` / `⟳` 字符**：一，本机字体里这类符号缺字形就是豆腐块
+/// （表头那个 `▴` 已经翻车过一次，见 `body` 里 `arrow` 的注释，`⟳`(U+27F3)
+/// 只是碰巧有字形，换台机器就不敢保证）；二，字符的字重、大小都跟着字体走，
+/// 放大字号后会跟着变粗，跟旁边的小按钮搭不上。自己画线最稳，也最像
+/// 资源管理器：细笔画（1.6）、圆头、可用/不可用两档灰度。
+fn nav_button(ui: &mut egui::Ui, kind: NavIcon, enabled: bool, tip: &str) -> egui::Response {
+    let pal = palette(ui);
+    let dark = ui.visuals().dark_mode;
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::splat(ui_scale::NAV_BTN),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    let resp = resp.on_hover_text(tip);
+    if enabled && resp.hovered() {
+        ui.painter().rect_filled(rect.shrink(2.0), 4.0, pal.hover);
+    }
+    // 三档颜色：点不动（淡）、悬停（最显眼）、常态（正文色）。深浅主题各一套。
+    let color = if !enabled {
+        if dark {
+            Color32::from_rgb(0x53, 0x5A, 0x66)
+        } else {
+            Color32::from_rgb(0xBB, 0xC2, 0xCC)
+        }
+    } else if resp.hovered() {
+        if dark {
+            Color32::from_rgb(0xFF, 0xFF, 0xFF)
+        } else {
+            Color32::from_rgb(0x10, 0x14, 0x1A)
+        }
+    } else if dark {
+        Color32::from_rgb(0xD8, 0xDD, 0xE4)
+    } else {
+        Color32::from_rgb(0x38, 0x3D, 0x46)
+    };
+
+    let st = egui::Stroke::new(1.6_f32, color);
+    let p = ui.painter();
+    let c = rect.center();
+    // 半径按控件边长取：改 `NAV_BTN` 时图形自动跟着缩放。
+    let s = ui_scale::NAV_BTN * 0.28;
+    match kind {
+        NavIcon::Back => {
+            // 横杆 + 左尖：与资源管理器的「后退」同形，只是把箭头朝左。
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y), egui::pos2(c.x - s * 0.15, c.y - s * 0.85)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y), egui::pos2(c.x - s * 0.15, c.y + s * 0.85)],
+                st,
+            );
+        }
+        NavIcon::Forward => {
+            p.line_segment(
+                [egui::pos2(c.x + s, c.y), egui::pos2(c.x - s, c.y)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + s, c.y), egui::pos2(c.x + s * 0.15, c.y - s * 0.85)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + s, c.y), egui::pos2(c.x + s * 0.15, c.y + s * 0.85)],
+                st,
+            );
+        }
+        NavIcon::Up => {
+            let tail = s * 1.0;
+            // 竖杆 + 两撇，和资源管理器的「上一级」同形。
+            p.line_segment([egui::pos2(c.x, c.y + tail), egui::pos2(c.x, c.y - tail)], st);
+            p.line_segment(
+                [egui::pos2(c.x - s, c.y - s * 0.1), egui::pos2(c.x, c.y - tail)],
+                st,
+            );
+            p.line_segment(
+                [egui::pos2(c.x + s, c.y - s * 0.1), egui::pos2(c.x, c.y - tail)],
+                st,
+            );
+        }
+        NavIcon::Refresh => {
+            let r = s * 0.95;
+            // 从右上（-40°）**顺时针**扫 320°，缺口留在右上角给箭头。
+            let a0 = -40.0_f32.to_radians();
+            let a1 = 280.0_f32.to_radians();
+            let n = 26;
+            let pts: Vec<egui::Pos2> = (0..=n)
+                .map(|i| {
+                    let a = a0 + (a1 - a0) * (i as f32 / n as f32);
+                    egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, st));
+            // 箭头：在弧的终点沿**切线**方向补一个实心小三角（指向顺时针前方）。
+            let tan = egui::vec2(-a1.sin(), a1.cos());
+            let rad = egui::vec2(a1.cos(), a1.sin());
+            let end = egui::pos2(c.x + r * a1.cos(), c.y + r * a1.sin());
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    end + tan * (r * 0.80),
+                    end + rad * (r * 0.46),
+                    end - rad * (r * 0.46),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+    resp
+}
+
 /// 扩展名白名单判定。空表 = 全部放行；目录不该走到这里（调用方先判 `is_dir`）。
 ///
 /// 是**模块级自由函数**而不是 `&self` 方法：`build_view` 是关联函数、没有 `self`，
@@ -964,14 +2144,6 @@ fn ext_ok(exts: &[String], name: &str) -> bool {
     match name.rsplit_once('.') {
         Some((_, e)) => exts.iter().any(|x| x.eq_ignore_ascii_case(e)),
         None => false,
-    }
-}
-
-fn stripe_bg(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(0x33, 0x38, 0x41)
-    } else {
-        Color32::from_rgb(0xE8, 0xEE, 0xF6)
     }
 }
 
@@ -1013,6 +2185,47 @@ fn home_dir() -> PathBuf {
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
+/// 把目录拆成面包屑分段：`(显示名, 该段指向的路径)`。
+///
+/// * `C:\Users\me\Documents`
+///   → `[("C:", C:\), ("Users", …\Users), ("me", …), ("Documents", …)]`
+/// * `\\server\share\sub` → `[("\\server\share", …), ("sub", …)]`
+///   —— UNC 的服务器与共享名**必须合成一段**：`\\server` 单独作为路径
+///   Windows 是访问不了的，点它只会报错。
+///
+/// 只在 [`Picker::set_loc`] 里调用（每次真正换目录一次），不在绘制里跑。
+fn crumbs_of(dir: &Path) -> Vec<(String, PathBuf)> {
+    use std::path::Component;
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut prefix: Option<String> = None;
+    let mut acc = PathBuf::new();
+    for c in dir.components() {
+        match c {
+            Component::Prefix(p) => {
+                prefix = Some(p.as_os_str().to_string_lossy().into_owned());
+            }
+            Component::RootDir => {
+                let pre = prefix.take().unwrap_or_default();
+                // 根段路径 = 前缀 + `\`；UNC 时前缀本身就是 `\\server\share`。
+                acc = PathBuf::from(format!("{pre}\\"));
+                // 显示名：盘符段就写 `C:`，UNC 写 `\\server\share`。
+                let label = if pre.is_empty() { acc.display().to_string() } else { pre };
+                out.push((label, acc.clone()));
+            }
+            Component::Normal(n) => {
+                acc.push(n);
+                out.push((n.to_string_lossy().into_owned(), acc.clone()));
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        // 相对路径（理论上到不了这儿）：退成整串，至少别空着。
+        out.push((dir.display().to_string(), dir.to_path_buf()));
+    }
+    out
 }
 
 /// 常用落脚点。只列**真的存在**的，免得点了跳进空目录。
@@ -1209,6 +2422,11 @@ mod tests {
             size: 10,
             mtime: Some(1_700_000_000),
             hidden: false,
+            icon: if is_dir {
+                RowIcon::Dir
+            } else {
+                RowIcon::of(name)
+            },
         }
     }
 

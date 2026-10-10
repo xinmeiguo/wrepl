@@ -16,7 +16,7 @@ import sys
 
 CWD = "D:/test/wrepl"
 LOG = "D:/test/regress-m10.log"
-BASH = "C:/Users/xinwei01307/scoop/apps/git/current/bin/bash.exe"
+BASH = os.environ.get("WREPL_BASH") or r"C:\Program Files\Git\bin\bash.exe"
 
 
 def main():

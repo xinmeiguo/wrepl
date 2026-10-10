@@ -138,17 +138,43 @@ pub struct Hit {
 pub struct PartPlan {
     pub part: String,
     pub kind: PartKind,
-    /// 改写后的字节流（未改动时与输入相同）
-    pub new_bytes: Vec<u8>,
+    /// 改写后的字节流。**`None` = 这个 part 一个字都没动** ——
+    /// 此时根本不存在"新的字节流"，调用方看 [`PartPlan::changed`]。
+    ///
+    /// 为什么不是"未改动时与输入相同"的那份拷贝：一个没命中的
+    /// `word/document.xml` 动辄一两 MB，拷一份再整段比一遍只为得出"没变"，
+    /// 纯属白干（`rewrite::apply` 走的就是"没有编辑 ⇒ 原样返回"）。
+    pub new_bytes: Option<Vec<u8>>,
     pub changed: bool,
     pub hits: Vec<Hit>,
     pub conflicts: usize,
 }
 
 /// 扫描一个 part，按作用域过滤，收集全部候选命中。
+///
+/// ## 折叠只做一次
+///
+/// 匹配靠的是「把待搜文本与查找串各自折叠成同一个可比形式」。
+/// 折叠结果只取决于**折叠设置**（区分大小写 / 区分全半角），**与是哪条规则无关**——
+/// 所以同一组设置下的规则应当共用同一份折叠后的段落文本。
+/// 原先是「每条规则 × 每一段」各折一遍：10 条规则就把同一段文字折了 10 遍，
+/// 规则表越长、文档越大，这份白干越贵。这里按设置分组，每组只折一次。
+///
+/// ## 命中顺序必须与"逐规则扫"完全一致
+///
+/// 报告里命中的排列顺序是归档凭据的一部分，不许随实现改动漂移。
+/// 分组之后按 `(规则序号, 段号, 起始位置)` 排一次序，把顺序**精确还原**成
+/// 原先「外层规则、内层段落、段内自左向右」的那一套。
 fn collect(paras: &[Para], kind: PartKind, rules: &[Rule]) -> Result<Vec<Cand>> {
-    let mut cands = Vec::new();
+    /// 一条待匹配的规则：查找串已折叠好。
+    struct Item {
+        rule: usize,
+        needle: Vec<char>,
+        whole_word: bool,
+    }
 
+    // 按折叠设置分组
+    let mut groups: Vec<((bool, bool), Vec<Item>)> = Vec::new();
     for (ri, r) in rules.iter().enumerate() {
         if !r.enabled {
             continue;
@@ -164,35 +190,60 @@ fn collect(paras: &[Para], kind: PartKind, rules: &[Rule]) -> Result<Vec<Cand>> 
         if needle.is_empty() {
             continue;
         }
+        let key = (r.case_sensitive, r.kana_sensitive);
+        let gi = match groups.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        groups[gi].1.push(Item {
+            rule: ri,
+            needle,
+            whole_word: r.whole_word,
+        });
+    }
 
+    let mut cands = Vec::new();
+    for (key, items) in &groups {
+        let (case_sensitive, kana_sensitive) = *key;
         for p in paras {
             let slot = match slot_of(kind, p.in_textbox) {
                 Some(s) => s,
                 None => continue,
             };
-            if !r.scope.allows(slot) {
+            // 这一段有没有规则要管？一条都没有就别白折一次。
+            if !items.iter().any(|it| rules[it.rule].scope.allows(slot)) {
                 continue;
             }
-            let hay = fold(&p.visible, r.case_sensitive, r.kana_sensitive);
-            for (a, b) in find_all(&hay, &needle, r.whole_word) {
-                let matched: String = p
-                    .visible
-                    .chars()
-                    .skip(a)
-                    .take(b - a)
-                    .collect();
-                cands.push(Cand {
-                    rule: ri,
-                    para: p.index,
-                    a,
-                    b,
-                    matched,
-                    slot,
-                });
+            let hay = fold(&p.visible, case_sensitive, kana_sensitive);
+            for it in items {
+                if !rules[it.rule].scope.allows(slot) {
+                    continue;
+                }
+                for (a, b) in find_all(&hay, &it.needle, it.whole_word) {
+                    let matched: String = p
+                        .visible
+                        .chars()
+                        .skip(a)
+                        .take(b - a)
+                        .collect();
+                    cands.push(Cand {
+                        rule: it.rule,
+                        para: p.index,
+                        a,
+                        b,
+                        matched,
+                        slot,
+                    });
+                }
             }
         }
     }
 
+    // 还原"逐规则扫"的原始顺序（见上方注释）。
+    cands.sort_by_key(|c| (c.rule, c.para, c.a));
     Ok(cands)
 }
 
@@ -356,17 +407,21 @@ pub fn plan_part(
     let conflicts = rej.iter().filter(|x| x.is_some()).count();
 
     let (edits, hits) = build_edits(xml, &paras, &cands, rules, &rej, longest_first)?;
+    // 没有编辑 ⇒ 连拷贝都不必做，直接报"未改动"。
+    // 有编辑也可能改出与原文一模一样的字节（查找串 == 替换串），那同样算未改动。
     let new_bytes = if edits.is_empty() {
-        xml.to_vec()
+        None
     } else {
-        rewrite::apply(xml, &edits)?
+        let b = rewrite::apply(xml, &edits)?;
+        if b == xml { None } else { Some(b) }
     };
+    let changed = new_bytes.is_some();
 
     Ok(PartPlan {
         part: part.to_string(),
         kind,
-        changed: new_bytes != xml,
         new_bytes,
+        changed,
         hits,
         conflicts,
     })
@@ -432,11 +487,12 @@ pub fn plan_part_chained(
         }
     }
 
+    let changed = cur != xml;
     Ok(PartPlan {
         part: part.to_string(),
         kind,
-        changed: cur != xml,
-        new_bytes: cur,
+        changed,
+        new_bytes: if changed { Some(cur) } else { None },
         hits,
         conflicts: 0,
     })

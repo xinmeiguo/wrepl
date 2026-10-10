@@ -22,6 +22,15 @@
 # ── 本机真实语料值（含真实客户名/项目号）─────────────────────────
 /regress-samples.local.sh
 
+# ── 性能回归的工作目录与对照二进制（见 bench/README.md）────────────
+# bench/small 是从真实语料里复制出来的样本，**含真实客户名与项目编号**，
+# 和上面 regress-samples.local.sh 同一个理由，绝不能进版本库；
+# bench/baseline 是"改动前"的 exe 快照（6 MB 二进制），按 bench/README.md 现编即可。
+/bench/small/
+/bench/baseline/
+/bench/cmp/
+/bench/release-notes.md
+
 # ── 编辑器 / 系统 ────────────────────────────────────────────────
 .vscode/
 .idea/

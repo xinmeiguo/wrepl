@@ -256,16 +256,25 @@ impl Para {
     }
 
     /// 取该 node 在可见字符区间 `[a, b)` 内被覆盖到的字节区间（仅对含文本节点的 node 有意义）。
+    ///
+    /// 只看 `map[a..b]` 这一小段：区间的两个界本来就把"落在区间外"的项全排除了，
+    /// 原先却每次都要把**整段**的映射表走一遍——一个长段落里命中几处，
+    /// 就是「命中数 × 段内字符数」的白扫。
     pub fn node_covered_range(
         &self,
         node: usize,
         a: usize,
         b: usize,
     ) -> Option<std::ops::Range<usize>> {
+        let lo_i = a.min(self.map.len());
+        let hi_i = b.min(self.map.len());
+        if lo_i >= hi_i {
+            return None;
+        }
         let mut lo: Option<usize> = None;
         let mut hi: Option<usize> = None;
-        for (i, r) in self.map.iter().enumerate() {
-            if i < a || i >= b || r.node != node || r.is_virtual() {
+        for r in &self.map[lo_i..hi_i] {
+            if r.node != node || r.is_virtual() {
                 continue;
             }
             lo = Some(match lo {
@@ -321,6 +330,41 @@ struct OpenPara {
     run_has_rpr: bool,
 }
 
+/// 元素栈里一格：**只留下判定用得上的那几种身份**。
+///
+/// 为什么不存元素名（`String`）：`word/document.xml` 动辄几万个元素，
+/// 每个元素一次 `local.to_string()` 就是几万次堆分配，而栈其实只用它回答三个问题——
+/// 「父元素是不是 `w:r`」「在当前元素里能不能找到 `w:txbxContent`」「它属不属于 W 命名空间」。
+/// 把答案直接编码成一个 1 字节的枚举，分配全没了，判定一字未变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElemId {
+    /// W 命名空间的 `<w:r>`——文本承载元素的唯一合法父节点
+    Run,
+    /// W 命名空间的 `<w:txbxContent>`——文本框正文的根
+    Txbx,
+    /// 其它 W 命名空间元素
+    Wml,
+    /// 非 W 命名空间元素（DrawingML 的 `a:p` / `a:r` / `a:t` 全在这里）
+    Other,
+}
+
+impl ElemId {
+    fn of(local: &str, is_wml: bool) -> Self {
+        if !is_wml {
+            return ElemId::Other;
+        }
+        match local {
+            "r" => ElemId::Run,
+            "txbxContent" => ElemId::Txbx,
+            _ => ElemId::Wml,
+        }
+    }
+
+    fn is_wml(self) -> bool {
+        !matches!(self, ElemId::Other)
+    }
+}
+
 /// 正在累积中的文本承载元素（`<w:t>` / `<w:delText>` / `<w:instrText>`）。
 ///
 /// **为什么不在这元素的第一个 `Event::Text` 就把节点定下来**：
@@ -348,7 +392,7 @@ struct PendingText {
 /// 扫描状态。把命名空间表、元素栈、段落栈放在一起，避免逐个当参数传递。
 struct Ctx {
     base_index: usize,
-    stack: Vec<(String, bool)>,
+    stack: Vec<ElemId>,
     ns_prefix: HashMap<String, String>,
     ns_default: String,
     open: Vec<OpenPara>,
@@ -382,10 +426,7 @@ impl Ctx {
 
     /// 当前父元素是否就是 W 命名空间的 `<w:r>`——文本承载元素的唯一合法父节点。
     fn parent_is_run(&self) -> bool {
-        match self.stack.last() {
-            Some((n, true)) => n == "r",
-            _ => false,
-        }
+        matches!(self.stack.last(), Some(ElemId::Run))
     }
 
     fn run_index(&self) -> usize {
@@ -456,10 +497,7 @@ impl Ctx {
             match local {
                 "p" if !empty_tag => {
                     let index = self.base_index + self.open.len();
-                    let in_textbox = self
-                        .stack
-                        .iter()
-                        .any(|(n, w)| *w && n == "txbxContent");
+                    let in_textbox = self.stack.iter().any(|e| *e == ElemId::Txbx);
                     self.open.push(OpenPara {
                         para: Para {
                             index,
@@ -537,17 +575,20 @@ impl Ctx {
         }
 
         if !empty_tag {
-            self.stack.push((local.to_string(), is_wml));
+            self.stack.push(ElemId::of(local, is_wml));
         }
     }
 
     /// 处理文本 / CDATA 事件：累积进当前挂着的文本元素。
-    fn on_text(&mut self, raw: String, before: usize, after: usize) {
+    ///
+    /// 收的是 `&str` 而不是 `String`：元素之间的空白也各是一个文本事件，
+    /// 没有挂着的文本元素时**一个字节都不必复制**（原先每次都要 `into_owned()` 一次）。
+    fn on_text(&mut self, raw: &str, before: usize, after: usize) {
         if let Some(p) = self.pending.as_mut() {
             if p.content_start.is_none() {
                 p.content_start = Some(before);
             }
-            p.raw.push_str(&raw);
+            p.raw.push_str(raw);
             p.last_end = after;
         }
         // pending 为 None 时的文本事件是元素间空白，忽略
@@ -606,7 +647,7 @@ impl Ctx {
         }
 
         let was_wml = match self.stack.pop() {
-            Some((_, w)) => w,
+            Some(id) => id.is_wml(),
             None => false,
         };
 
@@ -642,17 +683,15 @@ pub fn scan_part(part: &str, xml: &str) -> Result<(Vec<Para>, ScanStats)> {
             Event::Eof => break,
             Event::Start(e) => ctx.on_element(&e, false, before, after),
             Event::Empty(e) => ctx.on_element(&e, true, before, after),
-            Event::Text(e) => ctx.on_text(e.into_inner().into_owned(), before, after),
-            Event::CData(e) => ctx.on_text(e.into_inner().into_owned(), before, after),
+            // `into_inner()` 借的是输入缓冲，只有真挂着一个文本元素时才复制进 `pending`。
+            Event::Text(e) => ctx.on_text(&e.into_inner(), before, after),
+            Event::CData(e) => ctx.on_text(&e.into_inner(), before, after),
             // `&#nnn;` / `&amp;`：quick-xml 单独发的事件，必须显式接住，
             // 否则这些字符会被静默丢弃（见 PendingText 的说明）。
-            Event::GeneralRef(e) => {
-                let inner = e.into_inner().into_owned();
-                ctx.on_ref(&inner, before, after);
-            }
+            Event::GeneralRef(e) => ctx.on_ref(e.as_ref(), before, after),
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_string();
-                if let Some(mut p) = ctx.on_end(&local, before, after) {
+                let local = e.local_name();
+                if let Some(mut p) = ctx.on_end(local.as_ref(), before, after) {
                     p.part = part.to_string();
                     p.index = paras.len();
                     finalize_para(&mut p, &mut stats);
@@ -696,14 +735,7 @@ fn finalize_para(p: &mut Para, stats: &mut ScanStats) {
                 if node.preserve_space {
                     stats.preserve_space_nodes += 1;
                 }
-                for (ch, off, len) in decode_with_offsets(&node.raw, node.content_start) {
-                    visible.push(ch);
-                    map.push(CharRef {
-                        node: ni,
-                        off,
-                        len,
-                    });
-                }
+                decode_into(&node.raw, node.content_start, ni, &mut visible, &mut map);
             }
             NodeKind::DelText => stats.del_text_nodes += 1,
             NodeKind::InstrText => stats.instr_text_nodes += 1,
@@ -724,7 +756,9 @@ fn finalize_para(p: &mut Para, stats: &mut ScanStats) {
     if p.is_split_across_runs() {
         stats.split_paragraphs += 1;
     }
-    stats.visible_chars += visible.chars().count();
+    // `map` 每个可见字符恰好一项（虚拟字符也在内），长度就是可见字符数——
+    // 不必再拿 `visible.chars().count()` 把这段文本重数一遍。
+    stats.visible_chars += map.len();
 
     p.visible = visible;
     p.map = map;
@@ -744,13 +778,24 @@ fn has_preserve_space(e: &BytesStart<'_>) -> bool {
     false
 }
 
-/// 把原始（转义态）文本解码成 `(字符, 字节起点, 字节长度)`。
+/// 把原始（转义态）文本解码成**可见文本 + 字符→字节映射**，直接写进调用方的两个容器。
 ///
 /// 自己实现而不用库的解码函数，因为**必须同时拿到字节长度**：
 /// 库的 `xml_content()` 会做 EOL 规范化，长度对不上原文，偏移就废了。
-fn decode_with_offsets(raw: &str, base: usize) -> Vec<(char, usize, usize)> {
+///
+/// 为什么不返回 `Vec<(char, usize, usize)>` 让调用方再搬一遍：那个元组是 24 字节，
+/// 一个一万五千字符的段落就是几百 KB 的中间缓冲，分配、填充、再逐项搬进
+/// `CharRef` 全是白干。直接写进去，两个容器各长一次就够了。
+fn decode_into(
+    raw: &str,
+    base: usize,
+    node: usize,
+    visible: &mut String,
+    map: &mut Vec<CharRef>,
+) {
     let bytes = raw.as_bytes();
-    let mut out = Vec::new();
+    visible.reserve(raw.len());
+    map.reserve(raw.len());
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -759,7 +804,12 @@ fn decode_with_offsets(raw: &str, base: usize) -> Vec<(char, usize, usize)> {
                 if semi <= 12 {
                     let ent = &raw[i + 1..i + semi];
                     if let Some(ch) = decode_entity(ent) {
-                        out.push((ch, base + i, semi + 1));
+                        visible.push(ch);
+                        map.push(CharRef {
+                            node,
+                            off: base + i,
+                            len: semi + 1,
+                        });
                         i += semi + 1;
                         continue;
                     }
@@ -769,11 +819,14 @@ fn decode_with_offsets(raw: &str, base: usize) -> Vec<(char, usize, usize)> {
         // 普通 UTF-8 字符
         let ch = raw[i..].chars().next().expect("i 恒在字符边界上");
         let len = ch.len_utf8();
-        out.push((ch, base + i, len));
+        visible.push(ch);
+        map.push(CharRef {
+            node,
+            off: base + i,
+            len,
+        });
         i += len;
     }
-
-    out
 }
 
 fn decode_entity(ent: &str) -> Option<char> {

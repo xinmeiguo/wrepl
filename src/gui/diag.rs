@@ -122,19 +122,75 @@ pub fn init(what: &str) {
 /// 弹出「出错了」对话框。GUI 版没有控制台，不弹窗用户就只见窗口消失。
 #[cfg(windows)]
 fn crash_box(msg: &str) {
+    box_impl("wrepl —— 出错了", &format!(
+        "wrepl 遇到内部错误，必须关闭。\n\n{msg}\n\n完整日志：\n{}",
+        path_text()
+    ));
+}
+
+/// 弹「窗口没能打开」的对话框。
+///
+/// ## 为什么这条非得有不可
+///
+/// 图形界面版是**图形子系统**（PE Subsystem = 2），没有控制台 ——
+/// `stderr` 无处可去。而 "窗口建不出来" 恰恰是它最常见的失败方式：
+/// 显卡驱动只提供 OpenGL 1.1（远程桌面、虚拟机、只装了「Microsoft 基本显示适配器」
+/// 的机器都是这样）时，`eframe::run_native` 会**返回 Err**，
+/// `main` 一返回错误，进程就安安静静地退出了 ——
+/// **用户看到的就是"双击了，什么也没发生"**，连一句提示都没有。
+///
+/// 所以这里把话说全：出了什么事、为什么、日志在哪、
+/// 以及**接下来能干什么**（命令行版干的是同一件事，而且不需要显卡）。
+#[cfg(windows)]
+pub fn startup_failure_box(detail: &str) {
+    let text = format!(
+        "wrepl 图形界面没能打开窗口，程序即将退出。\n\
+         \n\
+         最常见的原因（按出现频率）：\n\
+         1. 这台机器的显卡驱动没有提供 OpenGL 2.1 以上 ——\n\
+         \x20  远程桌面、虚拟机、或只装了「Microsoft 基本显示适配器」时都是这样；\n\
+         2. 安全软件 / 公司管控套件拦住了本程序创建窗口；\n\
+         3. 系统过旧（本程序要求 64 位 Windows 10 及以上，且需 x64 CPU）。\n\
+         \n\
+         ── 不影响你干活 ──\n\
+         同一个压缩包里的 wrepl.exe（命令行版）做的是**完全一样的事**，\n\
+         而且不需要显卡、不需要窗口。用法：\n\
+         \n\
+         \x20   wrepl.exe apply \"要处理的文件夹\" --rules-file \"规则.txt\" --verify-after\n\
+         \n\
+         规则文件每行一条，制表符分隔：查找内容<TAB>替换为。\n\
+         先用 --dry-run 空跑一遍看命中，再正式跑。\n\
+         \n\
+         ── 完整日志 ──\n\
+         %LOCALAPPDATA%\\wrepl\\wrepl-gui.log\n\
+         {}\n\
+         \n\
+         ── 技术细节 ──\n\
+         {}",
+        path_text(),
+        detail
+    );
+    box_impl("wrepl —— 窗口没能打开", &text);
+}
+
+#[cfg(not(windows))]
+pub fn startup_failure_box(detail: &str) {
+    eprintln!(
+        "wrepl 图形界面没能打开窗口：{detail}\n\
+         （命令行版 wrepl 做的是同一件事，且不需要显卡）\n日志：{}",
+        path_text()
+    );
+}
+
+/// 弹一个只读的模态消息框。失败就算了 —— 报错本身不该再引发错误。
+#[cfg(windows)]
+fn box_impl(caption: &str, text: &str) {
     unsafe extern "system" {
         fn MessageBoxW(hwnd: *mut core::ffi::c_void, text: *const u16, caption: *const u16, ty: u32)
         -> i32;
     }
-    let text = format!(
-        "wrepl 遇到内部错误，必须关闭。\n\n{msg}\n\n完整日志：\n{}",
-        path_text()
-    );
     let t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let c: Vec<u16> = "wrepl —— 出错了"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let c: Vec<u16> = caption.encode_utf16().chain(std::iter::once(0)).collect();
     const MB_ICONERROR: u32 = 0x0000_0010;
     const MB_SETFOREGROUND: u32 = 0x0001_0000;
     const MB_TOPMOST: u32 = 0x0004_0000;

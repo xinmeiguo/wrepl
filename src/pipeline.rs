@@ -158,6 +158,20 @@ pub struct Options {
     /// 只对写副本模式有意义（就地替换本来就在原地，谈不上镜像）。预演不落盘，
     /// 恒不生效。
     pub mirror: bool,
+    /// 是否计算**文件级 SHA256**（[`Outcome::sha_before`] / [`Outcome::sha_after`]）。
+    ///
+    /// ## 为什么它是个开关
+    ///
+    /// 这两个值只在两个地方被消费：
+    /// ① `--report` 导出的「文件清单」工作表；② [`Options::mirror`] 用来自证
+    /// "未改动文件是原样复制的"。
+    ///
+    /// 而它的代价是**每个文件整读两遍、算两次 SHA256**——`sha2` 是纯软件实现
+    /// （约 240 MB/s），一个 8.8 MB 的 docx 就是 40 ms × 2。对"只想快点把这批文件改完"
+    /// 的人，这 80 ms 是纯白干。所以默认关闭，由调用方按需要打开。
+    ///
+    /// `mirror = true` 时 [`run`] 会**强制**打开它，不依赖调用方记得设。
+    pub file_sha: bool,
 }
 
 /// 一次运行的完整结果。
@@ -232,9 +246,21 @@ pub fn run(
     if opts.in_place && opts.out_dir.is_some() {
         bail!("输出目录与就地替换不能同时使用");
     }
+    // 产物根目录先建出来（带退避重试）。**必须在"逐文件改写"之前**：
+    // 本机实测过"建目录被拒"（`os error 5 拒绝访问`）是**一阵一阵**的 ——
+    // 企业管控 / 杀软对目录项变更的判定、同步盘的瞬时占用都会这样。
+    // 若留给每个文件各自去建，一次瞬时拒绝就会变成"整批 N 个文件全部失败"，
+    // 而人第一眼只看到一句"N 个文件处理失败"：既不知道是权限，也不知道一个文件都没动。
+    if !opts.dry_run {
+        if let Some(d) = opts.out_dir.as_deref() {
+            ensure_out_dir(d)?;
+        }
+    }
 
     let (files, skipped) = collect_targets(paths, opts)?;
     let threads_used = resolve_threads(opts.threads, files.len());
+    // 完整镜像的自证要靠整文件 SHA 对照，所以这里**强制**打开，不指望调用方记得设。
+    let want_sha = opts.file_sha || opts.mirror;
     let mut res = RunResult {
         outcomes: Vec::with_capacity(files.len()),
         skipped,
@@ -277,6 +303,7 @@ pub fn run(
             opts.longest_first,
             opts.verify_after && !opts.dry_run,
             opts.mirror && !opts.dry_run,
+            want_sha,
         ) {
             Ok(o) => o,
             Err(e) => Outcome::errored(src, rules, format!("{e:#}")),
@@ -390,7 +417,14 @@ fn build_excludes(pats: &[String]) -> Result<globset::GlobSet> {
 }
 
 /// 判断一个文件是否应被排除；返回原因。
-fn exclude_reason(path: &Path, ex: &globset::GlobSet, out_dir: Option<&Path>) -> Option<String> {
+///
+/// `canon` 是调用方已经算好的规范路径（可能为 `None`）——见 [`gate_and_push`]。
+fn exclude_reason(
+    path: &Path,
+    canon: Option<&Path>,
+    ex: &globset::GlobSet,
+    out_dir: Option<&Path>,
+) -> Option<String> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if name.starts_with("~$") {
         return Some("Word 临时锁文件".into());
@@ -399,7 +433,7 @@ fn exclude_reason(path: &Path, ex: &globset::GlobSet, out_dir: Option<&Path>) ->
         return Some("办公软件锁文件".into());
     }
     if let Some(od) = out_dir {
-        if let Ok(c) = path.canonicalize() {
+        if let Some(c) = canon {
             if c.starts_with(od) {
                 return Some("位于输出目录内（避免把产物当输入）".into());
             }
@@ -429,6 +463,36 @@ fn extension_gate(path: &Path, explicit: bool) -> Option<String> {
             }
         }
     }
+}
+
+/// 建产物根目录，失败则带**可照做的原因**返回；瞬时拒绝会退避重试几次。
+///
+/// 为什么不只在真要写第一个文件时建：这层失败是全局的（目录建不出来 ⇒ 每个文件都写不出去），
+/// 后果却是"整批 N 个文件失败"，人从结论上看不出根因。提前一次试出来，
+/// 结论就只剩一句"输出目录不可写"，且**一个文件都没动**。
+fn ensure_out_dir(dir: &Path) -> Result<()> {
+    if dir.as_os_str().is_empty() {
+        bail!("输出目录是空路径");
+    }
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..4u32 {
+        match std::fs::create_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                // 100 / 200 / 400 ms：这类判定常常只持续一瞬间
+                std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+            }
+        }
+    }
+    let e = last.expect("循环至少跑过一次");
+    bail!(
+        "输出目录建不出来：{}\n  原因：{e}\n  \
+         一个文件都还没动（本次没有改动任何源文件）。\n  \
+         常见成因：安全管控 / 杀软拦了写、同步盘正在占用、路径在只读位置。\n  \
+         换个输出目录（例如放到 D 盘）通常立刻可用。",
+        dir.display()
+    )
 }
 
 /// 收集待处理文件：返回 `(绝对路径, 相对路径)` 与跳过清单。
@@ -495,7 +559,12 @@ fn gate_and_push(
     skipped: &mut Vec<Skipped>,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<()> {
-    if let Some(r) = exclude_reason(path, ex, out_canon) {
+    // ★ 规范路径只算一次。「是否落在输出目录内」与"同一个文件被给了两次"都要它，
+    //   而 `canonicalize` 是一次真实的系统调用（本机约 0.3 ms/次）——
+    //   几十上百个文件时，白白多算一遍就是一个可观的固定开销。
+    let canon = path.canonicalize().ok();
+
+    if let Some(r) = exclude_reason(path, canon.as_deref(), ex, out_canon) {
         skipped.push(Skipped {
             path: path.to_path_buf(),
             reason: r,
@@ -511,7 +580,7 @@ fn gate_and_push(
         }
         return Ok(());
     }
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let key = canon.unwrap_or_else(|| path.to_path_buf());
     if seen.insert(key) {
         files.push((path.to_path_buf(), rel));
     }
@@ -559,6 +628,10 @@ pub fn file_sha(p: &Path) -> Result<String> {
 ///
 /// `mirror` 也只在**写副本**下有意义（见 [`Options::mirror`]）：一处都没改动时，
 /// 是原样复制一份到输出目录（完整镜像），还是什么都不写（默认）。
+///
+/// `want_sha` 决定要不要算文件级 SHA256（见 [`Options::file_sha`]）。
+/// 关掉时 [`Outcome::sha_before`] / [`Outcome::sha_after`] 都是空串——
+/// 调用方只有在**确实要写报告**或**开了完整镜像**时才该打开它。
 #[allow(clippy::too_many_arguments)]
 pub fn process_one(
     src: &Path,
@@ -571,6 +644,7 @@ pub fn process_one(
     longest_first: bool,
     want_verify: bool,
     mirror: bool,
+    want_sha: bool,
 ) -> Result<Outcome> {
     let text_parts = package::read_text_parts(src)?;
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
@@ -583,8 +657,8 @@ pub fn process_one(
         } else {
             engine::plan_part(name, *kind, bytes, rl, longest_first)?
         };
-        if plan.changed {
-            replaced.insert(name.clone(), plan.new_bytes);
+        if let Some(new_bytes) = plan.new_bytes {
+            replaced.insert(name.clone(), new_bytes);
             parts.push(name.clone());
         }
         hits.extend(plan.hits);
@@ -592,7 +666,8 @@ pub fn process_one(
 
     let conflicts = hits.iter().filter(|h| !h.applied).count();
     let applied = hits.iter().filter(|h| h.applied).count();
-    let sha_before = file_sha(src)?;
+    // ★ 文件级 SHA256 按需才算：整读两遍 + 两次 SHA256，只有报告与完整镜像用得上。
+    let sha_before = if want_sha { file_sha(src)? } else { String::new() };
 
     let meta = std::fs::metadata(src)?;
     let mtime = meta
@@ -617,17 +692,31 @@ pub fn process_one(
         // 下面那一步会把 `src` 覆盖掉；覆盖之后，`src` 指的就是产物本身了。
         // 不留基准的话，"执行后自动验证"只能拿这个文件跟它自己比 ——
         // 关卡 1/2 必然全等通过，报表一片绿，实际什么都没验。
-        // 骨架快照只在本函数内存活，比完即丢，不跨文件累积。
-        let before = if in_place && want_verify {
-            match verify::snapshot(src) {
-                Ok(s) => Some(s),
+        //
+        // 而且关卡 1 现在比的是**压缩字节**（见 `verify::compare_level1`）：
+        // 就地替换下"原件的那段压缩字节"同样只存在于覆盖之前 —— 所以不能只留指纹，
+        // 得把**整份原件字节**留在手上（`Arc`，比完即丢）。顺带省一次读盘：
+        // 这份字节本来就是就地改写要用的（`rewrite_in_place_with`）。
+        let origin: Option<std::sync::Arc<Vec<u8>>> = if in_place && want_verify {
+            match std::fs::read(src) {
+                Ok(b) => Some(std::sync::Arc::new(b)),
                 Err(e) => {
-                    snap_err = Some(format!("{e:#}"));
+                    snap_err = Some(format!("读取原件失败：{e}"));
                     None
                 }
             }
         } else {
             None
+        };
+        let before = match &origin {
+            Some(b) => match verify::snapshot_from_bytes(src, std::sync::Arc::clone(b)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    snap_err = Some(format!("{e:#}"));
+                    None
+                }
+            },
+            None => None,
         };
 
         match dst {
@@ -653,7 +742,10 @@ pub fn process_one(
                     // 机械盘）省得很实在；代价是失去 rename 的原子性 ——
                     // 保底手段是（勾了备份时的）那份 .bak，以及 rewrite_in_place 内部
                     // 写失败时把内存里的原件写回去。
-                    package::rewrite_in_place(src, &replaced)?;
+                    match &origin {
+                        Some(b) => package::rewrite_in_place_with(src, &replaced, b)?,
+                        None => package::rewrite_in_place(src, &replaced)?,
+                    }
                     note = format!("已就地改写（原文件上直接覆盖）{bak_note}");
                 } else {
                     package::write_with_replacements(src, d, &replaced)?;
@@ -663,7 +755,7 @@ pub fn process_one(
                 // 注意：这一支不看 `conflicts`——"部分落笔 + 部分冲突"也是真写了盘，
                 // 该由 `written` 如实反映，而不是被 `status` 的冲突语义盖过去。
                 written = true;
-                sha_after = file_sha(d)?;
+                sha_after = if want_sha { file_sha(d)? } else { String::new() };
 
                 // 写完立刻比、比完就丢。
                 if let Some(b) = before {
@@ -702,7 +794,7 @@ pub fn process_one(
             std::fs::copy(src, d)
                 .with_context(|| format!("复制到输出目录失败：{}", d.display()))?;
             written = true;
-            sha_after = file_sha(d)?;
+            sha_after = if want_sha { file_sha(d)? } else { String::new() };
             mirrored = true;
             note = "未改动，已原样复制到输出目录（完整镜像）".into();
         }
@@ -1211,9 +1303,9 @@ mod tests {
     fn excludes_word_lock_files() {
         let ex = build_excludes(&[]).unwrap();
         let p = PathBuf::from("/tmp/~$文件一.docx");
-        assert!(exclude_reason(&p, &ex, None).is_some());
+        assert!(exclude_reason(&p, None, &ex, None).is_some());
         let ok = PathBuf::from("/tmp/正常文件.docx");
-        assert!(exclude_reason(&ok, &ex, None).is_none());
+        assert!(exclude_reason(&ok, None, &ex, None).is_none());
     }
 
     #[test]

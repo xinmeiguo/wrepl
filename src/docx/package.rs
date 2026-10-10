@@ -361,18 +361,30 @@ pub fn write_with_replacements(
         }
     }
 
-    let out = File::create(dst).with_context(|| format!("创建输出文件失败：{}", dst.display()))?;
+    // ★ 以**可读可写**打开产物：写完之后要就地回填中央目录的记账字段，
+    //   而那时候若重新开一个句柄，刚落盘的文件常常正被杀软独占扫描，
+    //   写请求被拒 → 落到 `write_at` 的退避重试上（实测单文件能多花 30 ms 以上）。
+    //   自己写出来的东西，用自己这个句柄补完就行。
+    let out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)
+        .with_context(|| format!("创建输出文件失败：{}", dst.display()))?;
     let mut zw = ZipWriter::new(BufWriter::new(out));
     write_entries(&mut ar, &mut zw, replaced)?;
 
     let mut bw = zw.finish().context("收尾 zip 失败")?;
     bw.flush().context("写入磁盘失败")?;
-    drop(bw);
 
     // 未被改动的 part 应保持"连元数据都原样"；被改的 part 也沿用原条目的外部属性
-    if let Err(e) = restore_external_attrs(src, dst) {
-        eprintln!("  · 提示：未能复原 zip 外部属性（{e}）——不影响 part 内容");
+    match restore_external_attrs_on(bw.get_mut(), src) {
+        Ok(_) => {}
+        Err(e) => eprintln!("  · 提示：未能复原 zip 外部属性（{e}）——不影响 part 内容"),
     }
+    bw.flush().context("写入磁盘失败")?;
+    drop(bw);
     Ok(())
 }
 
@@ -418,9 +430,28 @@ fn build_zip_bytes(src_bytes: &[u8], replaced: &HashMap<String, Vec<u8>>) -> Res
 /// ① 调用方可以先用 `backup` 留一份 `.bak`（默认不留，留不留是调用方的选择）；
 /// ② 这里写失败会先尝试把原件写回去，再**把回滚结果如实报出去**——回滚也失败时
 ///   会明说"源文件可能已损坏"，而不是留下一句含糊的"改写失败"。
+/// 就地改写 `path` **本身**：自己把原件读进来，再走 [`rewrite_in_place_with`]。
 pub fn rewrite_in_place(path: &Path, replaced: &HashMap<String, Vec<u8>>) -> Result<()> {
     let orig = std::fs::read(path).with_context(|| format!("读取失败：{}", path.display()))?;
-    let out = build_zip_bytes(&orig, replaced)?;
+    rewrite_in_place_with(path, replaced, &orig)
+}
+
+/// 与 [`rewrite_in_place`] 同一件事，但**原件字节由调用方给**。
+///
+/// ## 为什么需要这个入口
+///
+/// 就地替换要采执行后验证的基准，而**基准里的"原件压缩字节"只能在覆盖之前拿**。
+/// `pipeline::process_one` 因此先把原件整份读进内存（`Arc<Vec<u8>>`）、据此采好快照，
+/// 再把同一份字节交到这里 —— 既少读一次盘，也保证"验证比的那份字节"和"实际被改写的
+/// 那份字节"**是同一次读出来的同一份**，中间没有第二个窗口。
+///
+/// 见 [`crate::verify::snapshot_from_bytes`] 与 `verify::RawSource::Mem`。
+pub fn rewrite_in_place_with(
+    path: &Path,
+    replaced: &HashMap<String, Vec<u8>>,
+    orig: &[u8],
+) -> Result<()> {
+    let out = build_zip_bytes(orig, replaced)?;
     if let Err(e) = write_at(path, 0, &out, true) {
         // ★ 回滚的结果**必须看**，不能 `let _ =` 吞掉。
         //
@@ -428,7 +459,7 @@ pub fn rewrite_in_place(path: &Path, replaced: &HashMap<String, Vec<u8>>) -> Res
         // 决定用户接下来该做什么。回滚成功 → 文件没坏，重跑即可；
         // 回滚也失败 → **文件可能已损坏**，得立刻说清楚，让他去用 .bak 或
         // 版本控制恢复，而不是只看到一句"就地改写失败"以为文件还好好的。
-        return match write_at(path, 0, &orig, true) {
+        return match write_at(path, 0, orig, true) {
             Ok(()) => Err(e).with_context(|| {
                 format!(
                     "就地改写 {} 失败（已把原件写回，源文件应保持原样；修好原因后重跑即可）",
@@ -612,12 +643,21 @@ struct CdRegion {
 
 fn read_cd_region(path: &Path) -> Result<CdRegion> {
     let mut f = File::open(path).with_context(|| format!("打不开文件：{}", path.display()))?;
+    read_cd_region_from(&mut f).with_context(|| format!("读中央目录失败：{}", path.display()))
+}
+
+/// 与 [`read_cd_region`] 同一条读法，但复用**已经打开**的句柄。
+///
+/// 为什么需要这个：写副本模式刚落盘时，产物经常正被杀软实时防护打开扫描，
+/// 那一刻**新开一个句柄**会被拒（触发 [`write_at`] 的退避重试，实测单文件能多花 30 ms 以上）。
+/// 而产出这个文件的句柄就在手上——只要它是可读可写的，就地补记账字段即可，
+/// 连"再开一次文件"这个动作都不必发生。
+fn read_cd_region_from<R: Read + Seek>(f: &mut R) -> Result<CdRegion> {
     let len = f
-        .metadata()
-        .with_context(|| format!("取文件长度失败：{}", path.display()))?
-        .len() as usize;
+        .seek(SeekFrom::End(0))
+        .context("定位文件末尾失败")? as usize;
     if len < 22 {
-        bail!("文件太小，不是合法 zip：{}", path.display());
+        bail!("文件太小，不是合法 zip");
     }
 
     let tail_n = len.min(22 + 0xFFFF);
@@ -738,6 +778,22 @@ pub fn restore_external_attrs(src: &Path, dst: &Path) -> Result<usize> {
     let fixed = fix_cd(&s.bytes, s.off, &mut d.bytes, d.off)?;
     if fixed > 0 {
         write_at(dst, d.off as u64, &d.bytes, false)?;
+    }
+    Ok(fixed)
+}
+
+/// 与 [`restore_external_attrs`] 同一件事，但**复用产物的写句柄**（须可读可写）。
+///
+/// 见 [`read_cd_region_from`]：刚落盘的产物在 Windows 上可能正被杀软独占扫描，
+/// 新开句柄会被拒并落到退避重试上。句柄就在手上时，这一步不该再开一次文件。
+pub fn restore_external_attrs_on<R: Read + Seek + Write>(f: &mut R, src: &Path) -> Result<usize> {
+    let s = read_cd_region(src)?;
+    let mut d = read_cd_region_from(f)?;
+    let fixed = fix_cd(&s.bytes, s.off, &mut d.bytes, d.off)?;
+    if fixed > 0 {
+        f.seek(SeekFrom::Start(d.off as u64))?;
+        f.write_all(&d.bytes)?;
+        f.flush()?;
     }
     Ok(fixed)
 }

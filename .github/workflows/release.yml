@@ -54,15 +54,49 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked --features gui --target x86_64-pc-windows-msvc
 
-      - name: 校验产物不依赖 VC++ 运行库
-        # 上面那个 +crt-static 到底生效没有 —— 不看开发机装没装运行库，只解析 PE 导入表。
-        # ★ 这一步是「用户双击报缺 VCRUNTIME140.dll」那类问题的根治：
-        #   开发机早就装过 VC++ Redistributable，所以那个不一致在本机永远看不出来，
-        #   只有把断言放进 CI，编译参数退化才会当场变红（脚本头注释有完整来龙去脉）。
+      - name: 盘点产物的系统依赖（导入表 / 架构 / 子系统 / 主线程栈）
+        # 这一步是「用户下载后双击没反应」那类问题的**唯一**自动化防线。
+        # 它查四件事，每一条在开发机上都看不出来（运行库、编译器、显卡驱动都装齐了）：
+        #   ① 导入表里有没有非 Windows 自带的 DLL（VC++ 运行库 / MinGW 运行库 / 来路不明）；
+        #   ② 架构是不是 x64（包名写着 x64-windows，发 x86 会让一部分机器直接起不来）；
+        #   ③ 子系统对不对（GUI 版必须 GUI(2)，否则双击先弹一个黑框）；
+        #   ④ 主线程栈**有没有被调大**。★ 这条方向反着 —— v0.2.3 曾经把栈提到 16 MB
+        #      "求稳"，实测直接把窗口打坏（glutin 枚举不到 GL 配置、永远建不出窗），
+        #      脚本头注释有完整的单变量实验记录。
         run: >-
           python .github/scripts/check_pe_imports.py
           target/x86_64-pc-windows-msvc/release/wrepl.exe
           target/x86_64-pc-windows-msvc/release/wrepl-gui.exe
+
+      - name: 冒烟：产物真的能起来
+        # 上一步是**静态**检查，这一步是**真跑一次**。
+        # 挡的是"编译过了、但在干净机器上根本进不去入口点"这一类：
+        # 依赖没带全、子系统写错、栈太小被运行时干掉……开发机上统统发现不了。
+        #
+        # 两个坑，注释写在这里免得下次再踩：
+        # ① `wrepl-gui.exe` 是**图形子系统**进程。用 `> 文件` 直接重定向时
+        #    PowerShell **不会等它**，退出码取不到（$LASTEXITCODE 是空的）；
+        #    走管道（`| Out-String`）才会等、才有退出码。
+        # ② `--selftest` **不开窗**，所以它验不了"窗口能不能建出来"——
+        #    那一步依赖显卡驱动（远程桌面 / 基本显示适配器上会失败），
+        #    只能在用户机器上才知道。程序对那种情况的处理见
+        #    `diag::startup_failure_box`（弹窗说清原因 + 指到命令行版）。
+        #    这一步能验的是：PE 能加载、CRT 齐、字体能读、egui 布局能跑、xlsx 读写能用。
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rel = 'target/x86_64-pc-windows-msvc/release'
+
+          # ① 命令行版：能打印版本，说明依赖链、CRT、入口点全部成立
+          & "$rel/wrepl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "wrepl.exe --version 退出码 $LASTEXITCODE" }
+
+          # ② 图形界面版：无窗口自检（真读字体、真跑布局、真跑一次批量 + xlsx 往返）
+          New-Item -ItemType Directory -Force -Path smoke/in, smoke/out | Out-Null
+          $log = & "$rel/wrepl-gui.exe" --selftest smoke/in smoke/out 2>&1 | Out-String
+          Write-Host $log
+          if ($LASTEXITCODE -ne 0) { throw "wrepl-gui.exe --selftest 退出码 $LASTEXITCODE" }
+          if ($log -notmatch '自检通过') { throw "wrepl-gui.exe --selftest 没有报告通过" }
 
       - name: 打包（zip + SHA256）
         shell: pwsh
