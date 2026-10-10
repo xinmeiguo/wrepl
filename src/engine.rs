@@ -31,9 +31,14 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 
 /// 一个字符的折叠结果（与输入**一一对应**，长度不变）。
-pub fn fold_char(c: char, case_sensitive: bool, kana_sensitive: bool) -> char {
+///
+/// `width_sensitive` 是"**区分全半角**"（`true` = 不做全角→半角归一）。
+/// 名字刻意不叫 `kana_sensitive`：这个开关与假名毫无关系——它只做 ASCII 全角
+/// （U+FF01..U+FF5E）与全角空格 U+3000 的归一。规则模型里的字段沿用历史名
+/// `kana_sensitive`（那是规则表的列标识，不能改），语义就是这里的 `width_sensitive`。
+pub fn fold_char(c: char, case_sensitive: bool, width_sensitive: bool) -> char {
     let mut c = c;
-    if !kana_sensitive {
+    if !width_sensitive {
         let u = c as u32;
         // 全角 ASCII → 半角
         if (0xFF01..=0xFF5E).contains(&u) {
@@ -58,10 +63,10 @@ pub fn fold_char(c: char, case_sensitive: bool, kana_sensitive: bool) -> char {
     c
 }
 
-/// 把字符串折叠成字符向量。
-pub fn fold(s: &str, case_sensitive: bool, kana_sensitive: bool) -> Vec<char> {
+/// 把字符串折叠成字符向量。各参数含义见 [`fold_char`]。
+pub fn fold(s: &str, case_sensitive: bool, width_sensitive: bool) -> Vec<char> {
     s.chars()
-        .map(|c| fold_char(c, case_sensitive, kana_sensitive))
+        .map(|c| fold_char(c, case_sensitive, width_sensitive))
         .collect()
 }
 
@@ -121,7 +126,6 @@ struct Cand {
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub rule_id: u32,
-    pub rule_index: usize,
     pub para: usize,
     pub slot: Slot,
     pub a: usize,
@@ -268,7 +272,6 @@ fn build_edits(
         if let Some(by) = rej[i] {
             hits.push(Hit {
                 rule_id: r.id,
-                rule_index: c.rule,
                 para: c.para,
                 slot: c.slot,
                 a: c.a,
@@ -292,7 +295,6 @@ fn build_edits(
         edits.extend(he.edits);
         hits.push(Hit {
             rule_id: r.id,
-            rule_index: c.rule,
             para: c.para,
             slot: c.slot,
             a: c.a,
@@ -427,6 +429,27 @@ pub fn plan_part(
     })
 }
 
+/// 规则表级别的**动手前预检**：把"无论如何都跑不通"的规则先挡下来。
+///
+/// 目前只有一项：通配符规则尚未实现（里程碑 M7）。这条检查本来写在
+/// [`collect`] 与 [`plan_part_chained`] 里——那是"每个文件、每个 part"的位置，
+/// 于是一条坏规则会把一批 N 个文件**全部**染成 ERROR，报告一片红，
+/// 却读不出"是规则本身就不能用"。挪到批处理入口做一次，一个文件都不碰，
+/// 报错只有一条。
+///
+/// `collect` / `plan_part_chained` 里的同名检查**保留**：它们是纵深防御，
+/// 而且单测会直接调用这两个函数（不经过 [`crate::pipeline::run`]）。
+pub fn precheck_rules(rules: &[Rule]) -> Result<()> {
+    if let Some(r) = rules.iter().find(|r| r.enabled && r.use_wildcard) {
+        bail!(
+            "规则 #{} 开启了通配符，但通配符尚未实现（里程碑 M7）。\
+             为避免静默按字面处理，这里直接中止。",
+            r.id
+        );
+    }
+    Ok(())
+}
+
 /// 处理单个 part（链式模式：前一条规则的输出即后一条的输入，逐个规则重新扫描）。
 ///
 /// 链式下不需要冲突检测——规则是**先后**作用的，顺序本身就是语义。
@@ -438,6 +461,13 @@ pub fn plan_part_chained(
 ) -> Result<PartPlan> {
     let mut cur = xml.to_vec();
     let mut hits: Vec<Hit> = Vec::new();
+    // 扫描结果缓存：**只有字节真的变了才作废**。
+    //
+    // 链式模式下每条规则都要重新扫一遍当前字节流。但规则表里往往只有少数几条
+    // 真的落了笔（其余全是"查找串在这份文档里根本没出现"）。上一条规则一处没改，
+    // 字节流就与上上条结束时**完全相同**，此时重扫得到的 `Para` 必然一模一样——
+    // 纯属白干。规则表 50 条、只命中 3 条时，解析次数从 50×N 降到 ~4×N。
+    let mut cache: Option<Vec<Para>> = None;
 
     for r in rules.iter().filter(|r| r.enabled) {
         if r.use_wildcard {
@@ -447,43 +477,53 @@ pub fn plan_part_chained(
         if needle.is_empty() {
             continue;
         }
-        let text = std::str::from_utf8(&cur)
-            .with_context(|| format!("{part} 链式处理中变为非 UTF-8"))?
-            .to_string();
-        let (paras, _) = scan::scan_part(part, &text)?;
+        if cache.is_none() {
+            // 直接借用 `cur`，**不要** `.to_string()`：那会把整个 part 每条规则
+            // 完整拷贝一份（R 条规则 = R 次整拷贝，纯浪费）。`scan_part` 返回的
+            // `Para` 全部自持数据（`String`/`Vec`），不借用 `text`，所以借用在
+            // 这一段结束即可。
+            let text = std::str::from_utf8(&cur)
+                .with_context(|| format!("{part} 链式处理中变为非 UTF-8"))?;
+            let (paras, _) = scan::scan_part(part, text)?;
+            cache = Some(paras);
+        }
 
         let mut edits: Vec<Edit> = Vec::new();
-        for p in &paras {
-            let slot = match slot_of(kind, p.in_textbox) {
-                Some(s) => s,
-                None => continue,
-            };
-            if !r.scope.allows(slot) {
-                continue;
-            }
-            let hay = fold(&p.visible, r.case_sensitive, r.kana_sensitive);
-            for (a, b) in find_all(&hay, &needle, r.whole_word) {
-                let matched: String = p.visible.chars().skip(a).take(b - a).collect();
-                let he = rewrite::build(&cur, p, a, b, &r.replace)?;
-                let desc = he.describe();
-                edits.extend(he.edits);
-                hits.push(Hit {
-                    rule_id: r.id,
-                    rule_index: 0,
-                    para: p.index,
-                    slot,
-                    a,
-                    b,
-                    matched,
-                    replaced_by: r.replace.clone(),
-                    applied: true,
-                    reason: String::new(),
-                    strategy: desc,
-                });
+        {
+            let paras = cache.as_ref().expect("上一段刚填过，必有值");
+            for p in paras {
+                let slot = match slot_of(kind, p.in_textbox) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if !r.scope.allows(slot) {
+                    continue;
+                }
+                let hay = fold(&p.visible, r.case_sensitive, r.kana_sensitive);
+                for (a, b) in find_all(&hay, &needle, r.whole_word) {
+                    let matched: String = p.visible.chars().skip(a).take(b - a).collect();
+                    let he = rewrite::build(&cur, p, a, b, &r.replace)?;
+                    let desc = he.describe();
+                    edits.extend(he.edits);
+                    hits.push(Hit {
+                        rule_id: r.id,
+                        para: p.index,
+                        slot,
+                        a,
+                        b,
+                        matched,
+                        replaced_by: r.replace.clone(),
+                        applied: true,
+                        reason: String::new(),
+                        strategy: desc,
+                    });
+                }
             }
         }
         if !edits.is_empty() {
             cur = rewrite::apply(&cur, &edits)?;
+            // 字节流变了：上一份扫描结果作废，下一条规则必须重扫
+            cache = None;
         }
     }
 

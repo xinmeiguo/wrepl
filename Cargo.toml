@@ -1,6 +1,6 @@
 [package]
 name = "wrepl"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 # 用 build.rs 把主线程栈预留**钉死在 1 MB** —— 见 build.rs 文件头。
 #

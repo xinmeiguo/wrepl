@@ -837,11 +837,18 @@ fn matchable_parts(path: &Path) -> Result<Vec<(String, String, bool)>> {
             // 文本容器：只取可见文本（`w:t` 等真实渲染出来的字），
             // 这样"查找内容"在 XML 标记里出现不算残留。
             let (paras, _) = scan::scan_part(&name, s)?;
+            // ★ 段落之间用 U+2029（PARAGRAPH SEPARATOR）拼接，**不能**用 '\n'：
+            // 段内的 `<w:br/>` 在可见文本里映射成 '\n'（与替换引擎一致，
+            // 查找串含 \n 时可以命中段内换行）。若段落分隔符也是 '\n'，
+            // 含换行的查找串会把"段 N 末尾 + 段 N+1 开头"拼成一次假命中——
+            // 残留自检误报。而替换引擎里跨段必不命中，两边语义必须对齐。
+            // U+2029 不会出现在折叠后的查找串里（规则文本正常无人输入它），
+            // 用它做分隔符即可保证"跨段的拼接命中"在数学上不可能。
             let joined = paras
                 .iter()
                 .map(|p| p.visible.as_str())
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join("\u{2029}");
             out.push((name, joined, true));
         } else {
             // 参数/关系/样式：整份文本都算数，逐字找
@@ -869,18 +876,13 @@ pub fn residue(path: &Path, rules: &[Rule]) -> Result<ResidueReport> {
 
     // 先按「折叠设置」给启用中的规则分组：同一组里的规则共用一份折叠后的文本。
     // 顺序仍然按规则表原序汇总，报告里条目的排列不受影响。
+    //
+    // **文件名专属规则跳过**：它们一个内容维度都没开，字面文本只可能出现在文件名里，
+    // 拿它们去搜 part 内容只会每个文件报一条假残留。判据收在 `Scope::content_empty`。
     let active: Vec<(usize, &Rule)> = rules
         .iter()
         .enumerate()
-        .filter(|(_, r)| {
-            r.enabled
-                && !(r.scope.filename
-                    && !r.scope.body
-                    && !r.scope.header_footer
-                    && !r.scope.textbox
-                    && !r.scope.footnote
-                    && !r.scope.comment)
-        })
+        .filter(|(_, r)| r.enabled && !r.scope.content_empty())
         .collect();
 
     // 每条规则每段的计数汇总
@@ -1032,13 +1034,13 @@ pub fn verify_one(a: &Path, b: &Path) -> PairVerdict {
     let sa = match snapshot(a).context("读左侧文件失败") {
         Ok(v) => v,
         Err(e) => {
-            return failed(a, b, format!("关卡1 读取失败：{e:#}"));
+            return failed(a, b, format!("读取左侧文件失败：{e:#}"));
         }
     };
     let sb = match snapshot(b).context("读右侧文件失败") {
         Ok(v) => v,
         Err(e) => {
-            return failed(a, b, format!("关卡2 读取失败：{e:#}"));
+            return failed(a, b, format!("读取右侧文件失败：{e:#}"));
         }
     };
     let l1 = match compare_level1(&sa, &sb) {
@@ -1058,7 +1060,7 @@ pub fn verify_snap(before: &PkgSnap, after: &Path) -> PairVerdict {
     let sb = match snapshot(after).context("读右侧文件失败") {
         Ok(v) => v,
         Err(e) => {
-            return failed(after, after, format!("关卡2 读取失败：{e:#}"));
+            return failed(after, after, format!("读取右侧文件失败：{e:#}"));
         }
     };
     let l1 = match compare_level1(before, &sb) {

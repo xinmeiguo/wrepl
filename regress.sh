@@ -938,6 +938,25 @@ else
   bad "有文件报错时退出码应为 2，实际 $brk_rc —— 见 $PJB/run.log"
 fi
 
+# ───── 19. 本轮修复的三条语义：CR 编码 / 跨段残留 / scan 裁决 ─────
+#
+# 这三条都是「静默退化型」的：坏了不报错，只是悄悄改错字节、或报出不存在的残留。
+# 逻辑全在 regress-group19.py 里（Python 侧做 docx 夹具与断言，免得 shell 引号打架），
+# 这里只负责跑它、把输出转出来、把它的计数并进总表。
+head1 "19. 修复回归：CR 编码、跨段假命中、scan 与 apply 裁决一致"
+g19_log="$WORK/g19.log"
+"$PY" "$SRC/regress-group19.py" "$WREPL" "$WORK/g19" > "$g19_log" 2>&1
+sed 's/^/  /' "$g19_log"
+p19=$(grep -oE '^PASS [0-9]+' "$g19_log" | tail -1 | awk '{print $2}')
+f19=$(grep -oE '^FAIL [0-9]+' "$g19_log" | tail -1 | awk '{print $2}')
+if [ -n "${p19:-}" ]; then
+  PASS=$((PASS + p19))
+  FAIL=$((FAIL + ${f19:-0}))
+else
+  FAIL=$((FAIL + 1))
+  printf '  \033[31m✗\033[0m 第 19 组没有输出计数行（脚本崩了？）—— 见 %s\n' "$g19_log"
+fi
+
 # ───────────────────── 汇总 ─────────────────────
 printf '\n\033[1m══════════ 汇总：通过 %d ／ 失败 %d ══════════\033[0m\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then

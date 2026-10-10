@@ -74,7 +74,11 @@ fn run() -> Result<()> {
             limit,
             special,
         } => cmd_dump(&file, part.as_deref(), grep.as_deref(), limit, special),
-        Cmd::Scan { targets, rules } => cmd_scan(&targets, &rules),
+        Cmd::Scan {
+            targets,
+            rules,
+            longest_first,
+        } => cmd_scan(&targets, &rules, longest_first),
         Cmd::Apply {
             targets,
             rules,
@@ -137,6 +141,30 @@ fn load_rules(rs: &RuleSource) -> Result<(Vec<Rule>, Option<String>)> {
         id += more.len() as u32;
         out.extend(more);
     }
+    // XML 非法控制字符检查（--rule / --rules-file 这两路；Excel 那路在
+    // from_xlsx_rows 里已带警告）。这类字符：在「查找内容」里则永远不命中，
+    // 在「替换为」里则写入时被丢弃（报告显示原文、产物实际不含）——
+    // 必须在装载时说清楚，见 scan::illegal_xml_chars 的注释。
+    for r in &out {
+        for (what, text) in [("查找内容", &r.find), ("替换为", &r.replace)] {
+            let bad = scan::illegal_xml_chars(text);
+            if !bad.is_empty() {
+                let names: Vec<String> =
+                    bad.iter().map(|c| format!("U+{:04X}", *c as u32)).collect();
+                eprintln!(
+                    "⚠ 规则 #{}「{}」含 XML 非法控制字符（{}）：{}",
+                    r.id,
+                    what,
+                    names.join("、"),
+                    if what == "查找内容" {
+                        "正文里不可能存在，这条规则将永远不命中"
+                    } else {
+                        "写入产物时会被丢弃，实际替换结果不含它"
+                    }
+                );
+            }
+        }
+    }
     if let Some(b) = &rs.rules_book {
         // 表名不固定：从第一张工作表起往后找，取第一张读得出条款的（见 rules::from_xlsx_book）
         let (more, warns, sheet) =
@@ -175,12 +203,23 @@ fn print_rules(rules: &[Rule], chain: bool, longest_first: bool) {
     println!();
 }
 
-fn cmd_scan(t: &Targets, rs: &RuleSource) -> Result<()> {
+fn cmd_scan(t: &Targets, rs: &RuleSource, longest_first: bool) -> Result<()> {
     let (rl, _) = load_rules(rs)?;
-    print_rules(&rl, rs.chain, false);
+    print_rules(&rl, rs.chain, longest_first);
+
+    // 预演与执行（apply）必须用同一套裁决方式：预演硬编码 false 而 apply 可开
+    // --longest-first 时，会出现"预览说两条冲突都不改、执行却真改了一条"——
+    // 预览就失去了"所见即所得"的意义。所以这里透传，与 cmd_apply 保持一致。
+    // 链式 + longest_first 的矛盾检查与 apply 相同（链式下重叠无从谈起）。
+    if longest_first && rs.chain {
+        bail!(
+            "--longest-first 与 --chain 不能同时使用：\
+             链式模式下规则是先后作用的，不存在区间重叠，也就无从裁决。请二选一。"
+        );
+    }
 
     let opts = pipeline::Options {
-        longest_first: false,
+        longest_first,
         recursive: t.recursive,
         exclude: t.exclude.clone(),
         chain: rs.chain,

@@ -13,6 +13,7 @@
 //! - 链式（前一条的输出当后一条的输入）需 `--chain` 显式开启
 
 use crate::docx::package::PartKind;
+use crate::docx::scan;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -127,12 +128,17 @@ impl Scope {
     /// 一个维度都没开。界面上写「正文,文件名」这类组合时可能被开关掐成空域，
     /// 空域规则会静默 0 命中——宁可报错让调用方看见。
     pub fn is_empty(&self) -> bool {
-        !(self.body
-            || self.header_footer
-            || self.textbox
-            || self.footnote
-            || self.comment
-            || self.filename)
+        self.content_empty() && !self.filename
+    }
+
+    /// 一个**内容**维度都没开（只剩文件名）。
+    ///
+    /// 这类规则的字面文本只可能出现在文件名里，不会出现在任何 part 的内容中：
+    /// 残留自检（[`crate::verify::residue`]）必须跳过它们，否则每个文件都会报
+    /// 一条假残留。原先那里把六个字段手写展开了一遍，与 `is_empty` 各写各的，
+    /// 加字段时极易走偏——收成这里一个谓词，两处共用。
+    pub fn content_empty(&self) -> bool {
+        !(self.body || self.header_footer || self.textbox || self.footnote || self.comment)
     }
 }
 
@@ -187,6 +193,11 @@ pub struct Rule {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub use_wildcard: bool,
+    /// **区分全半角**（`true` = 不把全角 ASCII / U+3000 归一到半角）。
+    ///
+    /// 字段名沿用规则表的历史列标识 `kana_sensitive`（flag 别名 `kana` /
+    /// `全半角`，见 [`Rule::from_cli_arg`]），**与假名无关**——实际语义就是
+    /// [`engine::fold_char`] 的 `width_sensitive`。
     pub kana_sensitive: bool,
 
     pub scope: Scope,
@@ -736,6 +747,28 @@ pub fn from_xlsx_rows(
                 "第 {lineno} 行「查找内容」是 {} 位纯数字：Excel 存储层可能已把它截断（15 位以上会丢精度），请核对原值",
                 find.len()
             ));
+        }
+
+        // XML 非法控制字符（多从别处复制粘贴混进来）：
+        // - 在「查找内容」里 → 文档本身是合法 XML，正文不可能含这些字符，这条规则永远命中不了；
+        // - 在「替换为」里 → 写入时会被强制丢弃（留着会产出打不开的文档），
+        //   报告里显示的仍是规则原文，与产物实际内容不一致。
+        // 两种情况都必须在装载时说清楚，不能等写入时静默吞掉。
+        for (what, text) in [("查找内容", &find), ("替换为", &rule.replace)] {
+            let bad = scan::illegal_xml_chars(text);
+            if !bad.is_empty() {
+                let names: Vec<String> =
+                    bad.iter().map(|c| format!("U+{:04X}", *c as u32)).collect();
+                warnings.push(format!(
+                    "第 {lineno} 行「{what}」含 XML 非法控制字符（{}）：该字符无法写入文档，{}",
+                    names.join("、"),
+                    if what == "查找内容" {
+                        "正文里不可能存在，这条规则将永远不命中"
+                    } else {
+                        "写入产物时会被丢弃，实际替换结果不含它"
+                    },
+                ));
+            }
         }
 
         id += 1;

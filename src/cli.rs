@@ -140,6 +140,11 @@ pub enum Cmd {
         targets: Targets,
         #[command(flatten)]
         rules: RuleSource,
+        /// 规则命中区间重叠时，只让「查找内容更长」的那条生效（默认两条都不改并报冲突）。
+        /// 预演必须与 apply 用同一套裁决，否则"预览两条都不改、执行却改了"——
+        /// 预览就失去意义了
+        #[arg(long)]
+        longest_first: bool,
     },
 
     /// 执行替换并落盘（默认就地替换源文件；用 --out 输出到副本目录）

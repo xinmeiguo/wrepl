@@ -199,8 +199,15 @@ fn attr_insert_pos(xml: &[u8], node: &scan::TextNode) -> Result<usize> {
 
 /// 把一组编辑应用到原始字节流上。
 ///
-/// 编辑区间**不允许重叠**；同一位置上的纯插入会被合并（去重），
+/// 编辑区间**不允许重叠**；同一位置上的**同一份**纯插入会被去重，
 /// 这样多条命中落在同一个 `<w:t>` 上时不会写出重复的 `xml:space` 属性。
+///
+/// ## 同一位置出现**不同**的纯插入 → 直接报错，不静默拼接
+///
+/// 合并的前提是"两笔插入其实是同一件事"（例如同一个 `xml:space` 被两条命中各加了一次）。
+/// 若同一个 `at` 上冒出两份**内容不同**的纯插入，说明编辑生成有 bug：
+/// 此时按到达顺序拼接，出来的字节看着"能用"，但顺序错了会让产物悄悄错位——
+/// 这是最难查的一类缺陷。所以宁可让这份文件报一个明确的错。
 pub fn apply(xml: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
     let mut sorted: Vec<Edit> = edits.to_vec();
     sorted.sort_by_key(|e| (e.at, e.del));
@@ -210,8 +217,15 @@ pub fn apply(xml: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
         if let Some(last) = merged.last_mut() {
             if last.at == e.at && last.del == 0 && e.del == 0 {
                 if last.ins != e.ins {
-                    last.ins.extend_from_slice(&e.ins);
+                    bail!(
+                        "同一位置出现两份不同的纯插入（位置 {}）：`{}` 与 `{}`。\
+                         编辑生成有 bug，拒绝静默拼接（拼接顺序错会让产物悄悄错位）",
+                        last.at,
+                        String::from_utf8_lossy(&last.ins),
+                        String::from_utf8_lossy(&e.ins)
+                    );
                 }
+                // 同一份插入重复到达：去重（保留先到的那笔）
                 continue;
             }
             if e.at < last.at + last.del {

@@ -389,12 +389,28 @@ struct PendingText {
     last_end: usize,
 }
 
+/// 一次命名空间声明的改动记录，用于**按元素作用域回滚**。
+///
+/// `prefix` 为空串表示默认命名空间（`xmlns=`）。`old` 是改动前的值：
+/// `None` = 原先没有这个声明（回滚时应当删掉）。
+struct NsChange {
+    prefix: String,
+    old: Option<String>,
+}
+
 /// 扫描状态。把命名空间表、元素栈、段落栈放在一起，避免逐个当参数传递。
 struct Ctx {
     base_index: usize,
     stack: Vec<ElemId>,
     ns_prefix: HashMap<String, String>,
     ns_default: String,
+    /// 命名空间声明是**按元素作用域**生效的：子树里可以重新声明前缀、甚至指向别的 URI。
+    /// 原先这张表只增不减，一个深层子树的重新声明会**污染它之后的所有元素判定**
+    /// （误判 W 命名空间 → 凭空开假段落，或反过来漏掉真段落）。
+    /// `ns_log` 记下每一次改动，`ns_marks[i]` 是第 i 层元素进入前的 `ns_log` 长度，
+    /// 退栈时按标记回滚。
+    ns_log: Vec<NsChange>,
+    ns_marks: Vec<usize>,
     open: Vec<OpenPara>,
     pending: Option<PendingText>,
 }
@@ -406,8 +422,33 @@ impl Ctx {
             stack: Vec::new(),
             ns_prefix: HashMap::new(),
             ns_default: String::new(),
+            ns_log: Vec::new(),
+            ns_marks: Vec::new(),
             open: Vec::new(),
             pending: None,
+        }
+    }
+
+    /// 把命名空间表回滚到 `mark`（含）之前的状态：逆序逐条恢复被覆盖的旧值。
+    fn rollback_ns(&mut self, mark: usize) {
+        while self.ns_log.len() > mark {
+            let ch = self.ns_log.pop().expect("长度已判，pop 必成功");
+            match ch.old {
+                Some(old) => {
+                    if ch.prefix.is_empty() {
+                        self.ns_default = old;
+                    } else {
+                        self.ns_prefix.insert(ch.prefix, old);
+                    }
+                }
+                None => {
+                    if ch.prefix.is_empty() {
+                        self.ns_default.clear();
+                    } else {
+                        self.ns_prefix.remove(&ch.prefix);
+                    }
+                }
+            }
         }
     }
 
@@ -466,14 +507,30 @@ impl Ctx {
             self.flush_pending(before);
         }
 
-        // 1. 先收集命名空间声明（声明可能就写在这个元素自己身上）
+        // 1. 先收集命名空间声明（声明可能就写在这个元素自己身上）。
+        //    每一条都记进 `ns_log`，退栈（或自闭合元素结束）时按 `ns_mark` 回滚——
+        //    不记的话，子树的重新声明会一直留在表里，污染后面的元素判定。
+        let ns_mark = self.ns_log.len();
         for attr in e.attributes().flatten() {
             let key: &str = attr.key.as_ref();
             let val: &str = attr.value.as_ref();
             if let Some(p) = key.strip_prefix("xmlns:") {
-                self.ns_prefix.insert(p.to_string(), val.to_string());
+                let old = self.ns_prefix.insert(p.to_string(), val.to_string());
+                self.ns_log.push(NsChange {
+                    prefix: p.to_string(),
+                    old,
+                });
             } else if key == "xmlns" {
+                let old = if self.ns_default.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.ns_default))
+                };
                 self.ns_default = val.to_string();
+                self.ns_log.push(NsChange {
+                    prefix: String::new(),
+                    old,
+                });
             }
         }
 
@@ -576,6 +633,11 @@ impl Ctx {
 
         if !empty_tag {
             self.stack.push(ElemId::of(local, is_wml));
+            // 与 `stack` 同深度：退栈时按这个标记把本元素带的命名空间声明撤掉
+            self.ns_marks.push(ns_mark);
+        } else {
+            // 自闭合元素不进栈，它的声明作用域到它自己为止 —— 立刻回滚
+            self.rollback_ns(ns_mark);
         }
     }
 
@@ -647,7 +709,14 @@ impl Ctx {
         }
 
         let was_wml = match self.stack.pop() {
-            Some(id) => id.is_wml(),
+            Some(id) => {
+                // 元素作用域结束：它进入时带的命名空间声明随之失效
+                if let Some(mark) = self.ns_marks.pop() {
+                    self.rollback_ns(mark);
+                }
+                id.is_wml()
+            }
+            // 多余的 End（畸形文档，`check_end_names` 已关）：不配对就不回滚
             None => false,
         };
 
@@ -876,12 +945,36 @@ pub fn escape_text(s: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            // ★ 回车必须写成字符引用 `&#13;`，不能原样落盘：符合规范的 XML
+            // 解析器做 EOL 规范化时会把字面 CR（含 CRLF）**静默变成 LF**——
+            // 写出去的是 CR，Word 读回来的却是 LF，等于替换结果被偷改一字节。
+            // 字符引用不走 EOL 规范化，CR 能原样存活。Excel 单元格里带软回车
+            // （Alt+Enter 之外的 CR）的替换串是现实来源。
+            // （LF 没有这个问题：EOL 规范化保持 LF 不变，原样写即可。）
+            '\r' => out.push_str("&#13;"),
             // XML 非法控制字符直接丢掉：留着会写出非法 XML，整份文档都读不开。
+            // 丢弃发生在写入这一步，规则表/报告里仍是原文——装载时的警告见
+            // [`illegal_xml_chars`]。
             c if is_xml_illegal(c) => {}
             _ => out.push(ch),
         }
     }
     out
+}
+
+/// 文本里的 XML 非法字符（去重、按出现顺序）。
+///
+/// 这是 [`escape_text`] "静默丢弃"的**告警面**：非法控制字符被丢掉后，
+/// 报告里的"替换为"仍是规则原文，与产物实际内容不一致——装载规则时就该
+/// 把这事说清楚，别让人事后对着报告和文档找差异。
+pub fn illegal_xml_chars(s: &str) -> Vec<char> {
+    let mut seen: Vec<char> = Vec::new();
+    for c in s.chars() {
+        if is_xml_illegal(c) && !seen.contains(&c) {
+            seen.push(c);
+        }
+    }
+    seen
 }
 
 /// 替换串首尾是否带空白——带的话必须确保目标 `<w:t>` 上有 `xml:space="preserve"`。
@@ -921,11 +1014,64 @@ mod tests {
 
     #[test]
     fn escape_text_keeps_legal_whitespace() {
-        // 制表 / 换行 / 回车是 XML 合法字符，必须原样保留（丢了会改掉正文排版）
-        assert_eq!(escape_text("a\tb\nc\rd"), "a\tb\nc\rd");
+        // 制表 / 换行原样保留（丢了会改掉正文排版；LF 不受 XML EOL 规范化影响）。
+        // 回车写成字符引用 `&#13;`：字面 CR 会被规范 XML 解析器静默变成 LF
+        //（见 escape_text 的注释），字符引用不走 EOL 规范化，CR 才能活到读回。
+        assert_eq!(escape_text("a\tb\nc\rd"), "a\tb\nc&#13;d");
         assert!(is_xml_illegal('\u{0B}'));
         assert!(!is_xml_illegal('\t'));
         assert!(!is_xml_illegal(' '));
         assert!(!is_xml_illegal('中'));
+        // 字符引用在扫描侧能解回 CR（round-trip：写出去、读回来一字不差）
+        assert_eq!(decode_entity("#13"), Some('\r'));
+        assert_eq!(decode_entity("#xD"), Some('\r'));
+    }
+
+    #[test]
+    fn illegal_xml_chars_collects_distinct() {
+        assert!(illegal_xml_chars("abc").is_empty());
+        assert_eq!(
+            illegal_xml_chars("a\u{0}b\u{0}c\u{1}"),
+            vec!['\u{0}', '\u{1}']
+        );
+        // CR / LF / TAB 是合法 XML 字符，不进这个告警名单
+        assert!(illegal_xml_chars("a\r\nb\tc").is_empty());
+    }
+
+    #[test]
+    fn ns_declaration_scoped_to_element() {
+        // ① 前缀重声明必须随退栈失效。子树里把 `w` 指到别的 URI 后，退栈时应恢复
+        //    成真正的 W 命名空间——否则后续 `<w:p>` 会被漏掉（凭空少段落）。
+        let xml = format!(
+            "<root xmlns:w=\"{W_NS}\"><x xmlns:w=\"urn:other\">\
+             <w:p><w:r><w:t>ignored</w:t></w:r></w:p></x>\
+             <w:p><w:r><w:t>count</w:t></w:r></w:p></root>"
+        );
+        let (paras, _) = scan_part("word/document.xml", &xml).unwrap();
+        let vis: Vec<&str> = paras.iter().map(|p| p.visible.as_str()).collect();
+        assert_eq!(vis, vec!["count"], "子树重声明 `w` 后未随退栈回滚（漏了真段落）");
+
+        // ② 默认命名空间重声明同理：子树内无前缀元素属于 W 命名空间，退栈后应恢复，
+        //    后续无前缀 `<p>` 不能再被算成段落——否则会凭空多出假段落。
+        let xml2 = format!(
+            "<root xmlns:w=\"{W_NS}\" xmlns=\"urn:other\"><x xmlns=\"{W_NS}\">\
+             <p><r><t>inside</t></r></p></x><p><r><t>outside</t></r></p></root>"
+        );
+        let (paras2, _) = scan_part("word/document.xml", &xml2).unwrap();
+        let vis2: Vec<&str> = paras2.iter().map(|p| p.visible.as_str()).collect();
+        assert_eq!(
+            vis2,
+            vec!["inside"],
+            "子树重声明默认命名空间后未随退栈回滚（多了假段落）"
+        );
+
+        // ③ 自闭合元素带的声明作用域只到它自己：处理完立刻回滚，不能影响后面的兄弟。
+        let xml3 = format!(
+            "<root xmlns:w=\"{W_NS}\"><junk xmlns:w=\"urn:other\"/>\
+             <w:p><w:r><w:t>after</w:t></w:r></w:p></root>"
+        );
+        let (paras3, _) = scan_part("word/document.xml", &xml3).unwrap();
+        let vis3: Vec<&str> = paras3.iter().map(|p| p.visible.as_str()).collect();
+        assert_eq!(vis3, vec!["after"], "自闭合元素上的声明未即时回滚");
     }
 }
