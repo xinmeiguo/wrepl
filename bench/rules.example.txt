@@ -1,0 +1,17 @@
+# bench 规则表 —— 模板。复制成 bench/rules.txt 后填本机真实值：
+#
+#   cp bench/rules.example.txt bench/rules.txt
+#
+# 为什么这么绕：各脚本跑的是**真实交付包**，规则表里写的正是真实客户名与
+# 项目编号，属于商业信息，不适合随源码公开，所以 .gitignore 排除了
+# bench/rules.txt —— 真实值只留在本机，仓库里只放这份占位模板。
+#
+# 没有这个文件也能编、能跑测试，只是 bench 脚本会找不到规则表。
+#
+# 格式：查找内容<TAB>替换为，一行一条；以 # 开头和空行会被忽略。
+# 下面四行是占位值，替换成你本机语料里真实存在的字符串才有效。
+
+0000-000AA	0000-000BB
+AA制药有限公司	BB生物
+AA Pharmaceutical Co., Ltd.	BB Biology
+0000-000CC	0000-000BB

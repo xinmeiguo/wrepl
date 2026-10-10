@@ -14,6 +14,9 @@
 - 真实语料放在 `E:\test\docx`（26 个交付包）。
   想换目录就改各脚本顶部的 `$corpus`。
 - `bench\small\`（<1 MB 的那批样本）会在缺失时**自动从语料里复制**。
+- **规则表 `bench\rules.txt` 不在仓库里** —— 里面写的是真实客户名 / 项目编号，
+  `.gitignore` 已排除。首次使用先 `copy bench\rules.example.txt bench\rules.txt`，
+  再把占位值改成你本机语料里真实存在的字符串。
 - Python 解释器路径写在各脚本顶部（`$py`），换成你自己的即可。
 
 ## compare.ps1 —— 逐字节对照
@@ -65,7 +68,7 @@ pwsh -NoProfile -File bench\final.ps1
 | `e2e.ps1` | 按语料分组（全部 / 大文件 / 小文件）的端到端 A/B |
 | `inplace.ps1` | 就地替换专项 A/B |
 | `ab.ps1` | 把 `profile.exe` 的输出汇总成「步骤 × 基线 / 新版 / 加速」表 |
-| `rules.txt` | 上面这些脚本共用的规则表 |
+| `rules.txt` | 上面这些脚本共用的规则表。**本机文件，不入库** —— 从 `rules.example.txt` 复制 |
 | `pe_resources.py` | 列 PE 的资源类型。**用来证明产物没有 manifest / 没有版本信息 / 没有图标** —— 详见 [../PERFORMANCE.md](../PERFORMANCE.md) 第 5 节 |
 | **`win_probe.py`** | ★ **界面版到底有没有把窗口建出来。** 枚举该进程的可见顶层窗口（排除 winit 的内部辅助窗口），够大才算数。**这是唯一能自动回答这个问题的工具** —— 静态检查只看 PE 字段、`--selftest` 按设计不开窗，而"建不出窗口时进程同样是活的"，看日志也分不开 |
 
@@ -81,6 +84,22 @@ python bench\win_probe.py target\release\wrepl-gui.exe 40
 > `python .github/scripts/check_pe_imports.py <exe>`。
 > ★ 其中"主线程栈"这一项的判据是**不许被调大**（上限 4 MB），方向与直觉相反 ——
 > 见 [../PERFORMANCE.md](../PERFORMANCE.md) 第 5.3.1 节的单变量实验。
+
+## 仓库边界 —— 仓库只放源码
+
+下面这些**不入库**，`.gitignore` 已全部排除：
+
+| 排除项 | 是什么 | 怎么来 |
+|---|---|---|
+| `bench/rules.txt` | 脚本共用的规则表（真实客户名 / 项目编号） | 从 `rules.example.txt` 复制后填真实值 |
+| `bench/small/`、`corpus/`、`samples/` | 真实语料样本 | 从交付包里复制 |
+| `bench/baseline/`、`bench/baseline-target/` | 基线 exe 与它的构建目录 | 按本文档现编 |
+| `bench/run/`、`bench/out/`、`bench/ip/`、`bench/cmp/` | 脚本跑完留下的工作目录 | 跑脚本时自动生成 |
+| `target/`、`target-*/` | Rust 构建产物 | `cargo build` |
+
+理由与 `regress-samples.example.sh` 一样：**真实交付包里含客户名与项目编号**，
+属于商业信息，不该随源码公开；构建产物换台机器就要重编，入库只是噪声。
+所以仓库里只留脚本本身，外加一份脱敏的 `rules.example.txt` 模板。
 
 ## 两个本机专属的坑
 

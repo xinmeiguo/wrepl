@@ -1,6 +1,9 @@
 # ── Rust 构建产物 ────────────────────────────────────────────────
-/target
+# 不写前导斜杠 = 任意层级都排除；compare.ps1 现编基线时会在
+# bench/baseline-target/ 下再建一个构建目录，一并盖住。
+target/
 /target-*/
+/bench/baseline-target/
 
 # ── 本机构建配置（机器相关，不进版本库）─────────────────────────
 # .cargo/config.toml  : 本机把 target-dir 指到 D:/test/cargo-target，
@@ -22,13 +25,25 @@
 # ── 本机真实语料值（含真实客户名/项目号）─────────────────────────
 /regress-samples.local.sh
 
+# ── 本机语料与规则表：仓库只放源码，这些一律不入库 ─────────────────
+# bench/rules.txt 是 bench 脚本共用的规则表，写的是**真实客户名 / 项目编号**；
+# 模板见 bench/rules.example.txt，本机复制一份填真实值即可。
+/bench/rules.txt
+# regress.sh 的语料入口（真实交付包目录）与单文件样本目录
+/corpus/
+/samples/
+
 # ── 性能回归的工作目录与对照二进制（见 bench/README.md）────────────
 # bench/small 是从真实语料里复制出来的样本，**含真实客户名与项目编号**，
 # 和上面 regress-samples.local.sh 同一个理由，绝不能进版本库；
-# bench/baseline 是"改动前"的 exe 快照（6 MB 二进制），按 bench/README.md 现编即可。
+# bench/baseline 是"改动前"的 exe 快照（6 MB 二进制），按 bench/README.md 现编即可；
+# run / out / ip 是各脚本跑完留下的工作目录。
 /bench/small/
 /bench/baseline/
 /bench/cmp/
+/bench/run/
+/bench/out/
+/bench/ip/
 /bench/release-notes.md
 
 # ── 编辑器 / 系统 ────────────────────────────────────────────────
