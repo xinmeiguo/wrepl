@@ -59,13 +59,14 @@ use wrepl::rules::{self, Rule, Scope};
 use wrepl::{naming, report};
 
 use crate::picker::{Mode, Outcome, Picker};
+use crate::wordtool::HeaderMode;
 
 const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
 const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
 const ERR_C: Color32 = Color32::from_rgb(0xC0, 0x2B, 0x1D);
 const DIM_C: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
 
-/// 界面上的六个「选路径」入口。
+/// 界面上的「选路径」入口。
 ///
 /// 自绘面板是**同一个**（[`Picker`]），靠这个枚举记住"这一趟是替谁选的" ——
 /// 面板只负责把路径拿回来，填到哪个字段由这里决定。
@@ -85,6 +86,10 @@ enum PickFor {
     ImportXlsx,
     /// 规则区「导出到 Excel」
     ExportXlsx,
+    /// 「页眉替换」页的「选择文档（可多选）」
+    HeaderDocs,
+    /// 「批量打印」页的「选择文档（可多选）」
+    PrintDocs,
 }
 
 /// 界面里的一行规则。
@@ -325,6 +330,26 @@ pub struct App {
     picker: Picker,
     /// 面板正在替哪个入口选（`None` = 面板没开）。
     picker_for: Option<PickFor>,
+
+    // ── 顶部三页切换（0.3.0 起）──
+    /// 当前页：正文替换（原有）/ 页眉替换 / 批量打印。
+    page: Page,
+    /// 页眉替换与批量打印的状态 + 任务（走 Word COM）。
+    wt: crate::wordtool::WordTool,
+}
+
+/// 顶部的三个页。
+///
+/// 「正文替换」是工具原本的能力，与另两页**没有共同依赖**——它纯 Rust 改 OOXML，
+/// 不需要 Word；「页眉替换 / 批量打印」走 Word COM，**需要目标机器装 Word**。
+#[derive(PartialEq, Clone, Copy)]
+enum Page {
+    /// 正文批量替换（原有）
+    Replace,
+    /// 页眉首单元格替换（文本 / 图片）
+    Header,
+    /// 批量打印
+    Print,
 }
 
 impl Default for App {
@@ -376,6 +401,8 @@ impl App {
             run_log_from: 0,
             picker: Picker::new(),
             picker_for: None,
+            page: Page::Replace,
+            wt: crate::wordtool::WordTool::new(),
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
         // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save` 时启动就把选择器
@@ -387,8 +414,28 @@ impl App {
             Some("file") => app.open_picker(PickFor::InputFiles),
             Some("out") => app.open_picker(PickFor::OutputDir),
             Some("save") => app.open_picker(PickFor::ExportXlsx),
+            // 另两页的「选择文档」——同一个面板、同一个入口分派，只是结果
+            // 落到 `WordTool` 那边（见 `apply_picked`）。
+            Some("hdrdocs") => app.open_picker(PickFor::HeaderDocs),
+            Some("printdocs") => app.open_picker(PickFor::PrintDocs),
             Some(other) => {
                 crate::diag::log(format!("[诊断] 未知的 WREPL_DEBUG_PICKER={other:?}，忽略"))
+            }
+            None => {}
+        }
+        // 同款诊断开关：`WREPL_DEBUG_PAGE=replace|header|header-image|print` 启动即落在那页。
+        // 加了「页眉替换 / 批量打印」两页之后，截图与演示都需要让窗口一开就停在
+        // 指定页——合成鼠标事件进不来（同上），只能让程序自己切。不设则停在首页。
+        match crate::diag::debug_page_mode().as_deref() {
+            Some("replace") => app.page = Page::Replace,
+            Some("header") => app.page = Page::Header,
+            Some("header-image") => {
+                app.page = Page::Header;
+                app.wt.hdr_mode = HeaderMode::Image;
+            }
+            Some("print") => app.page = Page::Print,
+            Some(other) => {
+                crate::diag::log(format!("[诊断] 未知的 WREPL_DEBUG_PAGE={other:?}，忽略"))
             }
             None => {}
         }
@@ -1171,6 +1218,8 @@ impl App {
     pub fn render(&mut self, ctx: &egui::Context) {
         // ① 先把后台线程攒下的进度收进来（不阻塞），这一帧就能画出来
         self.pump_job();
+        // 新两页的任务状态在 `wt` 里，也每帧收一次
+        self.wt.poll();
         // ② 有活干的时候定时重绘：串行阶段（预分配输出路径、改名）没有进度消息，
         //    不主动叫醒的话进度条会停住不动。200ms 一次，人眼看是连续的。
         if self.job.is_some() {
@@ -1191,15 +1240,43 @@ impl App {
                         .strong()
                         .color(Color32::from_rgb(0x1F, 0x4E, 0x79)),
                 );
-                ui.label(RichText::new("Word 批量替换").color(DIM_C));
+                ui.label(RichText::new("Word 工具集").color(DIM_C));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.checkbox(&mut self.light_theme, "浅色");
                 });
+            });
+            ui.add_space(4.0);
+            // 三页切换。任务在跑时也允许切——任务状态挂在 `job` / `wt` 上，
+            // 切页不会中断它（`render` 每帧都会 poll）。
+            ui.horizontal(|ui| {
+                for (m, label) in [
+                    (Page::Replace, "正文替换"),
+                    (Page::Header, "页眉替换"),
+                    (Page::Print, "批量打印"),
+                ] {
+                    let selected = self.page == m;
+                    let text = RichText::new(label)
+                        .size(ui_scale::SECTION)
+                        .color(if selected {
+                            Color32::from_rgb(0x1F, 0x4E, 0x79)
+                        } else {
+                            DIM_C
+                        });
+                    let text = if selected { text.strong() } else { text };
+                    if ui.selectable_label(selected, text).clicked() {
+                        self.page = m;
+                    }
+                }
             });
             ui.add_space(6.0);
         });
 
         egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+            // 这一栏是「正文替换」专用的（执行按钮 / 打开目录 / 报告 / 清日志）。
+            // 另两页各自把动作放在页面卡片里，所以这里直接不画。
+            if self.page != Page::Replace {
+                return;
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let running = self.job.is_some();
@@ -1298,18 +1375,35 @@ impl App {
         // 一条死横条），不如回到原位置 —— 日志跟着页面滚，最简单也最稳。
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                self.section_io(ui);
-                ui.add_space(10.0);
-                self.section_rules(ui);
-                ui.add_space(10.0);
-                self.section_result(ui);
-                ui.add_space(10.0);
-                self.section_log(ui);
+                match self.page {
+                    Page::Replace => {
+                        self.section_io(ui);
+                        ui.add_space(10.0);
+                        self.section_rules(ui);
+                        ui.add_space(10.0);
+                        self.section_result(ui);
+                        ui.add_space(10.0);
+                        self.section_log(ui);
+                    }
+                    Page::Header => self.wt.ui_header(ui),
+                    Page::Print => self.wt.ui_print(ui),
+                }
             });
         });
 
         // 就地覆盖确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
         self.confirm_inplace_dialog(ctx);
+
+        // 「页眉替换 / 批量打印」两页的「选择文档」按钮**不自己弹对话框**：
+        // 选择器是常驻的、全程序只有一台，所以由这里统一收口 —— 界面上那些
+        // 按钮只把意图抛出来（`WordTool::take_pick`），开还是这儿开。
+        // 收在这里还有个好处：此刻已出了 `CentralPanel` 的借用期，够得着 `self.picker`。
+        if let Some(who) = self.wt.take_pick() {
+            self.open_picker(match who {
+                crate::wordtool::PickDoc::Header => PickFor::HeaderDocs,
+                crate::wordtool::PickDoc::Print => PickFor::PrintDocs,
+            });
+        }
 
         // 自绘文件选择器比确认框还要靠前（`Foreground` 面板 + 全屏遮罩），
         // 所以放在最后。它自带遮罩，两者不会同时被点到。
@@ -1829,6 +1923,11 @@ impl App {
                 PathBuf::from(t)
             }
         };
+        // 两个「选文档」入口的起点：已选文档里第一个的路径
+        // （`Picker::open` 见到文件会自己退到它所在目录）。这样"再挑几个"
+        // 会停在上次挑的那处，而不是回到默认目录。
+        let hdr_first = doc_start(self.wt.docs_of(crate::wordtool::PickDoc::Header));
+        let print_first = doc_start(self.wt.docs_of(crate::wordtool::PickDoc::Print));
 
         let (mode, title, start, exts, default_name): (Mode, &str, PathBuf, Vec<&str>, String) =
             match what {
@@ -1863,6 +1962,23 @@ impl App {
                     PathBuf::new(),
                     vec!["xlsx"],
                     "规则.xlsx".to_string(),
+                ),
+                // 页眉替换 / 批量打印共用同一个面板，只是标题不同
+                // （标题在面板左上角显示，用户一眼能看到这一趟是在替哪一页选）。
+                PickFor::HeaderDocs => (
+                    Mode::Files,
+                    "选择文档 —— 页眉替换",
+                    hdr_first,
+                    // `.doc` 也放进来：老交付包里有 .doc，Word COM 一样打得开。
+                    vec!["doc", "docx"],
+                    String::new(),
+                ),
+                PickFor::PrintDocs => (
+                    Mode::Files,
+                    "选择文档 —— 批量打印",
+                    print_first,
+                    vec!["doc", "docx"],
+                    String::new(),
                 ),
             };
 
@@ -1928,6 +2044,20 @@ impl App {
                     self.do_export_xlsx(p.display().to_string());
                 }
             }
+            // 两个「选文档」入口 —— 路径交给 `WordTool` 自己存，
+            // 它那边才是「已选文档」这份状态的主人。
+            PickFor::HeaderDocs => {
+                self.wt.set_docs(
+                    crate::wordtool::PickDoc::Header,
+                    paths.iter().map(|p| p.display().to_string()).collect(),
+                );
+            }
+            PickFor::PrintDocs => {
+                self.wt.set_docs(
+                    crate::wordtool::PickDoc::Print,
+                    paths.iter().map(|p| p.display().to_string()).collect(),
+                );
+            }
         }
     }
 
@@ -1956,6 +2086,13 @@ impl App {
                 .set_file_name("规则.xlsx")
                 .save_file()
                 .map(|p| vec![p]),
+            PickFor::HeaderDocs | PickFor::PrintDocs => rfd::FileDialog::new()
+                .set_title(match what {
+                    PickFor::HeaderDocs => "选择文档 —— 页眉替换",
+                    _ => "选择文档 —— 批量打印",
+                })
+                .add_filter("Word 文档", &["doc", "docx"])
+                .pick_files(),
         };
         if let Some(paths) = picked {
             self.apply_picked(what, paths);
@@ -2195,6 +2332,14 @@ fn first_path(s: &str) -> PathBuf {
         .find(|x| !x.is_empty())
         .map(PathBuf::from)
         .unwrap_or_default()
+}
+
+/// 「已选文档」列表里第一条的路径 —— 给选择器当起点用。
+///
+/// 交给第一条**文件**而不是它所在的目录：`Picker::open` 见到文件会自己退到
+/// 它所在目录，这样起点逻辑留在选择器一处，这里不用重复判断。
+fn doc_start(docs: &[String]) -> PathBuf {
+    docs.first().map(PathBuf::from).unwrap_or_default()
 }
 
 /// 明/暗主题。
@@ -2679,6 +2824,55 @@ pub fn selftest(args: &[String]) -> i32 {
     app.mirror = false;
     app.out_to_subdir = keep_out;
     println!("  「完整镜像」可用 / 置灰两态：布局通过");
+
+    // 3.8) 新增的两页（页眉替换 / 批量打印）骨架：各画两帧。
+    //      这两页是 v0.3.0 新加的，普通一趟渲染只照到「正文替换」一页，
+    //      所以这里把另外两页也各渲染两帧钉住排版——**只是画，不触发任何
+    //      Word COM 动作**，所以无头环境、没装 Word 的机器上也能跑。
+    //      塞几行假路径是为了让「已选文档」列表与计数这两种状态也画出来。
+    let keep_page = app.page;
+    let keep_hdr_mode = app.wt.hdr_mode;
+    for (page, mode) in [
+        (Page::Header, HeaderMode::Text),
+        (Page::Header, HeaderMode::Image),
+        (Page::Print, HeaderMode::Text),
+    ] {
+        app.page = page;
+        app.wt.hdr_mode = mode;
+        app.wt.hdr_docs = (1..=3)
+            .map(|i| format!("D:/wrepl-selftest/H{i}.docx"))
+            .collect();
+        app.wt.print_docs = (1..=3)
+            .map(|i| format!("D:/wrepl-selftest/P{i}.docx"))
+            .collect();
+        for _ in 0..2 {
+            let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+        }
+    }
+    app.page = keep_page;
+    app.wt.hdr_mode = keep_hdr_mode;
+    app.wt.hdr_docs.clear();
+    app.wt.print_docs.clear();
+    println!("  页眉替换（文本 / 图片）+ 批量打印：布局各 2 帧通过");
+
+    // 3.9) 打印机枚举。批量打印页的「打印机」下拉全靠它，而它**不碰 COM**
+    //      （纯 Win32 `EnumPrintersW`），所以无头环境照样能验。
+    //      这里只是"报出来"：一台都没装打印机是合法情形，不该判失败。
+    app.wt.reload_printers();
+    match &app.wt.printers_err {
+        Some(e) => println!("  · 打印机枚举失败：{e}（批量打印页会显示这条，仍可用默认打印机）"),
+        None => {
+            println!("  · 打印机枚举：{} 台", app.wt.printers.len());
+            for p in app.wt.printers.iter().take(3) {
+                println!(
+                    "      {}{}（端口 {}）",
+                    p.name,
+                    if p.is_default { " ←系统默认" } else { "" },
+                    if p.port.is_empty() { "—" } else { &p.port }
+                );
+            }
+        }
+    }
 
     // 4) 真跑一次批量
     let dry = app.do_run_selftest(true);

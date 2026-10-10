@@ -242,6 +242,19 @@ pub fn debug_click() -> Option<(usize, bool)> {
     Some((n, d))
 }
 
+/// `WREPL_DEBUG_PAGE=replace|header|print` —— 启动就落在指定页。
+///
+/// 加「页眉替换 / 批量打印」两页之后，截图与演示都要让窗口一开就停在某页；
+/// 而本机的合成鼠标事件进不来窗口（见本模块开头），只能让程序自己切。
+pub fn debug_page_mode() -> Option<String> {
+    let v = std::env::var("WREPL_DEBUG_PAGE").ok()?;
+    let v = v.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    Some(v)
+}
+
 // ─────────────────────────── 时间戳 ───────────────────────────
 
 /// 本机时区的 `YYYY-MM-DD HH:MM:SS.mmm`。走 Win32 `GetLocalTime`，
