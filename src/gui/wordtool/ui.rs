@@ -24,18 +24,13 @@
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
-use crate::app::ui_scale;
+use crate::ds;
 
 use super::com::ComInit;
 use super::printers::{self, Printer};
 use super::services;
-
-const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
-const ERR_C: Color32 = Color32::from_rgb(0xC0, 0x2B, 0x1D);
-const DIM_C: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
-const ACCENT: Color32 = Color32::from_rgb(0x1F, 0x4E, 0x79);
 
 /// 「选择文档」按钮想干的事。抛给 `App`，由它去开自绘选择器。
 ///
@@ -293,30 +288,36 @@ impl WordTool {
     // ==================== 渲染：页眉替换 ====================
 
     pub fn ui_header(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
+
         // ---- 卡片 1：输入 ----
         card(ui, |ui| {
             card_title(ui, "输入内容");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.hdr_mode, HeaderMode::Text, "文本");
-                ui.add_space(16.0);
-                ui.radio_value(&mut self.hdr_mode, HeaderMode::Image, "图片");
-            });
-            ui.add_space(10.0);
+            // GUIDE §5：单选组用 `RadioGroup`（横向排版走 `.horizontal()`）。
+            // 注意它和 `InputField` 一样是 `.show(ui)`，不是 `Widget`。
+            ds::RadioGroup::new(&mut self.hdr_mode)
+                .horizontal()
+                .option(ds::RadioOption::new(HeaderMode::Text, "文本"))
+                .option(ds::RadioOption::new(HeaderMode::Image, "图片"))
+                .show(ui);
+            ui.add_space(ds::SPACING.s3);
 
             match self.hdr_mode {
                 HeaderMode::Text => {
-                    row(ui, "英文", |ui, w| {
-                        input(ui, w, &mut self.text_en, "");
-                    });
-                    ui.add_space(6.0);
-                    row(ui, "中文", |ui, w| {
-                        input(ui, w, &mut self.text_cn, "");
-                    });
+                    // GUIDE §6：标签放字段**正上方**（`InputField` 自带 label 槽位），
+                    // 不再用旧的「左标签 + 右输入框」那套 `row()`。
+                    ds::InputField::new(&mut self.text_en)
+                        .label("英文")
+                        .show(ui);
+                    ui.add_space(ds::SPACING.s3);
+                    ds::InputField::new(&mut self.text_cn)
+                        .label("中文")
+                        .show(ui);
                 }
                 HeaderMode::Image => {
                     ui.horizontal(|ui| {
                         if ui
-                            .add_sized([140.0, ui_scale::ROW_H], egui::Button::new("选择图片…"))
+                            .add(ds::Button::secondary("选择图片…").leading(ds::Icon::FolderOpen))
                             .clicked()
                         {
                             if let Some(p) = rfd::FileDialog::new()
@@ -330,10 +331,10 @@ impl WordTool {
                                 self.img_path = p.to_string_lossy().into_owned();
                             }
                         }
-                        ui.add_space(14.0);
-                        ui.checkbox(&mut self.img_scale, "按表格高度等比缩放");
+                        ui.add_space(ds::SPACING.s4);
+                        ui.add(ds::Checkbox::with_label(&mut self.img_scale, "按表格高度等比缩放"));
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(ds::SPACING.s3);
                     // 图片走的是系统对话框、界面上没有对应输入框，所以这里必须留一处
                     // 能看见"到底选了哪张"—— 只显示路径本身，不加前缀说明文字。
                     let disp = if self.img_path.is_empty() {
@@ -346,36 +347,41 @@ impl WordTool {
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 2：文档 ----
         card(ui, |ui| {
             doc_header(ui, "文档", self.hdr_docs.len(), |ui| {
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("选择文档…"))
+                    .add(
+                        ds::Button::secondary("选择文档…")
+                            .leading(ds::Icon::FolderOpen)
+                            .disabled(busy),
+                    )
                     .clicked()
                 {
                     self.want_pick = Some(PickDoc::Header);
                 }
-                ui.add_space(6.0);
+                ui.add_space(ds::SPACING.s2);
                 if ui
-                    .add_enabled(
-                        !self.hdr_docs.is_empty() && !self.busy(),
-                        egui::Button::new("清空"),
+                    .add(
+                        ds::Button::ghost("清空")
+                            .leading(ds::Icon::Trash)
+                            .disabled(self.hdr_docs.is_empty() || busy),
                     )
                     .clicked()
                 {
                     self.hdr_docs.clear();
                 }
             });
-            ui.add_space(8.0);
+            ui.add_space(ds::SPACING.s3);
             doc_list(ui, "wt_doc_scroll_h", &self.hdr_docs);
         });
 
-        ui.add_space(10.0);
+        ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 3：执行 ----
-        let can = !self.busy()
+        let can = !busy
             && !self.hdr_docs.is_empty()
             && match self.hdr_mode {
                 HeaderMode::Text => {
@@ -385,17 +391,13 @@ impl WordTool {
             };
         card(ui, |ui| {
             ui.horizontal(|ui| {
+                // GUIDE §4：一屏只有**一个** primary —— 本页就是「执行替换」。
                 let clicked = ui
-                    .add_enabled(
-                        can,
-                        egui::Button::new(
-                            RichText::new("执行替换")
-                                .size(ui_scale::BUTTON)
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(ACCENT)
-                        .min_size(egui::vec2(140.0, 34.0)),
+                    .add(
+                        ds::Button::primary("执行替换")
+                            .size(ds::ButtonSize::Lg)
+                            .leading(ds::Icon::Lightning)
+                            .disabled(!can),
                     )
                     .clicked();
                 if clicked {
@@ -417,12 +419,12 @@ impl WordTool {
                         }
                     }
                 }
-                ui.add_space(14.0);
+                ui.add_space(ds::SPACING.s4);
                 self.status_rows(ui);
             });
         });
 
-        ui.add_space(10.0);
+        ui.add_space(ds::SPACING.s4);
         self.log_section(ui);
     }
 
@@ -433,104 +435,113 @@ impl WordTool {
         if !self.printers_loaded {
             self.reload_printers();
         }
+        let busy = self.busy();
 
         // ---- 卡片 1：文档 ----
         card(ui, |ui| {
             doc_header(ui, "文档", self.print_docs.len(), |ui| {
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("选择文档…"))
+                    .add(
+                        ds::Button::secondary("选择文档…")
+                            .leading(ds::Icon::FolderOpen)
+                            .disabled(busy),
+                    )
                     .clicked()
                 {
                     self.want_pick = Some(PickDoc::Print);
                 }
-                ui.add_space(6.0);
+                ui.add_space(ds::SPACING.s2);
                 if ui
-                    .add_enabled(
-                        !self.print_docs.is_empty() && !self.busy(),
-                        egui::Button::new("清空"),
+                    .add(
+                        ds::Button::ghost("清空")
+                            .leading(ds::Icon::Trash)
+                            .disabled(self.print_docs.is_empty() || busy),
                     )
                     .clicked()
                 {
                     self.print_docs.clear();
                 }
             });
-            ui.add_space(8.0);
+            ui.add_space(ds::SPACING.s3);
             doc_list(ui, "wt_doc_scroll_p", &self.print_docs);
         });
 
-        ui.add_space(10.0);
+        ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 2：打印机与页码范围 ----
         card(ui, |ui| {
             card_title(ui, "打印设置");
 
-            row(ui, "打印机", |ui, _w| {
-                let label = self.printer_label();
-                // 先把「下拉项」算成一份独立数据再进闭包：闭包里只借
-                // `self.printer_pick`（可变）与这份局部数据，不和 `self.printers`
-                // 的借用打架 —— 少一处"能不能借过去"的隐式依赖。
-                let items: Vec<(usize, String)> = std::iter::once((0usize, "（用默认打印机）".to_string()))
-                    .chain(self.printers.iter().enumerate().map(|(i, p)| {
-                        let t = if p.is_default {
-                            format!("{}（系统默认）", p.name)
-                        } else {
-                            p.name.clone()
-                        };
-                        (i + 1, t)
-                    }))
-                    .collect();
-                egui::ComboBox::from_id_salt("wt_printer")
-                    .width(420.0)
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        for (k, t) in &items {
-                            ui.selectable_value(&mut self.printer_pick, *k, t);
-                        }
-                    });
-                ui.add_space(10.0);
-                if ui
-                    .add_enabled(!self.busy(), egui::Button::new("重新扫描"))
-                    .on_hover_text("重新枚举本机打印机（刚装了打印机 / 刚映射了共享打印机时用）")
-                    .clicked()
-                {
-                    self.reload_printers();
-                }
-            });
-            ui.add_space(8.0);
+            // GUIDE §6：标签放字段正上方，下拉换 `SelectField`。
+            // 它和 `InputField` 一样是 `.show(ui, …)`、**不是 `Widget`**。
+            let cur_label = self.printer_label();
+            // 先把选项文案算成 owned 的 `Vec<String>`：`SelectField::show` 要
+            // `&str` 选项，而「系统默认」那档得现拼一段字符串。落成 owned 之后再
+            // 借成 `Vec<(usize, &str)>`，进 `show` 时就只借 `self.printer_pick`
+            // （可变）与这份局部数据，不碰 `self.printers`，少一处借用冲突。
+            let labels: Vec<String> = std::iter::once("（用默认打印机）".to_string())
+                .chain(self.printers.iter().map(|p| {
+                    if p.is_default {
+                        format!("{}（系统默认）", p.name)
+                    } else {
+                        p.name.clone()
+                    }
+                }))
+                .collect();
+            let opts: Vec<(usize, &str)> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s.as_str()))
+                .collect();
+            ds::SelectField::new("wt_printer")
+                .label("打印机")
+                .width(420.0)
+                .show(ui, &mut self.printer_pick, &cur_label, opts);
+            ui.add_space(ds::SPACING.s2);
 
-            row(ui, "页码范围", |ui, _w| {
-                input(ui, 180.0, &mut self.page_range, "");
-            });
-            ui.add_space(8.0);
+            if ui
+                .add(
+                    ds::Button::secondary("重新扫描")
+                        .leading(ds::Icon::Refresh)
+                        .disabled(busy),
+                )
+                .on_hover_text("重新枚举本机打印机（刚装了打印机 / 刚映射了共享打印机时用）")
+                .clicked()
+            {
+                self.reload_printers();
+            }
+            ui.add_space(ds::SPACING.s3);
+
+            ds::InputField::new(&mut self.page_range)
+                .label("页码范围")
+                .desired_width(180.0)
+                .show(ui);
 
             // 说明性文案一律不摆 —— 下拉框本身就能看出有几台、选的是哪台。
             // 只有"枚举失败"必须说出来，否则下拉框空着没人知道为什么。
             if let Some(e) = &self.printers_err {
+                let pal = ds::palette_of(ui.ctx());
+                ui.add_space(ds::SPACING.s3);
                 ui.label(
                     RichText::new(format!("× 读取打印机列表失败：{e}"))
-                        .size(ui_scale::SMALL)
-                        .color(ERR_C),
+                        .text_style(egui::TextStyle::Small)
+                        .color(pal.error),
                 );
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 3：执行 ----
-        let can = !self.busy() && !self.print_docs.is_empty();
+        let can = !busy && !self.print_docs.is_empty();
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 let clicked = ui
-                    .add_enabled(
-                        can,
-                        egui::Button::new(
-                            RichText::new("开始打印")
-                                .size(ui_scale::BUTTON)
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(ACCENT)
-                        .min_size(egui::vec2(140.0, 34.0)),
+                    .add(
+                        ds::Button::primary("开始打印")
+                            .size(ds::ButtonSize::Lg)
+                            .leading(ds::Icon::Package)
+                            .disabled(!can),
                     )
                     .clicked();
                 if clicked {
@@ -554,12 +565,12 @@ impl WordTool {
                         services::print_run(&docs, &range, printer.as_deref(), log, prog)
                     });
                 }
-                ui.add_space(14.0);
+                ui.add_space(ds::SPACING.s4);
                 self.status_rows(ui);
             });
         });
 
-        ui.add_space(10.0);
+        ui.add_space(ds::SPACING.s4);
         self.log_section(ui);
     }
 
@@ -567,6 +578,7 @@ impl WordTool {
 
     /// 进度条 + 结果摘要（两页共用）。
     fn status_rows(&self, ui: &mut egui::Ui) {
+        let pal = ds::palette_of(ui.ctx());
         if let Some((cur, total)) = self.task.as_ref().and_then(|t| t.progress) {
             let frac = if total > 0 {
                 (cur as f32 / total as f32).clamp(0.0, 1.0)
@@ -578,17 +590,15 @@ impl WordTool {
             } else {
                 "正在启动 Word…".to_string()
             };
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .text(RichText::new(text).small())
-                    .desired_width(340.0),
-            );
+            // `ProgressBar` 是 `Widget`（`ui.add`）；`.label(..)` 收 `&str`，
+            // 所以先把文案落成 owned 字符串再借进去。
+            ui.add(ds::ProgressBar::new(frac).label(&text).height(8.0));
         }
         if let Some((msg, ok)) = &self.last_result {
             ui.label(
                 RichText::new(msg)
                     .strong()
-                    .color(if *ok { OK_C } else { ERR_C }),
+                    .color(if *ok { pal.success } else { pal.error }),
             );
         }
     }
@@ -599,26 +609,39 @@ impl WordTool {
             ui.horizontal(|ui| {
                 card_title(ui, "运行日志");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("清空").clicked() {
+                    if ui
+                        .add(
+                            ds::Button::ghost("清空")
+                                .leading(ds::Icon::Trash)
+                                .disabled(self.log.is_empty()),
+                        )
+                        .clicked()
+                    {
                         self.log.clear();
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(ds::SPACING.s3);
             well(ui, |ui| {
+                let pal = ds::palette_of(ui.ctx());
                 egui::ScrollArea::vertical()
                     .id_salt("wt_log_scroll")
                     .max_height(170.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         if self.log.is_empty() {
-                            ui.label(RichText::new("（暂无）").color(DIM_C).small());
+                            ui.label(
+                                RichText::new("（暂无）")
+                                    .text_style(egui::TextStyle::Small)
+                                    .color(pal.text_tertiary),
+                            );
                         }
                         for line in &self.log {
+                            // GUIDE §7：日志/等宽文本用 mono 13。
                             ui.label(
                                 RichText::new(line)
-                                    .size(ui_scale::LOG)
-                                    .color(ui.visuals().text_color()),
+                                    .font(egui::FontId::monospace(13.0))
+                                    .color(pal.text_primary),
                             );
                         }
                     });
@@ -629,18 +652,35 @@ impl WordTool {
 
 // ==================== 自由函数（避免与 `&mut self` 的借用冲突）====================
 
-/// 统一的卡片容器。
+/// 统一的卡片容器 —— 直接用设计系统的 [`ds::Card`]。
 ///
-/// 两条都照搬主界面的 [`crate::app`] `section()`：
-///
-/// 1. **必须撑满可用宽度** —— 否则卡片缩到内容那么大，整页内容挤在左上角。
-/// 2. **底色用 `faint_bg_color`（浅灰）而不是纯白** —— egui 的单行输入框
-///    底色是 `extreme_bg_color`（浅色主题下就是**白**），卡片要是也白，
-///    输入框的框线在卡面上就看不见了（实测：截图里输入框整个"消失"，
-///    只剩一行提示文字）。浅灰卡面 + 白色输入框才是主界面那套观感。
+/// 仍要 `set_width(available_width)`：`Card::show` **不自动撑宽**，
+/// 不设的话卡片会缩到内容那么大，整页内容挤在左上角。
 fn card<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::group(ui.style())
-        .fill(ui.visuals().faint_bg_color)
+    ds::Card::new().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        f(ui)
+    })
+}
+
+/// 卡片里的「凹槽」（已选文档列表 / 运行日志）。
+///
+/// 底色取 palette 里**比卡面更深**的那一档，两套主题各取各的：
+/// 浅色主题卡面是纯白（`bg_surface`）→ 槽用 `bg_surface_alt`（浅灰）；
+/// 深色主题卡面是 `bg_surface` → 再暗一档是 `bg_app`。
+/// 不写死颜色，主题一换自己跟着走。
+fn well<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let pal = ds::palette_of(ui.ctx());
+    let sunken = if pal.dark_mode {
+        pal.bg_app
+    } else {
+        pal.bg_surface_alt
+    };
+    egui::Frame::default()
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(egui::CornerRadius::same(ds::RADIUS.sm as u8))
+        .fill(sunken)
+        .stroke(egui::Stroke::new(1.0_f32, pal.border_subtle))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             f(ui)
@@ -648,118 +688,55 @@ fn card<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
-/// 卡片里的「凹槽」（列表 / 日志）：与输入框同底色 —— 一眼就看得出是块可以
-/// 装东西的区域。深色主题下同样由 `extreme_bg_color` 自动跟着走。
-fn well<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame {
-        inner_margin: egui::Margin::symmetric(10.0, 8.0),
-        rounding: egui::Rounding::same(4.0),
-        fill: ui.visuals().extreme_bg_color,
-        stroke: hairline(ui),
-        ..Default::default()
-    }
-    .show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        f(ui)
-    })
-    .inner
-}
+// 原先这里有一个手搓的 `input()`（自己套 `egui::Frame` 补描边 + `TextEdit::frame(NONE)`）
+// 和它的配套 `hairline()`。原因见旧注释：egui 0.29 浅色主题里未聚焦控件的
+// `inactive.bg_stroke` 是 `Stroke::NONE`，输入框落在白卡面上会"消失"。
+// 迁移到设计系统后这件事由 `ds::InputField` 接管 —— 它的边框来自 palette
+// （`border_default` / 聚焦时 `brand_default`），浅深两套都有人管，不必再自己补。
 
-/// 单行输入框。
-///
-/// **自己套一层带描边的 [`egui::Frame`]、把 `TextEdit` 自己的框关掉**
-/// （`.frame(false)`）。为什么不直接用 `TextEdit` 自带的框：
-/// egui 0.29 的浅色主题里**未聚焦的控件描边就是"没有"** ——
-/// `Widgets::light().inactive.bg_stroke = Default::default()`，
-/// 源码里紧挨着那句话是 `// TODO(emilk): we want to show something here,
-/// or a text-edit field doesn't "pop".`。于是输入框只剩一层
-/// `extreme_bg_color`（浅色主题下＝白）填充，落在同样接近白的卡面上就"消失"了。
-/// 主界面那边靠"输入框又高又宽"还能看出边界，这里是细长条，必须自己补一条描边。
-///
-/// `w` 是**外框**宽度（含内边距与描边）。
-fn input(ui: &mut egui::Ui, w: f32, s: &mut String, hint: &str) {
-    /// 左右内边距。
-    const PAD_X: f32 = 7.0;
-    egui::Frame {
-        inner_margin: egui::Margin::symmetric(PAD_X, 3.0),
-        rounding: egui::Rounding::same(4.0),
-        fill: ui.visuals().extreme_bg_color,
-        stroke: hairline(ui),
-        ..Default::default()
-    }
-    .show(ui, |ui| {
-        // 宽度用 `desired_width` 而不是 `add_sized`：高度交给 TextEdit 自己定，
-        // 免得把行高写死后文字被裁掉一点点。
-        ui.add(
-            egui::TextEdit::singleline(s)
-                .hint_text(hint)
-                .desired_width((w - 2.0 * PAD_X - 2.0).max(48.0))
-                .frame(false),
-        );
-    });
-}
-
-/// 细边框用的描边。取主题里 `noninteractive.bg_stroke` 的**颜色** ——
-/// 它是 egui 给"分隔线 / 卡片边"准备的那一档灰，浅深两套主题各有一份，
-/// 不会在深色主题下变成一道刺眼的白线。
-///
-/// ⚠️ 不能取 `inactive.bg_stroke`：那一档在浅色主题下是 `Stroke::NONE`
-/// （见 [`input`] 的说明）。
-fn hairline(ui: &egui::Ui) -> egui::Stroke {
-    egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
-}
-
-/// 卡片标题（蓝字，与主界面 `section()` 的标题一致）。
+/// 卡片标题：与 [`ds::Card::title`] 同一档（h3 + `text_primary`），
+/// 但由调用方自己画 —— 「文档」「运行日志」这两张卡要把按钮挂在标题**同一行**
+/// 的右侧，用 `Card::title` 就做不到了（它固定独占一行）。
 fn card_title(ui: &mut egui::Ui, s: &str) {
+    let pal = ds::palette_of(ui.ctx());
     ui.label(
         RichText::new(s)
-            .size(ui_scale::SECTION)
-            .strong()
-            .color(ACCENT),
+            .text_style(egui::TextStyle::Name("h3".into()))
+            .color(pal.text_primary),
     );
 }
 
-/// 「标签 + 右边一整行控件」的一行。标签定宽，保证多行左边缘对齐。
-///
-/// `add` 拿到的是**减掉标签列之后剩下的宽度**，在这里算好再传进去。
-/// ⚠️ **不要在 `ui.horizontal(..)` 内部去问 `ui.available_width()`** ——
-/// 横向布局里那个值不是"剩下的这一截"，实测拿到 0，`add_sized` 于是把输入框
-/// 压成 0 宽：框线画不出来，只剩一行提示文字浮在卡面上（提示文字是不裁剪的，
-/// 所以这个 bug 看起来像"输入框没画背景"，很容易往配色上去查）。
-fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f32)) {
-    // 80 而不是 68：`页码范围`（4 个全角字）在 16 pt 下就要 64 px 出头，
-    // 68 会把标签压到和输入框贴在一起。
-    const LABEL_W: f32 = 80.0;
-    let w = (ui.available_width() - LABEL_W - ui.spacing().item_spacing.x).max(120.0);
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(LABEL_W, ui_scale::ROW_H),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.label(RichText::new(label).size(ui_scale::BODY));
-            },
-        );
-        add(ui, w);
-    });
-}
+// 原先这里有一个 `row()`（左边定宽标签 + 右边一整行控件）。迁移后标签改由
+// `ds::InputField` / `ds::SelectField` 自带的 label 槽位画在**字段正上方**
+// （GUIDE §6），这个函数就没人用了。
+// 它当年记录的那个坑仍值得留着：**不要在 `ui.horizontal(..)` 内部去问
+// `ui.available_width()`** —— 横向布局里那个值不是"剩下的这一截"，实测拿到 0，
+// 于是把输入框压成 0 宽、框线画不出来，只剩提示文字浮在卡面上（看起来像
+// "输入框没画背景"，很容易误往配色上去查）。
 
 /// 灰色小字。现在只用于**显示状态**（如已选图片的路径、空列表占位），
 /// 不再承担"向用户解释功能"的职责 —— 那类文案按"界面清爽"的要求已全部撤掉。
 fn hint(ui: &mut egui::Ui, s: &str) {
-    ui.label(RichText::new(s).size(ui_scale::SMALL).color(DIM_C));
+    let pal = ds::palette_of(ui.ctx());
+    ui.label(
+        RichText::new(s)
+            .text_style(egui::TextStyle::Small)
+            .color(pal.text_tertiary),
+    );
 }
 
 /// 「标题 + 按钮」那一行，右侧挂「已选 N 个」（两页的文档卡片共用）。
 fn doc_header(ui: &mut egui::Ui, title: &str, count: usize, buttons: impl FnOnce(&mut egui::Ui)) {
+    let pal = ds::palette_of(ui.ctx());
     ui.horizontal(|ui| {
         card_title(ui, title);
-        ui.add_space(4.0);
+        ui.add_space(ds::SPACING.s2);
         buttons(ui);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 RichText::new(format!("已选 {count} 个"))
-                    .size(ui_scale::SMALL)
-                    .color(DIM_C),
+                    .text_style(egui::TextStyle::Small)
+                    .color(pal.text_tertiary),
             );
         });
     });
@@ -767,6 +744,7 @@ fn doc_header(ui: &mut egui::Ui, title: &str, count: usize, buttons: impl FnOnce
 
 /// 已选文档列表（撑满宽度、定高滚动）。
 fn doc_list(ui: &mut egui::Ui, id: &str, docs: &[String]) {
+    let pal = ds::palette_of(ui.ctx());
     well(ui, |ui| {
         egui::ScrollArea::vertical()
             .id_salt(id)
@@ -774,16 +752,20 @@ fn doc_list(ui: &mut egui::Ui, id: &str, docs: &[String]) {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 if docs.is_empty() {
-                    ui.label(RichText::new("（未选）").color(DIM_C).small());
+                    ui.label(
+                        RichText::new("（未选）")
+                            .text_style(egui::TextStyle::Small)
+                            .color(pal.text_tertiary),
+                    );
                 }
                 for (i, d) in docs.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(format!("{:>3}.", i + 1))
-                                .size(ui_scale::SMALL)
-                                .color(DIM_C),
+                                .text_style(egui::TextStyle::Small)
+                                .color(pal.text_tertiary),
                         );
-                        ui.label(RichText::new(file_name(d)).size(ui_scale::SMALL));
+                        ui.label(RichText::new(file_name(d)).text_style(egui::TextStyle::Small));
                     });
                 }
             });

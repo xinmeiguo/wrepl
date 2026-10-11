@@ -24,6 +24,188 @@
 
 ---
 
+## [0.4.0] - 2026-10-11
+
+> - 升级：底层 UI 库 `eframe` / `egui` **0.29 → 0.34**（27 处 API 适配），
+>   **行为零漂移** —— 升级前后同一批输入跑出的 26 个产物 SHA256 逐字节相同。
+> - 新增：图形界面接入 **`egui_sauge` 设计系统** —— sage 绿主题、九档字号层级、
+>   浅色 / 深色两套配色，`Card` / `Button` / `Checkbox` / `InputField` / `NavItem` /
+>   `SelectField` / `ConfirmDialog` 等统一组件；导航改成左侧边栏。
+> - 修复：接入时踩到 **Phosphor 图标字体占用了小写字母 a–z 的码位**，
+>   一度让界面上所有小写字母（`Excel`、`.bak`、路径…）整体消失；
+>   已把字体顺序钉成 `["cjk", "phosphor", …egui 默认…]` 修好。
+> - 保留原生：规则表因**可编辑**需求继续用 `egui::Grid`，文件选择器的自绘核心继续自绘 ——
+>   设计系统的 `Table<T>` 只支持展示型，硬套会破坏这两处的功能。
+> - 交互：表单标签按设计规范移到**字段正上方**；「就地替换」的确认框换成设计的危险操作对话框
+>   （**就地替换依旧不自动留备份** —— 那是用户明确选择覆盖源文件的场景）。
+
+### 升级：eframe / egui 0.29 → 0.34
+
+动机是接入 `egui_sauge` 设计系统（其 v2.0.0 锁定 `egui 0.34.1`）。
+
+这一步**只升依赖、不动 UI 结构**：跑完 `--selftest` 与升级前逐字一致、
+26 个产物 SHA256 全同，确认零行为漂移之后，才在下一步开始换界面。
+
+| 0.29 写法 | 0.34 写法 |
+|---|---|
+| `Rounding` | `CornerRadius` |
+| `Frame::none()` | `Frame::NONE` |
+| `Margin` 收 `f32` | 收 **`i8`**（`Margin::same(12.0)` → `Margin::same(12)`） |
+| `TextEdit::frame(false)` | `frame(Frame::NONE)`（改收 `Frame`，不再收 `bool`） |
+| `ctx.style()` / `ctx.set_style()` | `ctx.global_style()` / `ctx.set_global_style()` |
+| `ctx.screen_rect()` | `ctx.content_rect()` |
+| `ctx.run(...)` | `ctx.run_ui(...)`（无头自检里 3 处） |
+| `painter.rect_stroke(rect, r, stroke)` | 多收一个 `StrokeKind`（本仓库一律 `StrokeKind::Inside`） |
+| —— | **新增必需方法 `App::ui(&mut self, ui, frame)`**；旧 `update()` 仍会被调用但已 deprecated |
+
+`eframe` 的 feature 也随之收紧成 `default-features = false` + `default_fonts` + `glow`
+（glow/OpenGL 后端而不是 wgpu：依赖树更小、离线可编）。
+
+### 新增：接入 `egui_sauge` 设计系统
+
+**依赖形式是 path 依赖**（不是 `git = …`）：本机 git 通道被封
+（只放行 `api.github.com` / `raw` / `codeload` / `crates.io`，`git ls-remote github.com` 直接 502），
+所以源码按 tag **v2.0.0** 落在与仓库同级的 `../egui_sauge`：
+
+```toml
+egui_sauge   = { path = "../egui_sauge", optional = true }
+egui-phosphor = { version = "0.12", optional = true }   # 直接依赖，见下
+```
+
+`egui-phosphor` 要**直接依赖**：`egui_sauge` 没有重导出它，而中文字体得自己拼进
+「egui 默认 + Phosphor」的字体表。版本必须与 `egui_sauge` 内部一致（`0.12`），
+否则字体表里会出现两个 `phosphor`。
+
+接入层集中在新建的 **`src/gui/ds.rs`**（字体安装 / 主题应用 / 组件再导出），
+`app.rs` 与 `wordtool/ui.rs` 只 `use crate::ds::…`。
+
+**已 DS 化的范围：**
+
+| 位置 | 换掉了什么 |
+|---|---|
+| **正文替换**页（整页） | 顶栏、左侧 `NavItem` 导航、`Card` 分区容器、`InputField`、`Button`、`Checkbox`、就地替换的 `ConfirmDialog::danger()` |
+| **页眉替换**页 | `RadioGroup`（原来是两个 `radio_value`）、标签上移到字段上方、按钮与复选框 |
+| **批量打印**页 | 打印机下拉 `egui::ComboBox` → **`SelectField`**、页码范围 `InputField` |
+| **文件选择器（picker）外壳** | 卡片容器、按钮、标签、复选框、地址栏手输框、「文件名」输入框 |
+
+文件选择器的**自绘核心**（导航箭头、侧栏、面包屑、表头、列表、文件与文件夹图标）
+**保留自绘**，只把它的调色板接进设计系统 —— 见下。
+
+**几个必须记住的坑**（都写进了代码注释）：
+
+1. `egui_sauge::install_fonts` 内部是 `FontDefinitions::default() + Phosphor` + `set_fonts()`，
+   **无条件覆盖整张字体表**；README 说「把自定义字体注册在 `install_fonts` **之前**」，
+   与实现**相反** —— 照做的话中文字体会被整条冲掉。
+   正确顺序：`install_fonts` → 自己从头拼字体表 → `set_fonts` → `apply_theme_with`。
+2. **不能**走 `ctx.fonts(|f| f.definitions().clone())` 取回再追加：eframe 的创建闭包跑在
+   `Context::run()` **之前**，此刻字体表还不存在，取用直接 panic。
+3. `apply_theme_with` 只写 `Style`，**不改 egui 的主题偏好**；还要补一句
+   `ctx.set_theme(ThemePreference::…)`，否则 `visuals.dark_mode` 与内置控件
+   （滚动条、文本选中）不会跟着走。
+4. 组件调用形态不一样：`InputField` / `SelectField` / `RadioGroup` 是
+   `.show(ui, …)`，**不是 `Widget`**；`Button` / `Checkbox` / `ProgressBar` / `Switch`
+   是 `Widget`，可以直接 `ui.add(...)`。
+
+### 修复：界面上的小写字母整体消失（Phosphor 占用了 a–z 码位）
+
+接入后的第一版界面上出现：`从 Excel 导入` 显示成 `从 E 导入`、`导出为 Excel` 成 `导出为 E`、
+`保留 .bak 备份` 成 `保留 . 备份`、`wrepl` 整串看不见、路径 `E:/test/docx` 成 `E://`。
+
+规律极齐整：**小写拉丁字母 a–z 全部消失，大写 / 数字 / 标点都在**。
+
+定位手段：写了个纯 Python 的 cmap 解析器（`_cmap_probe.py`）直接读字体表码位，实锤：
+
+| 字体 | 大写 A–Z | 小写 a–z | 数字 0–9 | 私用区图标码位 |
+|---|---|---|---|---|
+| `Phosphor.ttf` | **0/26** | **26/26** | 0/10 | 1513 |
+| 微软雅黑 `msyh.ttc` | 26/26 | 26/26 | 10/10 | **0** |
+
+`Phosphor` 的图标字体/连字层占用了 a–z 的码位。`egui_phosphor::add_to_fonts` 本意是把
+`phosphor` 插到 `Proportional` 的 **index 1**（即 egui 默认字体之后，源码 `lib.rs:10`），
+小写字母本来会被默认字体先接走；而这里拼接时把它顶到了 **index 0**，小写字母就全被它
+接手成了空白字形。
+
+修复后的目标顺序：
+
+```text
+Proportional = ["cjk", "phosphor", …egui 自带…]
+```
+
+中文先接走拉丁 / 数字 / 汉字（中文字体候选与迁移前**完全相同**，所以其余页面观感不变），
+而中文字体的私用区码位是 **0**，图标照样落到 `phosphor` —— 两头都稳。
+
+### 保留原生：三处「没得换」及原因
+
+| 位置 | 保留什么 | 为什么 |
+|---|---|---|
+| 规则表（正文替换页） | 原生 `egui::Grid` + 行内 `TextEdit` | 设计系统的 `Table<T>` 只支持**展示型**（cell 只拿 `&T`，不可变），装不下逐行可编辑的规则表。表格外面已包 `ds::Card` |
+| 文件选择器核心 | 自绘 | 自绘本身就是它的核心价值，组件库没有等价物。只把调色板接进设计系统 |
+| 文件选择器面板外框 | `egui::Frame::popup` | 面板是 920×600 的自定义尺寸模态，`ds::Card` 固定的 margin / radius 会改掉面板几何与 `PANEL_W/2` 居中；而 `Frame::popup` 读全局 `Style`，`apply_visuals` 已把它设成 sage 观感 |
+
+### 「Excel 列」那排标签：12px 局部补丁
+
+设计系统的 `Checkbox` 把标签字号**写死 13px**
+（`egui_sauge/src/components/checkbox.rs`），且 `label` 只收 `&str`、装不下 `RichText`；
+而 GUIDE 给「label」规定的档位是 `Small`(12px)。折叠头本身已经是 `.small()`，
+底下那排标签也得同档，否则面板内部两档字号打架。
+
+按第 1 步定的约定 —— **不改上游本地副本**、也**不动 `ds.rs` 的公共 API** ——
+就地拆成两件套：
+
+```rust
+let hit_box   = ui.add(ds::Checkbox::new(&mut on)).clicked();            // 只要方框，仍是 sage 绿
+let hit_label = ui.add(egui::Label::new(RichText::new(h).small())        // 只要 12px 标签
+        .sense(egui::Sense::click())).clicked();                         // 点文字也能切换
+```
+
+两者之间不需要手动补间距：sage 的 `item_spacing.x` 就是 `SPACING.s2`(8px)，
+与 DS 复选框自己的 box↔label 间距同值。
+
+### 交互调整
+
+- **导航**：顶部三个页签 → **左侧 `NavItem` 边栏**（`Icon::FileText` / `Edit` / `Package`）。
+- **标签位置**：表单标签按设计规范从「字段左侧」移到**字段正上方**。
+- **「就地替换」确认框**：手搓的两层 `Area` 模态 → `ConfirmDialog::danger()`。
+  **确认后直接覆盖源文件，不额外留备份** —— 那是用户明确选择覆盖源文件的场景，
+  额外塞一份备份反而违背意图；要留备份就勾「保留 .bak 备份」（那是另一条独立路径，
+  勾了才生成，且只首次生成）。
+- 底栏动作按钮：`执行替换` 走 primary（勾了「输出到子文件夹」）或 danger（就地覆盖），
+  `清空日志` / `...` 等次要动作走 ghost。
+
+### 验证
+
+每一步都用同一套硬标准验收，改完立即跑：
+
+- `wrepl-gui --selftest` 归一化后与基线**逐字一致**：
+  `文件 26（跳过 1）｜命中 122｜已替换 122｜冲突 0｜改名 21｜验证 26/26` + `✓ 自检通过`。
+- 26 个产物 `.docx` 与升级前基线 **SHA256 26/26 完全相同**
+  （每一步各跑一次；字体修复前后也各跑一次，结果相同 —— 字体只影响显示，不影响产物）。
+- 界面：四个界面实拍截图，**浅色 / 深色**两套主题各验一遍；
+  未改动的页面与上一步截图**逐像素**比对，差异只落在窗口装饰（标题栏、窗口边缘）
+  与传进去的路径文字上，**内容区零变化**。
+
+### 已知项（本版不修，仅记录）
+
+- **`egui_sauge` 上游 74 条** `falling back to f32 as the trait bound f32: From<f64> is not satisfied`
+  警告：path 依赖下会出现在本地构建日志里。已决定**先接受**，将来同步上游时一起处理。
+- **7 条面板 deprecated 警告**：`egui 0.34` 起 `SidePanel` / `TopBottomPanel` /
+  `Panel::show` / `CentralPanel::show` 被标记 deprecated（应改用
+  `Panel::left/top/bottom` + `show_inside`）。本版没动面板结构，按升级第 1 步的约定保留。
+- 设计系统缺三个语义色，`picker` 里**现算**而不是硬凑：
+  - 「选中行」→ `lerp(bg_surface, brand_default, 浅 0.16 / 深 0.28)`；
+  - 「禁用文字」→ `lerp(dim, bg, 0.45)`；
+  - 浅色主题下 `bg_surface_alt` 与 `bg_hover` **取值相同**，导致浅色下「斑马纹」与
+    「悬停行」底色一致（深色正常，三档递进）。这是上游 token 的问题，等上游拆开再跟上。
+- `ds::Checkbox` 的标签字号写死 13px，而 GUIDE 把 label 归在 `Small`(12px) 档 ——
+  上游偏差；本版只在「Excel 列」那一处用局部补丁绕开，没有全局改。
+- `Card::show` **不自动撑宽**：每张卡的 body 里要自己
+  `ui.set_width(ui.available_width())`，否则卡片会缩到内容那么大。
+- 底部动作栏因「文件名」标签上移比原来高约 20px（600px 高度内不裁切）。
+- 自绘图标保留原色（落脚点蓝 / 紫、盘符灰 / 墨绿、W / E / P / PDF 字号色、金色文件夹）——
+  它们是「按类型区分」的辨识色，不是主题色，设计系统里也没有对应 token。
+
+---
+
 ## [0.3.0] - 2026-10-11
 
 > - 新增：**页眉替换** —— 把指定文本或图片写进文档页眉表格的首个单元格，可批量。

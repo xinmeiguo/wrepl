@@ -38,6 +38,8 @@ use egui::{Align2, Color32, FontId, RichText, Sense, Vec2};
 
 // 字号与行高统一取自 `app::ui_scale` —— 别在这里写裸数字（见那个模块的说明）。
 use crate::app::ui_scale;
+// egui_sauge 设计系统：外壳控件走 DS，自绘层的配色全部取自它的语义调色板。
+use crate::ds;
 
 // ─────────────────────────── 对外接口 ───────────────────────────
 
@@ -363,7 +365,9 @@ impl Picker {
             return Some(Outcome::Cancelled);
         }
 
-        let screen = ctx.screen_rect();
+        // 0.34：`screen_rect()` 拆成 viewport_rect / content_rect，旧实现就是
+        // `content_rect()`。遮罩要铺满可绘制区，用后者（行为不变）。
+        let screen = ctx.content_rect();
         let mut act: Option<Act> = None;
 
         // ① 遮罩：吞掉落到底下主界面的点击（不然面板开着还能点到后面的按钮）。
@@ -391,7 +395,7 @@ impl Picker {
             ))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .inner_margin(egui::Margin::same(12.0))
+                    .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.set_width(PANEL_W);
                         ui.set_height(PANEL_H);
@@ -755,7 +759,7 @@ impl Picker {
                 RichText::new(title)
                     .size(ui_scale::SMALL + 1.5)
                     .strong()
-                    .color(DIR_C),
+                    .color(pal.dir),
             );
         });
         ui.add_space(12.0);
@@ -770,7 +774,7 @@ impl Picker {
         let cur_norm = cwd_s.trim_end_matches(['\\', '/']);
 
         // ── 快速访问 ──
-        nav_section(ui, "快速访问");
+        nav_section(ui, &pal, "快速访问");
         for &(label, ref p) in &places {
             // 图标随位置变：用户 / 桌面 / 文档 / 下载各一个字形与颜色。
             let (glyph, color) = match label {
@@ -798,7 +802,7 @@ impl Picker {
 
         // ── 此电脑（盘符）── 映射网盘单独标出它指向的 UNC。
         ui.add_space(8.0);
-        nav_section(ui, "此电脑");
+        nav_section(ui, &pal, "此电脑");
         for d in &drives_v {
             let target = PathBuf::from(format!("{}\\", letter_of(&d.letter)));
             let (glyph, color, tip) = match &d.remote {
@@ -821,7 +825,7 @@ impl Picker {
         let others: Vec<&PathBuf> = recent.iter().filter(|p| !same_dir(cur_norm, p)).collect();
         if !others.is_empty() {
             ui.add_space(8.0);
-            nav_section(ui, "最近使用");
+            nav_section(ui, &pal, "最近使用");
             for p in others {
                 let name = p
                     .file_name()
@@ -855,11 +859,12 @@ impl Picker {
         let h = ui_scale::EDIT_H;
 
         if self.addr_editing {
-            let resp = ui.add_sized(
-                [w, h],
-                egui::TextEdit::singleline(&mut self.addr)
-                    .hint_text(r"目录，或 \\服务器\共享\子目录"),
-            );
+            // 手输这一档换成 DS 输入框；焦点/回车判定沿用返回的 `Response`，
+            // 交互逻辑一行没动。
+            let resp = ds::InputField::new(&mut self.addr)
+                .placeholder(r"目录，或 \\服务器\共享\子目录")
+                .desired_width(w)
+                .show(ui);
             // 只在刚切进来的那一帧抢焦点。每帧都 `request_focus` 会和"点别处"
             // 打架：egui 先把焦点交出去、我们下一帧又抢回来，文本框就摘不掉了。
             //
@@ -894,6 +899,10 @@ impl Picker {
             rect,
             5.0,
             egui::Stroke::new(1.0_f32, pal.border),
+            // 0.34 起矩形描边必须指定 StrokeKind；矩形沿用旧行为＝Inside
+            // （见 epaint CHANGELOG「You probably want to use StrokeKind::Inside
+            // when drawing rectangles」）。
+            egui::StrokeKind::Inside,
         );
 
         let font = FontId::proportional(ui_scale::SMALL + 1.0);
@@ -903,7 +912,7 @@ impl Picker {
         let n = self.crumbs.len();
         let mut widths: Vec<f32> = Vec::with_capacity(n);
         for (i, (name, _)) in self.crumbs.iter().enumerate() {
-            let col = if i + 1 == n { DIR_C } else { txt_c };
+            let col = if i + 1 == n { pal.dir } else { txt_c };
             let g = ui.painter().layout_no_wrap(name.clone(), font.clone(), col);
             widths.push(g.size().x);
         }
@@ -934,13 +943,13 @@ impl Picker {
                 Align2::LEFT_CENTER,
                 "…",
                 font.clone(),
-                DIM,
+                pal.dim,
             );
             x += 18.0;
         }
         for i in from..n {
             let last = i + 1 == n;
-            let col = if last { DIR_C } else { txt_c };
+            let col = if last { pal.dir } else { txt_c };
             let bw = widths[i] + PAD;
             let brect = egui::Rect::from_min_size(
                 egui::pos2(x, rect.top() + 2.0),
@@ -972,7 +981,7 @@ impl Picker {
                         egui::pos2(x + 7.5, cy),
                         egui::pos2(x + 4.5, cy + 3.0),
                     ],
-                    egui::Stroke::new(1.2_f32, DIM),
+                    egui::Stroke::new(1.2_f32, pal.dim),
                 ));
                 x += CHEV;
             }
@@ -989,7 +998,7 @@ impl Picker {
         if er.hovered() {
             ui.painter().rect_filled(ebr, 3.0, pal.hover);
         }
-        paint_pencil(ui.painter(), ebr.center(), er.hovered());
+        paint_pencil(ui.painter(), ebr.center(), er.hovered(), &pal);
 
         let mut edit = er.clicked();
         // 点在段之间的空白上 = 直接进编辑（与资源管理器一致）
@@ -1073,21 +1082,21 @@ impl Picker {
                 Align2::LEFT_CENTER,
                 n_txt,
                 f.clone(),
-                DIM,
+                pal.dim,
             );
             p.text(
                 egui::pos2(size_r.rect.right() - 10.0, size_r.rect.center().y),
                 Align2::RIGHT_CENTER,
                 s_txt,
                 f.clone(),
-                DIM,
+                pal.dim,
             );
             p.text(
                 egui::pos2(time_r.rect.left() + 8.0, time_r.rect.center().y),
                 Align2::LEFT_CENTER,
                 t_txt,
                 f.clone(),
-                DIM,
+                pal.dim,
             );
             // 排序指示：**自己画一个小三角**，不用 `↑`/`↓` 字符 ——
             // 字符的字重跟着字体走，且 `▴`/`▾`(U+25B4/BE) 在本机是豆腐块
@@ -1107,12 +1116,12 @@ impl Picker {
                         egui::pos2(cx, cy + b),
                     ]
                 };
-                p.add(egui::Shape::convex_polygon(pts, DIR_C, egui::Stroke::NONE));
+                p.add(egui::Shape::convex_polygon(pts, pal.dir, egui::Stroke::NONE));
             };
             // 三角摆在各自列标题的右侧（名称列按文字宽估个位）。
             let w_txt = |s: &str, ui: &egui::Ui| -> f32 {
                 ui.painter()
-                    .layout_no_wrap(s.to_string(), FontId::proportional(ui_scale::SMALL), DIM)
+                    .layout_no_wrap(s.to_string(), FontId::proportional(ui_scale::SMALL), pal.dim)
                     .size()
                     .x
             };
@@ -1176,6 +1185,7 @@ impl Picker {
             list_rect,
             4.0,
             egui::Stroke::new(1.0_f32, pal.border),
+            egui::StrokeKind::Inside,
         );
         let loading = self
             .load
@@ -1208,7 +1218,7 @@ impl Picker {
                 ui.allocate_ui(Vec2::new(full_w, list_h), |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((list_h / 2.0 - 14.0).max(0.0));
-                        ui.label(RichText::new(msg).small().color(DIM));
+                        ui.label(RichText::new(msg).small().color(pal.dim));
                     });
                 });
             } else {
@@ -1240,7 +1250,7 @@ impl Picker {
                                         Vec2::new(3.0, bg.height()),
                                     ),
                                     1.5,
-                                    DIR_C,
+                                    pal.dir,
                                 );
                             } else if resp.hovered() {
                                 p.rect_filled(bg, 4.0, pal.hover);
@@ -1258,10 +1268,10 @@ impl Picker {
                                     paint_dir_icon(p, rect.left() + ICON_DX, cy, icon_h)
                                 }
                                 other => {
-                                    paint_row_icon(p, rect.left() + ICON_DX, cy, icon_h, other, DIM)
+                                    paint_row_icon(p, rect.left() + ICON_DX, cy, icon_h, other, pal.dim)
                                 }
                             }
-                            let color = if e.is_dir { DIR_C } else { txt_c };
+                            let color = if e.is_dir { pal.dir } else { txt_c };
                             p.text(
                                 egui::pos2(rect.left() + NAME_DX, cy),
                                 Align2::LEFT_CENTER,
@@ -1276,7 +1286,7 @@ impl Picker {
                                     Align2::RIGHT_CENTER,
                                     fmt_size(e.size),
                                     f_meta.clone(),
-                                    DIM,
+                                    pal.dim,
                                 );
                             }
                             if let Some(t) = e.mtime {
@@ -1285,7 +1295,7 @@ impl Picker {
                                     Align2::LEFT_CENTER,
                                     fmt_mtime(t),
                                     f_meta,
-                                    DIM,
+                                    pal.dim,
                                 );
                             }
 
@@ -1368,13 +1378,13 @@ impl Picker {
             } else {
                 format!("{n_all} 个项目")
             };
-            ui.label(RichText::new(line).size(ui_scale::SMALL).color(DIM));
+            ui.label(RichText::new(line).size(ui_scale::SMALL).color(pal.dim));
             if let Some(e) = &self.err {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!("× {e}"))
                         .size(ui_scale::SMALL)
-                        .color(ERR_C),
+                        .color(pal.err),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1382,7 +1392,7 @@ impl Picker {
                     ui.label(
                         RichText::new(format!("已选 {} 项", self.sel.len()))
                             .size(ui_scale::SMALL)
-                            .color(DIM),
+                            .color(pal.dim),
                     );
                 }
             });
@@ -1393,12 +1403,13 @@ impl Picker {
         ui.horizontal(|ui| {
             let need_name = matches!(self.mode, Mode::Save | Mode::Files);
             if need_name {
-                ui.label("文件名");
                 let w = if self.mode == Mode::Save { 360.0 } else { 260.0 };
-                let resp = ui.add_sized(
-                    [w, ui_scale::EDIT_H],
-                    egui::TextEdit::singleline(&mut self.file_name).hint_text("可直接敲名字"),
-                );
+                // 标签按 GUIDE 挪到字段正上方（原来是并排的「文件名」+ 框）。
+                let resp = ds::InputField::new(&mut self.file_name)
+                    .label("文件名")
+                    .placeholder("可直接敲名字")
+                    .desired_width(w)
+                    .show(ui);
                 let mut enter_name = false;
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     enter_used = true;
@@ -1416,8 +1427,11 @@ impl Picker {
                 }
                 ui.add_space(10.0);
             }
-            ui.label(RichText::new(self.filter_label.clone()).small().color(DIM));
-            if ui.checkbox(&mut self.show_hidden, "显示隐藏项").changed() {
+            ui.label(RichText::new(self.filter_label.clone()).small().color(pal.dim));
+            if ui
+                .add(ds::Checkbox::with_label(&mut self.show_hidden, "显示隐藏项"))
+                .changed()
+            {
                 // 同上：self.all 此刻是空的，必须用 entries
                 self.refresh_view(entries);
             }
@@ -1429,16 +1443,13 @@ impl Picker {
                     Mode::Save => "保存",
                 };
                 let can = self.confirm(entries).is_some();
-                if ui
-                    .add_enabled(can, egui::Button::new(RichText::new(ok_label).strong()))
-                    .clicked()
-                {
+                if ui.add(ds::Button::primary(ok_label).disabled(!can)).clicked() {
                     if let Some(paths) = self.confirm(entries) {
                         act = Some(Act::Close(Outcome::Picked(paths)));
                     }
                 }
                 ui.add_space(8.0);
-                if ui.button("取消").clicked() {
+                if ui.add(ds::Button::secondary("取消")).clicked() {
                     act = Some(Act::Close(Outcome::Cancelled));
                 }
                 ui.add_space(10.0);
@@ -1446,7 +1457,7 @@ impl Picker {
                 // 故意做得小而不显眼 —— 它是逃生口，不是主路径。
                 // 文字用 ASCII 的 `...`：`⋯`(U+22EF) 在本机是豆腐块（见上面 arrow 那段）。
                 if ui
-                    .small_button(RichText::new("...").color(DIM))
+                    .add(ds::Button::ghost("..."))
                     .on_hover_text("改用系统对话框（原生）")
                     .clicked()
                 {
@@ -1526,9 +1537,9 @@ fn is_hidden(_md: &std::fs::Metadata) -> bool {
 
 // ─────────────────────────── 小工具 ───────────────────────────
 
-const DIM: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
-const DIR_C: Color32 = Color32::from_rgb(0x1F, 0x4E, 0x79);
-const ERR_C: Color32 = Color32::from_rgb(0xB0, 0x30, 0x30);
+// 原来这里有三条写死的文字色（DIM / DIR_C / ERR_C）。第 4a 步接入 egui_sauge
+// 之后，它们改由 `palette(ui)` 的 `dim` / `dir` / `err` 三个字段提供 —— 深浅两套
+// 主题各有一份，主题一切就跟着走（原来写死的那套是蓝灰，跟 sage 绿不搭）。
 
 /// 列表行内两个横向锚点（都相对行的左边缘）：图标中心、文件名起点。
 ///
@@ -1539,8 +1550,17 @@ const NAME_DX: f32 = 29.0;
 
 /// 列表区的一套配色。
 ///
-/// 单独拎出来是因为**浅色/深色主题必须各给一套** —— 深色主题下沿用浅灰底
-/// 会变成一块刺眼的白斑（`stripe_bg` 早就踩过同一个坑）。
+/// 字段**全部取自 egui_sauge 的语义调色板**（[`ds::palette_of`]）—— 深浅两套
+/// 主题各有一份，主题一切就跟着走，不必再在这里写死两份色值。这样面板的
+/// 自绘区（列表 / 侧栏 / 表头）与已经 DS 化的三页是同一套观感，不会割裂。
+///
+/// ⚠️ 两点是**没得换、按最接近的语义色凑**的，记在遗留清单里：
+/// 1. sage 没有「选中行」这一档语义色（`bg_hover` / `bg_pressed` 是给按钮态
+///    留的），所以 `sel` 用**品牌绿按比例混进卡面**现算 —— 比硬用中性灰更贴合
+///    整体的绿，但严格说不是上游定义的 token。
+/// 2. sage 的 `bg_surface_alt` 与 `bg_hover` 在**浅色主题下取值相同**
+///    （都是 `#F1EFE8`）⇒ 浅色下斑马纹与悬停行的底色一致（深色下是三档递进，
+///    正常）。想区分得靠 `lerp` 自己调，属"能接受但不理想"。
 struct Palette {
     /// 列表空白处的底色。
     bg: Color32,
@@ -1556,29 +1576,37 @@ struct Palette {
     head: Color32,
     /// 左侧导航栏的底色（比列表底略灰一档，才分得出两栏）。
     side: Color32,
+    /// 正文色。原来各处直接问 `ui.visuals().text_color()`，这里统一收进来。
+    text: Color32,
+    /// 次要文字（取代原 `DIM`）。
+    dim: Color32,
+    /// 强调色 / 目录名 / 选中条（取代原 `DIR_C`）。换成 sage 的品牌绿。
+    dir: Color32,
+    /// 错误红（取代原 `ERR_C`）。
+    err: Color32,
 }
 
 fn palette(ui: &egui::Ui) -> Palette {
-    if ui.visuals().dark_mode {
-        Palette {
-            bg: Color32::from_rgb(0x1B, 0x1E, 0x23),
-            zebra: Color32::from_rgb(0x21, 0x25, 0x2B),
-            hover: Color32::from_rgb(0x2A, 0x30, 0x39),
-            sel: Color32::from_rgb(0x27, 0x3E, 0x5C),
-            border: Color32::from_rgb(0x3B, 0x42, 0x4D),
-            head: Color32::from_rgb(0x2C, 0x31, 0x39),
-            side: Color32::from_rgb(0x20, 0x24, 0x2A),
-        }
-    } else {
-        Palette {
-            bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            zebra: Color32::from_rgb(0xF7, 0xF9, 0xFC),
-            hover: Color32::from_rgb(0xEC, 0xF2, 0xFB),
-            sel: Color32::from_rgb(0xDC, 0xE9, 0xFA),
-            border: Color32::from_rgb(0xD2, 0xD9, 0xE2),
-            head: Color32::from_rgb(0xEA, 0xEF, 0xF6),
-            side: Color32::from_rgb(0xF6, 0xF7, 0xF9),
-        }
+    let s = ds::palette_of(ui.ctx());
+    Palette {
+        bg: s.bg_surface,
+        zebra: s.bg_surface_alt,
+        hover: s.bg_hover,
+        // 选中行：品牌绿按比例混进卡面（sage 无「选中」语义色，见结构体说明）。
+        sel: lerp_c(
+            s.bg_surface,
+            s.brand_default,
+            if s.dark_mode { 0.28 } else { 0.16 },
+        ),
+        border: s.border_default,
+        head: s.bg_surface_alt,
+        // 侧栏：浅色下比卡面略灰（`bg_surface_alt`）、深色下比卡面更暗（`bg_app`）
+        // —— 与第 3 步 `well()` 用的是同一套「比卡面沉一档」的思路。
+        side: if s.dark_mode { s.bg_app } else { s.bg_surface_alt },
+        text: s.text_primary,
+        dim: s.text_tertiary,
+        dir: s.brand_default,
+        err: s.error,
     }
 }
 
@@ -1608,13 +1636,13 @@ fn drive_short(label: &str) -> String {
 }
 
 /// 侧栏的分区小标题（「快速访问」「此电脑」…）。
-fn nav_section(ui: &mut egui::Ui, label: &str) {
+fn nav_section(ui: &mut egui::Ui, pal: &Palette, label: &str) {
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         ui.label(
             RichText::new(label)
                 .size(ui_scale::SMALL - 0.5)
-                .color(DIM),
+                .color(pal.dim),
         );
     });
     ui.add_space(3.0);
@@ -1661,7 +1689,7 @@ fn nav_row(
         p.rect_filled(
             egui::Rect::from_min_size(rect.left_top(), Vec2::new(3.0, rect.height())),
             1.5,
-            DIR_C,
+            pal.dir,
         );
     } else if resp.hovered() {
         p.rect_filled(rect, 4.0, pal.hover);
@@ -1730,7 +1758,7 @@ fn paint_place_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, g: NavGlyph, co
         }
         NavGlyph::Doc => {
             let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(s * 1.35, s * 1.8));
-            p.rect_stroke(r, 0.5, st);
+            p.rect_stroke(r, 0.5, st, egui::StrokeKind::Inside);
             p.line_segment(
                 [egui::pos2(r.left() + s * 0.2, r.center().y), egui::pos2(r.right() - s * 0.2, r.center().y)],
                 st,
@@ -1741,7 +1769,7 @@ fn paint_place_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, g: NavGlyph, co
                 egui::pos2(cx, cy - s * 0.18),
                 egui::vec2(s * 2.0, s * 1.3),
             );
-            p.rect_stroke(r, 0.5, st);
+            p.rect_stroke(r, 0.5, st, egui::StrokeKind::Inside);
             p.line_segment([egui::pos2(cx, r.bottom()), egui::pos2(cx, cy + s * 0.8)], st);
             p.line_segment(
                 [egui::pos2(cx - s * 0.5, cy + s * 0.8), egui::pos2(cx + s * 0.5, cy + s * 0.8)],
@@ -1750,7 +1778,7 @@ fn paint_place_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, g: NavGlyph, co
         }
         NavGlyph::Drive => {
             let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(s * 2.0, s * 1.4));
-            p.rect_stroke(r, 0.8, st);
+            p.rect_stroke(r, 0.8, st, egui::StrokeKind::Inside);
             p.line_segment(
                 [
                     egui::pos2(r.left() + s * 0.3, r.center().y + s * 0.3),
@@ -1768,8 +1796,8 @@ fn paint_place_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, g: NavGlyph, co
                 egui::pos2(cx - s * 0.25, cy - s * 0.35),
                 egui::vec2(s * 1.25, s * 1.25),
             );
-            p.rect_stroke(a, 0.4, st);
-            p.rect_stroke(b, 0.4, st);
+            p.rect_stroke(a, 0.4, st, egui::StrokeKind::Inside);
+            p.rect_stroke(b, 0.4, st, egui::StrokeKind::Inside);
         }
         NavGlyph::Clock => {
             p.circle_stroke(egui::pos2(cx, cy), s * 0.95, st);
@@ -1779,13 +1807,9 @@ fn paint_place_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32, g: NavGlyph, co
     }
 }
 
-/// 地址栏右端那只「编辑路径」的小铅笔。
-fn paint_pencil(p: &egui::Painter, c: egui::Pos2, hot: bool) {
-    let col = if hot {
-        Color32::from_rgb(0x10, 0x14, 0x1A)
-    } else {
-        DIM
-    };
+/// 地址栏右端那只「编辑路径」的小铅笔。颜色走调色板（悬停 = 正文色，常态 = 次要色）。
+fn paint_pencil(p: &egui::Painter, c: egui::Pos2, hot: bool, pal: &Palette) {
+    let col = if hot { pal.text } else { pal.dim };
     let s = 5.5;
     p.line_segment(
         [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s * 0.7, c.y - s * 0.7)],
@@ -1947,7 +1971,7 @@ fn paint_dir_icon(p: &egui::Painter, cx: f32, cy: f32, h: f32) {
 fn paint_doc_outline(p: &egui::Painter, cx: f32, cy: f32, h: f32, color: Color32) {
     let w = h * 0.84;
     let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(w, h));
-    p.rect_stroke(r, 1.5, egui::Stroke::new(1.2_f32, color));
+    p.rect_stroke(r, 1.5, egui::Stroke::new(1.2_f32, color), egui::StrokeKind::Inside);
     // 折角：右上角那块实心三角。
     let c = h * 0.34;
     p.add(egui::Shape::convex_polygon(
@@ -2026,7 +2050,6 @@ enum NavIcon {
 /// 资源管理器：细笔画（1.6）、圆头、可用/不可用两档灰度。
 fn nav_button(ui: &mut egui::Ui, kind: NavIcon, enabled: bool, tip: &str) -> egui::Response {
     let pal = palette(ui);
-    let dark = ui.visuals().dark_mode;
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::splat(ui_scale::NAV_BTN),
         if enabled { Sense::click() } else { Sense::hover() },
@@ -2035,23 +2058,15 @@ fn nav_button(ui: &mut egui::Ui, kind: NavIcon, enabled: bool, tip: &str) -> egu
     if enabled && resp.hovered() {
         ui.painter().rect_filled(rect.shrink(2.0), 4.0, pal.hover);
     }
-    // 三档颜色：点不动（淡）、悬停（最显眼）、常态（正文色）。深浅主题各一套。
+    // 三档颜色：点不动（淡）、悬停（品牌绿）、常态（正文色）。深浅两套主题自动
+    // 跟着调色板走 —— sage 没有「禁用文字」语义色，点不动那一档用「次要文字往
+    // 底色里退 45%」现算（记在遗留清单）。
     let color = if !enabled {
-        if dark {
-            Color32::from_rgb(0x53, 0x5A, 0x66)
-        } else {
-            Color32::from_rgb(0xBB, 0xC2, 0xCC)
-        }
+        lerp_c(pal.dim, pal.bg, 0.45)
     } else if resp.hovered() {
-        if dark {
-            Color32::from_rgb(0xFF, 0xFF, 0xFF)
-        } else {
-            Color32::from_rgb(0x10, 0x14, 0x1A)
-        }
-    } else if dark {
-        Color32::from_rgb(0xD8, 0xDD, 0xE4)
+        pal.dir
     } else {
-        Color32::from_rgb(0x38, 0x3D, 0x46)
+        pal.text
     };
 
     let st = egui::Stroke::new(1.6_f32, color);
@@ -2449,8 +2464,8 @@ mod tests {
         let mut p = Picker::new();
         p.open(Mode::Files, "测试", PathBuf::from(r"C:\"), &["docx"], "");
         for _ in 0..60 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                let _ = p.show(ctx);
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = p.show(ui.ctx());
             });
             if p.load.is_none() {
                 break;
@@ -2638,8 +2653,8 @@ mod tests {
                     "",
                 );
                 for _ in 0..300 {
-                    let _ = ctx.run(egui::RawInput::default(), |c| {
-                        let _ = p.show(c);
+                    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let _ = p.show(ui.ctx());
                     });
                     if p.load.is_none() {
                         break;
@@ -2649,8 +2664,8 @@ mod tests {
                 // 列表就绪后再多跑几帧：真正吃栈的是「有内容的完整布局」，
                 // 空列表那几帧反而轻。
                 for _ in 0..20 {
-                    let _ = ctx.run(egui::RawInput::default(), |c| {
-                        let _ = p.show(c);
+                    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let _ = p.show(ui.ctx());
                     });
                 }
                 p.view.len()

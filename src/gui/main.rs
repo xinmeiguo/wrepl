@@ -31,6 +31,7 @@
 
 mod app;
 mod diag;
+mod ds;
 mod picker;
 mod wordtool;
 
@@ -93,8 +94,11 @@ fn run_and_report(
         "wrepl",
         native,
         Box::new(move |cc| {
-            app::install_fonts(&cc.egui_ctx);
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            // 设计系统：字体表（egui 默认 + Phosphor + 中文）+ 九档字号层级 + 主题。
+            // 顺序钉死在 `ds::install` 里（install_fonts → 自拼字体表 → set_fonts），
+            // 不要再往这里插 `set_visuals` —— 那会把设计系统的主题整个盖掉。
+            ds::install(&cc.egui_ctx);
+            ds::apply(&cc.egui_ctx, true);
             Ok(Box::new(match &preset {
                 Some(p) => app::App::with_preset(p),
                 None => app::App::new(),

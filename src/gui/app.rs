@@ -50,6 +50,7 @@
 //! 几百个文件的时候看上去就像死了。改成"按帧推进"并不改变总耗时，
 //! 改变的是**这段时间里屏幕上有东西在动**。
 
+use crate::ds;
 use eframe::egui::{self, Color32, RichText};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1225,51 +1226,69 @@ impl App {
         if self.job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        // 主题只在变化时应用一次（每帧都 set_visuals 会把用户的临时样式冲掉）
+        // 主题只在变化时应用一次（每帧都刷会把用户的临时样式冲掉）。
+        //
+        // 第 2 步起走设计系统：`ds::apply` 内部是
+        // `set_theme + apply_theme_with(palette, Comfortable)`，浅/深两套 palette
+        // 各自对应迁移前 `Visuals::light()/dark()` 的角色。
         if self.applied_light != Some(self.light_theme) {
-            ctx.set_visuals(visuals_of(self.light_theme));
+            ds::apply(ctx, self.light_theme);
             self.applied_light = Some(self.light_theme);
         }
 
+        // ── TopBar：品牌 + 全局开关（GUIDE §1：「TopBar · brand · user menu」）──
         egui::TopBottomPanel::top("title").show(ctx, |ui| {
+            let pal = ds::palette_of(ui.ctx());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                // 品牌图标用设计系统的品牌绿（`Icon::Leaf` 是 GUIDE 里给
+                // "tout est calme / 品牌" 场景的推荐图标）。
+                let (ir, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ds::Icon::Leaf.paint(ui.painter(), ir, pal.brand_default);
                 ui.label(
                     RichText::new("wrepl")
-                        .size(ui_scale::TITLE)
+                        .size(20.0)
                         .strong()
-                        .color(Color32::from_rgb(0x1F, 0x4E, 0x79)),
+                        .color(pal.text_primary),
                 );
-                ui.label(RichText::new("Word 工具集").color(DIM_C));
+                ui.label(
+                    RichText::new("Word 工具集")
+                        .size(13.0)
+                        .color(pal.text_secondary),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.checkbox(&mut self.light_theme, "浅色");
+                    ui.add(ds::Checkbox::with_label(&mut self.light_theme, "浅色"));
                 });
-            });
-            ui.add_space(4.0);
-            // 三页切换。任务在跑时也允许切——任务状态挂在 `job` / `wt` 上，
-            // 切页不会中断它（`render` 每帧都会 poll）。
-            ui.horizontal(|ui| {
-                for (m, label) in [
-                    (Page::Replace, "正文替换"),
-                    (Page::Header, "页眉替换"),
-                    (Page::Print, "批量打印"),
-                ] {
-                    let selected = self.page == m;
-                    let text = RichText::new(label)
-                        .size(ui_scale::SECTION)
-                        .color(if selected {
-                            Color32::from_rgb(0x1F, 0x4E, 0x79)
-                        } else {
-                            DIM_C
-                        });
-                    let text = if selected { text.strong() } else { text };
-                    if ui.selectable_label(selected, text).clicked() {
-                        self.page = m;
-                    }
-                }
             });
             ui.add_space(6.0);
         });
+
+        // ── Sidebar：三页导航 ────────────────────────────────────────────────
+        //
+        // GUIDE §2：3–12 个常驻区块一律用 SidePanel + NavItem（≤5 且是"同一实体的
+        // 子视图"才用 Tabs）。三页各有自己的动作与状态、随时可切，属于前者。
+        egui::SidePanel::left("nav")
+            .exact_size(184.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(10.0);
+                for (page, label, icon) in [
+                    (Page::Replace, "正文替换", ds::Icon::FileText),
+                    (Page::Header, "页眉替换", ds::Icon::Edit),
+                    (Page::Print, "批量打印", ds::Icon::Package),
+                ] {
+                    if ui
+                        .add(
+                            ds::NavItem::new(label)
+                                .icon(icon)
+                                .selected(self.page == page),
+                        )
+                        .clicked()
+                    {
+                        self.page = page;
+                    }
+                }
+            });
 
         egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
             // 这一栏是「正文替换」专用的（执行按钮 / 打开目录 / 报告 / 清日志）。
@@ -1283,11 +1302,24 @@ impl App {
                 let can_run = !self.input.trim().is_empty() && !running;
                 let label = if running { "执行中…" } else { "执行替换" };
                 // 就地覆盖的确认兜在 `start_run` 入口（见那里的注释），这里直接调。
+                //
+                // GUIDE §4：每屏**只有一个** primary，破坏性动作用 danger。
+                // 就地替换会不可撤销地覆盖源文件 —— 正是 danger 的用例；
+                // 写副本不动源文件，保持 primary 即可。
+                let run_btn = if self.out_to_subdir {
+                    ds::Button::primary(label)
+                } else {
+                    ds::Button::danger(label)
+                }
+                .size(ds::ButtonSize::Lg)
+                .leading(if running {
+                    ds::Icon::Hourglass
+                } else {
+                    ds::Icon::Lightning
+                })
+                .disabled(!can_run);
                 if ui
-                    .add_enabled(
-                        can_run,
-                        egui::Button::new(RichText::new(label).size(ui_scale::BUTTON).strong()),
-                    )
+                    .add(run_btn)
                     .on_hover_text(if self.out_to_subdir {
                         "把产物写到输出目录，源文件不动"
                     } else {
@@ -1297,23 +1329,34 @@ impl App {
                 {
                     self.start_run(false, ctx);
                 }
-                ui.separator();
+                ui.add_space(ds::SPACING.s5);
                 let (open_lbl, open_p) = if self.out_to_subdir {
                     ("打开输出目录", self.output.clone())
                 } else {
                     ("打开源目录", self.input_dir().display().to_string())
                 };
-                if ui.button(open_lbl).clicked() {
+                if ui
+                    .add(ds::Button::secondary(open_lbl).leading(ds::Icon::FolderOpen))
+                    .clicked()
+                {
                     self.open_path(&open_p);
                 }
-                if ui.button("打开报告").clicked() {
+                ui.add_space(ds::SPACING.s2);
+                if ui
+                    .add(ds::Button::secondary("打开报告").leading(ds::Icon::FileText))
+                    .clicked()
+                {
                     let p = self.report_path().display().to_string();
                     self.open_path(&p);
                 }
-                ui.separator();
+                ui.add_space(ds::SPACING.s5);
                 // 执行期间不给清：那一整段日志等一下要落盘成「运行日志.txt」
                 if ui
-                    .add_enabled(!running, egui::Button::new("清空日志"))
+                    .add(
+                        ds::Button::ghost("清空日志")
+                            .leading(ds::Icon::Trash)
+                            .disabled(running),
+                    )
                     .clicked()
                 {
                     self.log.clear();
@@ -1413,100 +1456,62 @@ impl App {
     /// 「就地覆盖」确认框。
     ///
     /// 只做一件事：在真的动源文件之前停一下。就地替换把源文件**直接覆盖、不可撤销**，
-    /// 而触发它只是界面上的一个单击——所以这里**只说清"改源文件、不可撤销"**，
-    /// 再给个当场勾备份的口子，问一句就走（文字从简）。
+    /// 而触发它只是界面上的一个单击 —— 所以这里**只说清"改源文件、不可撤销"**，
+    /// 问一句就走（文字从简）。
     ///
-    /// egui 0.29 没有 `Modal`，用两层 `Area` 模拟：底层遮罩铺满屏幕并吞掉点击
-    /// （不然确认框开着的时候，人还能点到后面的「执行替换」和输入框），
-    /// 上层放对话框本体。两层用**不同**的 `Order` 定序，不依赖同层内的绘制顺序。
+    /// 迁移第 2 步：0.29 那套"两层 `Area` 手搓 Modal"换成设计系统的
+    /// [`ds::ConfirmDialog`]（GUIDE §3「Modal = bloquant」／§4「破坏性动作走
+    /// `ConfirmDialog::danger()`」）。**只负责确认**：要不要留 `.bak` 由上面
+    /// 「选项」那行的复选框决定，框里不再重复给一次。
+    ///
+    /// 就地替换**不加自动备份**：用户明确选了"覆盖源文件"，那就确认后直接覆盖，
+    /// 不额外留备份文件（这是 xin 2026-10-11 明确的口径）。
     fn confirm_inplace_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_inplace {
             return;
         }
-        let mut go = false;
-        let mut cancel = false;
-
-        // ① 遮罩：铺满整屏、吞掉所有点击。`Order::Middle` 高于页面所在的
-        //    `Background`、低于对话框的 `Foreground`，正好夹在中间。
-        egui::Area::new(egui::Id::new("wrepl-confirm-veil"))
-            .order(egui::Order::Middle)
-            .fixed_pos(egui::Pos2::ZERO)
-            .interactable(true)
-            .show(ctx, |ui| {
-                let full = ctx.screen_rect();
-                ui.allocate_response(full.size(), egui::Sense::click_and_drag());
-                ui.painter()
-                    .rect_filled(full, 0.0, Color32::from_black_alpha(70));
-            });
-
-        // ② 对话框本体：居中，浮在遮罩之上。**文字从简**。
-        egui::Area::new(egui::Id::new("wrepl-confirm-dialog"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width(340.0);
-                    ui.label(
-                        RichText::new("将在源文件上直接替换，此操作不可撤销。")
-                            .strong()
-                            .color(ERR_C),
-                    );
-                    // 没备份时给一条退路：勾一下就行，不必取消回主界面。
-                    if !self.backup {
-                        ui.add_space(6.0);
-                        ui.checkbox(&mut self.backup, "替换前先保留 .bak 备份").on_hover_text(
-                            "每个文件改写前先留一份 .docx.bak（只首次生成，重复跑不会覆盖最初那版）",
-                        );
-                    }
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        // 按钮文字**不用红色**：上面那句警告已经是红的，红色只用来
-                        // 说"有风险"，不该同时用来标"按钮"。按钮用正文色
-                        // （浅色主题下即黑色）——强调靠加粗，不靠颜色。
-                        // 取 `text_color()` 而不是写死黑色：换深色主题时不会变成黑底黑字。
-                        let btn_fg = ui.visuals().text_color();
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("确认替换").strong().color(btn_fg),
-                            ))
-                            .clicked()
-                        {
-                            go = true;
-                        }
-                        // 「确认替换」是放行破坏性操作的按钮，「取消」紧挨着它右侧。
-                        // 用默认的 8px 间距时两个按钮几乎贴在一起，鼠标偏一格就点错——
-                        // 而这两个动作的结果正好相反（真改文件 / 什么都不做）。
-                        // 这里额外拉开一段，别让相反的动作挤在同一片区域里。
-                        ui.add_space(12.0);
-                        if ui.button("取消").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            });
-
-        if go {
+        match ds::ConfirmDialog::new(
+            "在源文件上直接替换？",
+            "此操作不可撤销：原文件会被直接覆盖，且不会额外留备份。\
+             若不放心，可先取消、勾上「保留 .bak 备份」再执行。",
+        )
+        .danger()
+        .confirm_label("确认替换")
+        .cancel_label("取消")
+        .show(ctx)
+        {
             // 先关框、再置"放行票"，否则下一帧还会画这个确认框。
-            self.confirm_inplace = false;
-            self.inplace_confirmed = true;
-            self.start_run(false, ctx);
-        } else if cancel {
-            self.confirm_inplace = false;
+            Some(true) => {
+                self.confirm_inplace = false;
+                self.inplace_confirmed = true;
+                self.start_run(false, ctx);
+            }
+            Some(false) => self.confirm_inplace = false,
+            None => {}
         }
     }
 
     fn section_io(&mut self, ui: &mut egui::Ui) {
         section(ui, "文件与输出", |ui| {
-            const L: f32 = 52.0; // 标签列宽
-            const F: f32 = 560.0; // 路径输入框宽
+            /// 路径输入框宽。
+            const F: f32 = 560.0;
 
             let mut pick_in_dir = false;
             let mut pick_in_file = false;
             let mut pick_out_dir = false;
             let mut use_sibling_out = false;
 
+            // GUIDE §7：标签在字段**正上方**（不是左侧——IT 类界面这样扫得更快）。
+            // 这里手写这一行小标签，因为下面那个框是多行的：
+            // ⚠ **没得换**：设计系统的 `InputField` 只有 `singleline`，换成它会丢掉
+            //   「一行一个路径」这个用法（多选文件 / 手输若干条都靠它）。
+            ui.label(
+                RichText::new("输入")
+                    .size(12.0)
+                    .color(ds::palette_of(ui.ctx()).text_secondary),
+            );
+            ui.add_space(4.0);
             ui.horizontal_top(|ui| {
-                cell_label(ui, L, "输入");
                 // 多行：一行一个路径。只给一个目录 / 一个文件时就是一行高。
                 // 高度封顶 6 行——一次选了几十个文件时不再往长里撑，框内自己滚。
                 let rows = self.input.lines().count().clamp(1, 6) as f32;
@@ -1515,12 +1520,16 @@ impl App {
                     egui::TextEdit::multiline(&mut self.input)
                         .hint_text("目录，或若干 .docx（一行一个）"),
                 );
+                ui.add_space(ds::SPACING.s2);
                 ui.vertical(|ui| {
-                    if ui.button("选目录…").clicked() {
+                    if ui
+                        .add(ds::Button::secondary("选目录").leading(ds::Icon::Folder))
+                        .clicked()
+                    {
                         pick_in_dir = true;
                     }
                     if ui
-                        .button("选文件…")
+                        .add(ds::Button::secondary("选文件").leading(ds::Icon::FileText))
                         .on_hover_text(
                             "按住 Ctrl / Shift 一次选多个 .docx；选中几个就处理几个。\n\
                              也可以直接把多个路径粘进左边的框里（一行一个，或用分号隔开）。",
@@ -1531,35 +1540,46 @@ impl App {
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(ds::SPACING.s3);
 
             ui.horizontal(|ui| {
-                cell_label(ui, L, "输出");
-                ui.checkbox(&mut self.out_to_subdir, "输出到子文件夹");
-                ui.add_space(8.0);
+                ui.add(ds::Checkbox::with_label(
+                    &mut self.out_to_subdir,
+                    "输出到子文件夹",
+                ));
+                ui.add_space(ds::SPACING.s4);
                 // 镜像只对写副本有意义：就地替换本就在原地，没有"要不要复制"这回事。
                 // 置灰而不是隐藏——让人看到这个开关存在，切换落盘方式后它就在那儿。
+                // 注：`Checkbox` 自己管 `disabled`，不能靠外层 `add_enabled_ui`。
                 let writes_copy = self.out_to_subdir;
-                ui.add_enabled_ui(writes_copy, |ui| {
-                    ui.checkbox(&mut self.mirror, "完整镜像").on_hover_text(
-                        "默认不勾：输出目录里只有本次真正改过的文件。\n\
-                         勾上则未改动的文件也原样复制过去（逐字节相同，文件名一并归一），\n\
-                         输出目录成为输入目录的**完整镜像**，可直接当交付包拿走。\n\
-                         只对「输出到子文件夹」有效。",
-                    );
-                });
+                ui.add(
+                    ds::Checkbox::with_label(&mut self.mirror, "完整镜像").disabled(!writes_copy),
+                )
+                .on_hover_text(
+                    "默认不勾：输出目录里只有本次真正改过的文件。\n\
+                     勾上则未改动的文件也原样复制过去（逐字节相同，文件名一并归一），\n\
+                     输出目录成为输入目录的**完整镜像**，可直接当交付包拿走。\n\
+                     只对「输出到子文件夹」有效。",
+                );
             });
             if self.out_to_subdir {
-                ui.add_space(8.0);
+                ui.add_space(ds::SPACING.s3);
+                let _ = ds::InputField::new(&mut self.output)
+                    .label("输出目录")
+                    .placeholder("留空 = <输入目录>/out")
+                    .leading(ds::Icon::FolderOpen)
+                    .desired_width(F)
+                    .show(ui);
+                ui.add_space(ds::SPACING.s2);
                 ui.horizontal(|ui| {
-                    // 缩进对齐上面那个路径框：标签宽 + 一个控件间距
-                    ui.add_space(L + ui.spacing().item_spacing.x);
-                    path_edit(ui, F - L, &mut self.output, "");
-                    if ui.button("选目录…").clicked() {
+                    if ui
+                        .add(ds::Button::secondary("选目录").leading(ds::Icon::Folder))
+                        .clicked()
+                    {
                         pick_out_dir = true;
                     }
                     if ui
-                        .button("源文件目录")
+                        .add(ds::Button::ghost("源文件目录").leading(ds::Icon::Refresh))
                         .on_hover_text(
                             "把输出目录一键填成「源文件目录旁的 out 子文件夹」。\n\
                              （源文件目录＝上面「输入」那行指向的目录）",
@@ -1570,32 +1590,33 @@ impl App {
                     }
                 });
             }
-            ui.add_space(8.0);
+            ui.add_space(ds::SPACING.s3);
 
-            // 「报告」不再是一行输入框：它跟着产物走（写副本＝输出目录，
-            // 就地替换＝源目录），运行日志也落在同一处。
             ui.horizontal(|ui| {
-                cell_label(ui, L, "选项");
-                ui.checkbox(&mut self.recursive, "递归子目录");
-                ui.add_space(8.0);
+                ui.add(ds::Checkbox::with_label(&mut self.recursive, "递归子目录"));
+                ui.add_space(ds::SPACING.s4);
                 // 备份勾选只对「就地替换」有效，写副本时置灰——不给一个不影响结果的选择
-                ui.add_enabled_ui(!self.out_to_subdir, |ui| {
-                    ui.checkbox(&mut self.backup, "保留 .bak 备份").on_hover_text(
-                        "默认不留：就地替换后源目录里不会多出任何文件。\n\
-                         勾上则每个文件先留一份 .docx.bak 再改写（只首次生成，\n\
-                         重复跑不会覆盖最初那版）。写副本时源文件本来就不动，无需备份。",
-                    );
-                });
-                ui.add_space(8.0);
-                ui.label("排除");
-                ui.add_sized(
-                    [180.0, ui_scale::EDIT_H],
-                    egui::TextEdit::singleline(&mut self.exclude).hint_text("*_bak*"),
+                ui.add(
+                    ds::Checkbox::with_label(&mut self.backup, "保留 .bak 备份")
+                        .disabled(self.out_to_subdir),
+                )
+                .on_hover_text(
+                    "默认不留：就地替换后源目录里不会多出任何文件。\n\
+                     勾上则每个文件先留一份 .docx.bak 再改写（只首次生成，\n\
+                     重复跑不会覆盖最初那版）。写副本时源文件本来就不动，无需备份。",
                 );
             });
+            ui.add_space(ds::SPACING.s3);
+
+            let _ = ds::InputField::new(&mut self.exclude)
+                .label("排除")
+                .placeholder("*_bak*")
+                .helper("按文件名 glob 排除，留空 = 不排除")
+                .desired_width(240.0)
+                .show(ui);
 
             // 选路径的动作放在布局之后执行：避免在借用 self 的闭包里嵌套借用。
-            // 三个入口都走**同一个自绘面板**，靠 `PickFor` 区分结果落到哪个字段。
+            // 四个入口都走**同一个自绘面板**，靠 `PickFor` 区分结果落到哪个字段。
             if pick_in_dir {
                 self.open_picker(PickFor::InputDir);
             }
@@ -1639,31 +1660,31 @@ impl App {
             // 下行是两个开关（怎么跑），跟动作分开。
             ui.horizontal(|ui| {
                 if ui
-                    .button("＋ 添加规则")
+                    .add(ds::Button::primary("添加规则").leading(ds::Icon::Plus))
                     .on_hover_text("手工增加一条规则")
                     .clicked()
                 {
                     self.rows.push(Row::new("", "", "全部"));
                 }
-                ui.add_space(12.0);
+                ui.add_space(ds::SPACING.s3);
                 if ui
-                    .button("从文本导入…")
+                    .add(ds::Button::secondary("从文本导入").leading(ds::Icon::Upload))
                     .on_hover_text("读 .txt 规则文件，整表替换当前规则")
                     .clicked()
                 {
                     import_txt = true;
                 }
-                ui.add_space(8.0);
+                ui.add_space(ds::SPACING.s2);
                 if ui
-                    .button("从 Excel 导入…")
+                    .add(ds::Button::secondary("从 Excel 导入").leading(ds::Icon::Upload))
                     .on_hover_text("读 .xlsx 的「规则」工作表，整表替换当前规则")
                     .clicked()
                 {
                     import_xlsx = true;
                 }
-                ui.add_space(8.0);
+                ui.add_space(ds::SPACING.s2);
                 if ui
-                    .button("导出为 Excel…")
+                    .add(ds::Button::secondary("导出为 Excel").leading(ds::Icon::Download))
                     .on_hover_text("把下表导出成 .xlsx，便于存档或改完再读回来")
                     .clicked()
                 {
@@ -1676,9 +1697,7 @@ impl App {
                         // right_to_left：先放的在最右边，所以顺序是
                         // 「清空 N 条规则？ … [取消] [确认清空]」
                         if ui
-                            .add(egui::Button::new(
-                                RichText::new("确认清空").color(ERR_C).strong(),
-                            ))
+                            .add(ds::Button::danger("确认清空").leading(ds::Icon::Trash))
                             .clicked()
                         {
                             let n = self.rows.len();
@@ -1689,15 +1708,21 @@ impl App {
                             self.push_log(format!("已清空 {n} 条规则"));
                             self.toast = Some((format!("已清空 {n} 条规则"), true));
                         }
-                        if ui.button("取消").clicked() {
+                        ui.add_space(ds::SPACING.s2);
+                        if ui.add(ds::Button::secondary("取消")).clicked() {
                             self.clear_armed = false;
                         }
+                        ui.add_space(ds::SPACING.s2);
                         ui.label(
                             RichText::new(format!("清空 {} 条规则？", self.rows.len()))
                                 .color(WARN_C),
                         );
                     } else if ui
-                        .add_enabled(!self.rows.is_empty(), egui::Button::new("清空规则"))
+                        .add(
+                            ds::Button::ghost("清空规则")
+                                .leading(ds::Icon::Trash)
+                                .disabled(self.rows.is_empty()),
+                        )
                         .on_hover_text("一次清掉整张规则表（导入新表、换一批任务时用）。\n点一下只是待命，会再问一次。")
                         .clicked()
                     {
@@ -1709,21 +1734,25 @@ impl App {
 
             // 选项与按钮拉开距离：它们是"怎么跑"，不是"点什么"
             ui.horizontal(|ui| {
-                if ui.checkbox(&mut self.chain, "链式替换").changed() && self.chain {
+                let chain_resp =
+                    ui.add(ds::Checkbox::with_label(&mut self.chain, "链式替换"));
+                if chain_resp.changed() && self.chain {
                     // 链式下规则先后作用，不存在区间重叠，最长匹配优先无事可做。
                     // 命令行遇到这个组合会直接报错，界面上就别让它出现。
                     self.longest_first = false;
                 }
-                ui.add_space(20.0);
-                ui.add_enabled_ui(!self.chain, |ui| {
-                    ui.checkbox(&mut self.longest_first, "最长匹配优先").on_hover_text(
-                        "规则命中区间重叠时，只让「查找内容更长」的那条生效，\n\
-                         被挤掉的记进报告（谁让给谁、多少处）。\n\
-                         不勾则两条都不改，只报冲突——原来的行为。",
-                    );
-                });
-                ui.add_space(20.0);
-                ui.checkbox(&mut self.rename_files, "同步替换文件名");
+                ui.add_space(ds::SPACING.s5);
+                ui.add(
+                    ds::Checkbox::with_label(&mut self.longest_first, "最长匹配优先")
+                        .disabled(self.chain),
+                )
+                .on_hover_text(
+                    "规则命中区间重叠时，只让「查找内容更长」的那条生效，\n\
+                     被挤掉的记进报告（谁让给谁、多少处）。\n\
+                     不勾则两条都不改，只报冲突——原来的行为。",
+                );
+                ui.add_space(ds::SPACING.s5);
+                ui.add(ds::Checkbox::with_label(&mut self.rename_files, "同步替换文件名"));
             });
             ui.add_space(4.0);
 
@@ -1734,10 +1763,37 @@ impl App {
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        // ─── 局部补丁（第 4b 步）：这一排开关的标签要 `Small`(12px) ───
+                        //
+                        // 依据 GUIDE §Typography：`Méta / labels` 档就是 `Small`(12px)，
+                        // 且"金律"禁止同一处混两种字号。折叠头本身已是 `.small()`，
+                        // 底下这排标签也得同档，否则面板内部两档字号打架。
+                        //
+                        // 但设计系统的 `Checkbox` 把标签字号**写死 13px**
+                        // （`egui_sauge/src/components/checkbox.rs` 第 69/159 行）、
+                        // 且 `label` 只收 `&str`，装不下 `RichText::small()`。
+                        //
+                        // 按第 1 步定的 (c) 约定**不改上游本地副本**、也**不动 `ds.rs`
+                        // 的公共 API**，就地拆成两件套：
+                        //   · `ds::Checkbox::new(&mut on)`  —— 只要方框，仍是 sage 绿；
+                        //   · `egui::Label` + `RichText::small()` —— 只要 12px 标签。
+                        // 两者之间不需要手动补间距：sage 的 `item_spacing.x` 就是
+                        // `SPACING.s2`(8px)，与 DS 复选框自己的 box↔label 间距同值。
+                        // 标签挂 `Sense::click()`，点文字照样能切换（与原生复选框一致）。
                         for h in rules::XLSX_UI_HEADERS {
                             let mut on = self.xlsx_cols.is_on(h);
-                            if ui.checkbox(&mut on, RichText::new(h).small()).changed() {
+                            let hit_box = ui.add(ds::Checkbox::new(&mut on)).clicked();
+                            let hit_label = ui
+                                .add(
+                                    egui::Label::new(RichText::new(h).small())
+                                        .sense(egui::Sense::click()),
+                                )
+                                .clicked();
+                            // 方框被点时 `on` 已被它自己翻过；标签被点则手动翻一次。
+                            if hit_box {
                                 self.xlsx_cols.set(h, on);
+                            } else if hit_label {
+                                self.xlsx_cols.set(h, !on);
                             }
                         }
                     });
@@ -1750,15 +1806,15 @@ impl App {
 
             // 表头做成一条带底色的横条，跟下面的输入行分开。
             // 左右不留内边距，好让表头文字与下面输入框左边缘对齐。
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(stripe_bg(ui))
                 .inner_margin(egui::Margin {
-                    left: 0.0,
-                    right: 0.0,
-                    top: 5.0,
-                    bottom: 5.0,
+                    left: 0,
+                    right: 0,
+                    top: 5,
+                    bottom: 5,
                 })
-                .rounding(egui::Rounding::same(3.0))
+                .corner_radius(egui::CornerRadius::same(3))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         // 撑满整行：否则底色横条只包住三列文字，看着不像表头
@@ -1806,15 +1862,15 @@ impl App {
                                 } else {
                                     Color32::TRANSPARENT
                                 };
-                                egui::Frame::none()
+                                egui::Frame::NONE
                                     .fill(row_bg)
                                     .inner_margin(egui::Margin {
-                                        left: 0.0,
-                                        right: 0.0,
-                                        top: 3.0,
-                                        bottom: 3.0,
+                                        left: 0,
+                                        right: 0,
+                                        top: 3,
+                                        bottom: 3,
                                     })
-                                    .rounding(egui::Rounding::same(3.0))
+                                    .corner_radius(egui::CornerRadius::same(3))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             // 隔行底色同样撑满整行
@@ -2241,7 +2297,20 @@ impl App {
 
 /// eframe 的入口：每帧调一次 `update`，其余全交给 `render`。
 /// 这样布局代码也能在无窗口环境里被 `selftest` 直接驱动（见 `selftest`）。
+///
+/// 0.34 起 `App::ui` 成为**必需**方法（拿到的是 root `Ui`），旧的
+/// `App::update(ctx, frame)` 被标 `#[deprecated]` 但**仍会被调用**。
+/// 迁移第 1 步只升依赖、不动面板结构：`render(ctx)` 仍从 `update` 进，
+/// 所以这里留一个空的 `ui`。等第 2 步接设计系统时再决定是否把布局搬进 `ui`。
 impl eframe::App for App {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 空实现：真正的绘制仍在 `update` → `render(ctx)` 里。
+    }
+
+    // 0.34 已把 `update` 标为 deprecated（推荐改用 `ui`），但框架仍然调用它，
+    // 且我们的布局代码就是按 `&egui::Context` 写的。第 1 步刻意保留这条通路，
+    // 避免"升依赖"和"改结构"混在一次提交里 —— 所以显式压掉弃用告警。
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.render(ctx);
     }
@@ -2249,30 +2318,16 @@ impl eframe::App for App {
 
 // ─────────────────────── 小工具 ───────────────────────
 
+/// 页内分区：设计系统的 `Card`（标题走 h3、卡面带描边与阴影）。
+///
+/// 迁移前这里是 `Frame::group + 自定义蓝标题`；换成 `Card` 之后
+/// 「文件与输出 / 替换规则 / 执行结果 / 运行日志」四块一次性都变成卡片，
+/// **不用逐块改**——这也是 GUIDE §1「每个主题区块一张 `Card`」的推荐形态。
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .fill(ui.visuals().faint_bg_color)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(title)
-                    .size(ui_scale::SECTION)
-                    .strong()
-                    .color(Color32::from_rgb(0x1F, 0x4E, 0x79)),
-            );
-            ui.add_space(6.0);
-            add(ui);
-        });
-}
-
-/// 表格里的标签列（固定宽，保证每行对齐）。内容左对齐，与规则表表头一致。
-fn cell_label(ui: &mut egui::Ui, w: f32, s: &str) {
-    let _ = fixed_cell(ui, w, ui_scale::EDIT_H, RichText::new(s));
-}
-
-/// 路径输入框：固定宽高，不被父级布局压缩。
-fn path_edit(ui: &mut egui::Ui, w: f32, s: &mut String, hint: &str) {
-    let _ = ui.add_sized([w, ui_scale::EDIT_H], egui::TextEdit::singleline(s).hint_text(hint));
+    ds::Card::new().title(title).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
 }
 
 /// 表头 / 隔行的淡底色。
@@ -2340,15 +2395,6 @@ fn first_path(s: &str) -> PathBuf {
 /// 它所在目录，这样起点逻辑留在选择器一处，这里不用重复判断。
 fn doc_start(docs: &[String]) -> PathBuf {
     docs.first().map(PathBuf::from).unwrap_or_default()
-}
-
-/// 明/暗主题。
-fn visuals_of(light: bool) -> egui::Visuals {
-    if light {
-        egui::Visuals::light()
-    } else {
-        egui::Visuals::dark()
-    }
 }
 
 pub fn verdict_text(res: &RunResult, dry: bool) -> String {
@@ -2572,14 +2618,9 @@ fn short_sha(s: &str) -> String {
 /// 路径提示和 `.small()` 按钮在用的字号（本仓库 11 处），9 点几乎要凑近看。
 /// 这里整体比默认放大 15%~30%。**只动数值，不动布局结构。**
 pub mod ui_scale {
-    /// 窗口标题「wrepl」。
-    pub const TITLE: f32 = 24.0;
-    /// 分区标题（「替换规则」「输出」…）。
-    pub const SECTION: f32 = 17.0;
-    /// 正文：输入框、列表、普通标签。
-    pub const BODY: f32 = 16.0;
-    /// 按钮（含「执行替换」）。
-    pub const BUTTON: f32 = 16.0;
+    // 注：原 `SECTION`(17) / `BODY`(16) / `BUTTON`(16) 三个常量随第 2、3 步迁移
+    // 到设计系统后已无引用 —— 分区标题、正文、按钮字号都改由 egui_sauge 的
+    // 九档字号层级（h3 / body / button）与 `ds::Button` 自己管，删掉以免留死代码。
     /// 日志与等宽文本。
     pub const LOG: f32 = 14.0;
     /// 辅助小字：表头、计数、提示、`.small()` 按钮。**egui 默认 9.0，太小了。**
@@ -2601,114 +2642,6 @@ pub mod ui_scale {
     pub const NAV_BTN: f32 = 26.0;
 }
 
-/// 运行时加载系统中文字体（不打包字体，避免授权与体积问题），并设定界面字号与间距。
-///
-/// 字号一律取自 [`ui_scale`]；字体只做**插入**、不替换 egui 自带字体 ——
-/// egui 的字体表里还留着 Latin/emoji/符号（`✓`、`→`、`×` 之外的箭头等），
-/// 把整个 `Proportional` 家族换掉会让这些字形变成豆腐块。
-///
-/// 优先微软雅黑 `msyh.ttc`——它是字体集合（`.ttc`），
-/// `epaint` 会把 `FontData::index` 透传给 `ab_glyph::FontRef::try_from_slice_and_index`，
-/// 所以索引 0 取第一张字面即可。找不到就退到黑体 / 宋体。
-pub fn install_fonts(ctx: &egui::Context) {
-    // 候选字体：**按"更现代"排，前面的优先**。
-    //
-    // 只读系统已装的字体、**不打包进产物** —— 零体积增长、无字体授权问题，
-    // 也解释了为什么产物一直是 6~7 MB（对比：嵌一个中文字体要 +5~10 MB）。
-    //
-    // 前 8 项是更现代的中文无衬线（小米 MiSans / 华为 HarmonyOS Sans / 思源黑体 /
-    // Noto Sans SC / 阿里普惠体 / OPPO Sans）。**本机一个都没装**，所以行为与以前
-    // 完全一致；哪天装了，重启程序就自动用上，不用改代码。
-    // 后面五项是 Windows 保底，尤其 `msyh.ttc`（微软雅黑）—— 简体中文系统的标配，
-    // 字形覆盖最全，作为兜底最稳。
-    //
-    // 注意 `.ttc` 是字体集合，靠 `FontData::index` 选第几张字面（见下方注释）。
-    const CANDIDATES: &[(&str, u32)] = &[
-        // ── 更现代的中文黑体（装了才生效，都是免费商用授权）──
-        ("C:/Windows/Fonts/MiSans-Regular.ttf", 0),
-        ("C:/Windows/Fonts/MiSans-Regular.otf", 0),
-        ("C:/Windows/Fonts/HarmonyOS_Sans_SC_Regular.ttf", 0),
-        ("C:/Windows/Fonts/SourceHanSansSC-Regular.otf", 0),
-        ("C:/Windows/Fonts/SourceHanSansCN-Regular.otf", 0),
-        ("C:/Windows/Fonts/NotoSansSC-Regular.otf", 0),
-        ("C:/Windows/Fonts/AlibabaPuHuiTi-3-55-Regular.ttf", 0),
-        ("C:/Windows/Fonts/OPPOSans-R.ttf", 0),
-        // ── Windows 保底 ──
-        ("C:/Windows/Fonts/msyh.ttc", 0),
-        ("C:/Windows/Fonts/msyhbd.ttc", 0),
-        ("C:/Windows/Fonts/simhei.ttf", 0),
-        ("C:/Windows/Fonts/simsun.ttc", 0),
-        ("C:/Windows/Fonts/Deng.ttf", 0),
-    ];
-
-    let mut fonts = egui::FontDefinitions::default();
-    let mut used = String::from("(系统默认)");
-    for (path, idx) in CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let mut fd = egui::FontData::from_owned(bytes);
-        fd.index = *idx;
-        fonts.font_data.insert("cjk".to_owned(), fd);
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "cjk".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("cjk".to_owned());
-        used = (*path).to_string();
-        break;
-    }
-    ctx.set_fonts(fonts);
-
-    let mut style = (*ctx.style()).clone();
-    // 五个内置字号**全部**显式给值，不留 egui 默认 —— 取值理由见 `ui_scale`。
-    //   · 不给 `Small` 会漏掉表头/计数/提示/`.small()` 按钮这 11 处；
-    //   · 不给 `Heading` 则将来谁写一句 `.heading()` 又会掉回默认的 18.0。
-    for (which, size, family) in [
-        (
-            egui::TextStyle::Small,
-            ui_scale::SMALL,
-            egui::FontFamily::Proportional,
-        ),
-        (
-            egui::TextStyle::Body,
-            ui_scale::BODY,
-            egui::FontFamily::Proportional,
-        ),
-        (
-            egui::TextStyle::Button,
-            ui_scale::BUTTON,
-            egui::FontFamily::Proportional,
-        ),
-        (
-            egui::TextStyle::Heading,
-            ui_scale::SECTION,
-            egui::FontFamily::Proportional,
-        ),
-        (
-            egui::TextStyle::Monospace,
-            ui_scale::LOG,
-            egui::FontFamily::Monospace,
-        ),
-    ] {
-        style.text_styles.insert(which, egui::FontId::new(size, family));
-    }
-    // 间距跟着字号一起放宽。只放大字号而不动间距，界面会比原来**更挤**：
-    // 字与字的留白是按 egui 默认的小字号配的（item_spacing.y 只有 3.0）。
-    style.spacing.item_spacing = egui::vec2(9.0, 5.0);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    // 按钮/复选框等的默认最小高度（egui 默认 18.0），要容纳 `BUTTON` 号字 + 上下内边距。
-    style.spacing.interact_size = egui::vec2(44.0, 24.0);
-    ctx.set_style(style);
-    // 把实际选中的字体写进日志 —— 以后有人问"为什么看着不一样"，
-    // 这一行能直接回答（而不是靠猜他机器上装了什么）。
-    crate::diag::log(format!("界面字体：{used}"));
-}
 
 // ─────────────────────── 无窗口自检 ───────────────────────
 
@@ -2732,8 +2665,11 @@ pub fn selftest(args: &[String]) -> i32 {
 
     // 1) 字体
     let ctx = egui::Context::default();
-    install_fonts(&ctx);
-    println!("  字体加载完成");
+    // 走**和开窗同一条路**：设计系统字体表 + 主题。少了 `ds::apply`，
+    // 无头这几帧就是在用 egui 默认样式画，等于没在验真实外观。
+    ds::install(&ctx);
+    ds::apply(&ctx, true);
+    println!("  设计系统 + 字体加载完成");
 
     // 2) 构造界面状态——与 `--preset` 开窗**同一条路**，避免自检测的是另一套代码
     let mut app = App::with_preset(&preset);
@@ -2765,7 +2701,7 @@ pub fn selftest(args: &[String]) -> i32 {
         egui::vec2(1280.0, 800.0),
     ));
     for _ in 0..3 {
-        let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
     }
     println!("  布局 3 帧通过（无 panic）");
 
@@ -2807,7 +2743,7 @@ pub fn selftest(args: &[String]) -> i32 {
         .join("\n");
     app.clear_armed = true;
     for _ in 0..2 {
-        let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
     }
     app.clear_armed = false;
     app.input = keep_input;
@@ -2817,10 +2753,10 @@ pub fn selftest(args: &[String]) -> i32 {
     //      它是跟着「输出到子文件夹」启停的，普通一趟渲染只能照到其中一态。
     let keep_out = app.out_to_subdir;
     app.out_to_subdir = false;
-    let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
     app.out_to_subdir = true;
     app.mirror = true;
-    let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
     app.mirror = false;
     app.out_to_subdir = keep_out;
     println!("  「完整镜像」可用 / 置灰两态：布局通过");
@@ -2846,7 +2782,7 @@ pub fn selftest(args: &[String]) -> i32 {
             .map(|i| format!("D:/wrepl-selftest/P{i}.docx"))
             .collect();
         for _ in 0..2 {
-            let _ = ctx.run(raw.clone(), |ctx| app.render(ctx));
+            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
         }
     }
     app.page = keep_page;

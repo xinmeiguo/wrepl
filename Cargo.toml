@@ -1,6 +1,6 @@
 [package]
 name = "wrepl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # 用 build.rs 把主线程栈预留**钉死在 1 MB** —— 见 build.rs 文件头。
 #
@@ -14,7 +14,13 @@ build = "build.rs"
 [features]
 # 图形界面。**默认不编**——CLI 构建完全不拉 eframe/winit/glow，
 # 保持命令行工具的编译速度和零 GUI 依赖。
-gui = ["dep:eframe", "dep:rfd", "dep:windows"]
+gui = [
+    "dep:eframe",
+    "dep:rfd",
+    "dep:windows",
+    "dep:egui_sauge",
+    "dep:egui-phosphor",
+]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -27,12 +33,33 @@ walkdir = "2.5.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # 仅 GUI 需要。glow 后端（OpenGL）而非 wgpu —— 依赖树更小、离线可编。
-eframe = { version = "0.29.1", default-features = false, features = [
+#
+# 0.34 起：`App::ui(&mut self, ui, frame)` 成为必需方法（旧的 `update(ctx, frame)`
+# 被标记 deprecated 但**仍会被调用**）。迁移第 1 步只补一个空的 `ui`，面板结构不动。
+#
+# 版本跨到 0.34 的动机：接入 egui_sauge 设计系统（其 v2.0.0 锁 egui/eframe 0.34.1）。
+eframe = { version = "0.34", default-features = false, features = [
     "default_fonts",
     "glow",
 ], optional = true }
 # 原生「选择目录 / 选择文件」对话框
 rfd = { version = "0.15.4", optional = true }
+
+# ── 设计系统（迁移第 2 步接入）───────────────────────────────────────────
+#
+# 用 **path 依赖**而不是 `git = ...`：本机 git 通道被封（只放行
+# api.github.com / raw / codeload / crates.io），`git ls-remote github.com`
+# 直接 502。源码已按 tag v2.0.0 落在 `../egui_sauge`（与 wrepl 同级）。
+# 上游 74 个 warning 暂不处理（用户 2026-10-11 决定：先接受，将来同步上游时一起弄）。
+#
+# ⚠ 它锁 `egui 0.34.1`，与上面 eframe 0.34 一致 —— 版本再往上错开就会
+#   出现"两套 egui 类型不通用"的编译错误。
+egui_sauge = { path = "../egui_sauge", optional = true }
+
+# 直接依赖（egui_sauge 未重导出它）：中文字体要拼进
+# 「egui 默认 + Phosphor」的字体表里，得自己拿到 Phosphor 的字体数据。
+# 版本必须与 egui_sauge 内部一致（0.12），否则字体表里会出现两个 phosphor。
+egui-phosphor = { version = "0.12", optional = true }
 
 # Word COM —— 页眉替换（文本/图片）与批量打印走这条路。
 # 晚期绑定（ProgID + IDispatch），不依赖类型库、不挑 Office 版本。
