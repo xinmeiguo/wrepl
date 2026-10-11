@@ -44,18 +44,40 @@ jobs:
       # `../egui_sauge` 落空，cargo 直接报：
       #   error: no matching package named `egui_sauge` found
       #   location searched: D:\a\wrepl\egui_sauge
-      # （v0.4.0 的首次发版就是这么挂在「编译」这一步的；v0.3.0 没有这个依赖，所以没暴露。）
+      # （v0.4.0 首次发版 run #18 就是挂在「编译」这一步的；
+      #  v0.3.0 没有这个依赖，所以此前一直没暴露。）
       #
-      # 修法 = 在 CI 里把同一份源码补到 cargo 要搜的那个位置。
-      # `path` 是相对 $GITHUB_WORKSPACE 解析的，所以 `../egui_sauge` 正好落到
-      # `D:\a\wrepl\egui_sauge`（= 上面报错里 searched 的路径）。
-      # ref 与本地解压用的 tag 保持一致，且是公开仓库，无需凭据。
-      - name: 取设计系统源码（供 path 依赖 ../egui_sauge 使用）
+      # ★ 不能直接给 checkout 写 `path: ../egui_sauge` —— actions/checkout 会拒绝
+      #   落在 workspace 之外的路径（实测 run #19）：
+      #     ##[error]Repository path 'D:\a\wrepl\egui_sauge' is not under 'D:\a\wrepl\wrepl'
+      #   所以分两步：先 checkout 进 workspace 内的 _deps/，再建一个**目录联接**把
+      #   `../egui_sauge` 指过去。Windows 的 junction 不需要管理员权限，
+      #   cargo 走的仍是原样的 `../egui_sauge`，Cargo.toml / Cargo.lock 一个字不动。
+      # ref 与本地解压用的 tag 保持一致，且是公开仓库，无需额外凭据。
+      - name: 取设计系统源码（先落在 workspace 内）
         uses: actions/checkout@v4
         with:
           repository: macnjil4/egui_sauge
           ref: v2.0.0
-          path: ../egui_sauge
+          path: _deps/egui_sauge
+
+      - name: 建 ../egui_sauge 联接（cargo 的 path 依赖要求同级）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parent = Split-Path $env:GITHUB_WORKSPACE -Parent
+          $link   = Join-Path $parent 'egui_sauge'
+          $target = Join-Path $env:GITHUB_WORKSPACE '_deps\egui_sauge'
+          if (Test-Path $link) { Remove-Item $link -Recurse -Force }
+          New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+          $j = Get-Item $link
+          Write-Host "junction  : $($j.FullName)"
+          Write-Host "  -> target: $($j.Target)"
+          # 兜底：必须能透过联接看到 Cargo.toml，否则后面白编
+          if (-not (Test-Path (Join-Path $link 'Cargo.toml'))) {
+            throw "联接里看不到 Cargo.toml —— ../egui_sauge 没接上"
+          }
+          Write-Host "OK: $(Join-Path $link 'Cargo.toml') 可见"
 
       - name: 装 Rust 工具链
         # edition 2024 需要 Rust >= 1.85，stable 就是当前最新稳定版。
