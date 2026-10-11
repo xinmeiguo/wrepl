@@ -32,6 +32,31 @@ jobs:
       - name: 取源码
         uses: actions/checkout@v4
 
+      # ★★ 设计系统源码（2026-10-11 加）—— 必须与 wrepl **同级**，见 Cargo.toml：
+      #       egui_sauge = { path = "../egui_sauge", optional = true }
+      #
+      # 为什么是 path 依赖而不是 git 依赖：**开发机上 git 通道被封**
+      #（代理只放行 api.github.com / raw / codeload / crates.io，
+      #  `git ls-remote github.com` / `git-receive-pack` 一律 502），
+      # 所以本地是把 v2.0.0 的源码解到 `../egui_sauge` 再用 path 引的。
+      #
+      # 但 path 依赖**不可移植** —— CI 只 checkout 了 wrepl 一个仓库，
+      # `../egui_sauge` 落空，cargo 直接报：
+      #   error: no matching package named `egui_sauge` found
+      #   location searched: D:\a\wrepl\egui_sauge
+      # （v0.4.0 的首次发版就是这么挂在「编译」这一步的；v0.3.0 没有这个依赖，所以没暴露。）
+      #
+      # 修法 = 在 CI 里把同一份源码补到 cargo 要搜的那个位置。
+      # `path` 是相对 $GITHUB_WORKSPACE 解析的，所以 `../egui_sauge` 正好落到
+      # `D:\a\wrepl\egui_sauge`（= 上面报错里 searched 的路径）。
+      # ref 与本地解压用的 tag 保持一致，且是公开仓库，无需凭据。
+      - name: 取设计系统源码（供 path 依赖 ../egui_sauge 使用）
+        uses: actions/checkout@v4
+        with:
+          repository: macnjil4/egui_sauge
+          ref: v2.0.0
+          path: ../egui_sauge
+
       - name: 装 Rust 工具链
         # edition 2024 需要 Rust >= 1.85，stable 就是当前最新稳定版。
         # 本机的 rust-toolchain.toml（锁 Windows GNU）故意没进仓库，不会干扰这里。
