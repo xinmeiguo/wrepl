@@ -53,12 +53,28 @@ jobs:
       #   所以分两步：先 checkout 进 workspace 内的 _deps/，再建一个**目录联接**把
       #   `../egui_sauge` 指过去。Windows 的 junction 不需要管理员权限，
       #   cargo 走的仍是原样的 `../egui_sauge`，Cargo.toml / Cargo.lock 一个字不动。
-      # ref 与本地解压用的 tag 保持一致，且是公开仓库，无需额外凭据。
+      #
+      # ★★ 2026-10-12：仓库从 `macnjil4/egui_sauge@v2.0.0` 换成自家 fork
+      #   `xinmeiguo/egui_sauge`，并钉到**提交 SHA**而不是 tag。
+      #   理由（详见 docs/ROADMAP.md §6）：
+      #     1. 上游是个人项目（3 star、crates.io 总下载 57、半年零提交），
+      #        一旦改名/删库/转私有，这条流水线当场断链。
+      #     2. fork 已修掉 74 条 `float_literal_f32_fallback`
+      #        （rust-lang/rust#154024 正在删那条 fallback）。上游没修，
+      #        用上游源码编，CI 日志里会一直挂这 74 条。
+      #     3. 钉 SHA 而非 tag：任何人都无法在无代码改动的情况下改变发版产物。
+      #        需要更新时改这一行即可（更新步骤见 CONTRIBUTING.md §1.2）。
+      #   fork 与上游 v2.0.0 的唯一差异就是那 74 处 `_f32` 后缀，
+      #   已用 `rustc --emit=llvm-ir` 实测编译结果逐字节相同。
+      #   对上游的修复已提 PR：https://github.com/macnjil4/egui_sauge/pull/1
+      #   仓库是公开的，无需额外凭据。
       - name: 取设计系统源码（先落在 workspace 内）
         uses: actions/checkout@v4
         with:
-          repository: macnjil4/egui_sauge
-          ref: v2.0.0
+          repository: xinmeiguo/egui_sauge
+          # = 上游 v2.0.0 + 74 处显式 _f32 后缀。
+          # tag `wrepl-base-2026-10-12` 指向同一提交，tag 可被移动，故此处用 SHA。
+          ref: 095ae21e6e2357d4d392b1b33de98a7032af9212
           path: _deps/egui_sauge
 
       - name: 建 ../egui_sauge 联接（cargo 的 path 依赖要求同级）

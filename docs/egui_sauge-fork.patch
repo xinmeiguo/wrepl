@@ -1,0 +1,711 @@
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/accordion.rs egui_sauge/src/components/accordion.rs
+--- a/src/components/accordion.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/accordion.rs	2026-10-12 12:37:11.255307800 +0800
+@@ -59,7 +59,7 @@
+         let palette = palette_of(ui.ctx());
+         let frame = egui::Frame::default()
+             .fill(palette.bg_surface)
+-            .stroke(Stroke::new(1.0, palette.border_subtle))
++            .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::symmetric(SPACING.s3 as i8, SPACING.s2 as i8));
+         // We can't easily pierce CollapsingHeader's icon, so we just style
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/activity_bar.rs egui_sauge/src/components/activity_bar.rs
+--- a/src/components/activity_bar.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/activity_bar.rs	2026-10-12 12:37:10.974120300 +0800
+@@ -124,7 +124,7 @@
+                             egui::pos2(ui.min_rect().left() + 8.0, y),
+                             egui::pos2(ui.min_rect().right() - 8.0, y),
+                         ],
+-                        Stroke::new(1.0, palette.border_subtle),
++                        Stroke::new(1.0_f32, palette.border_subtle),
+                     );
+                 });
+             }
+@@ -201,7 +201,7 @@
+         ui.painter().rect_stroke(
+             rect.expand(1.0),
+             corner(RADIUS.sm),
+-            Stroke::new(2.0, palette.focus_ring),
++            Stroke::new(2.0_f32, palette.focus_ring),
+             StrokeKind::Outside,
+         );
+     }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/alert.rs egui_sauge/src/components/alert.rs
+--- a/src/components/alert.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/alert.rs	2026-10-12 12:37:11.275671300 +0800
+@@ -79,7 +79,7 @@
+ 
+         egui::Frame::default()
+             .fill(fill)
+-            .stroke(Stroke::new(1.0, border))
++            .stroke(Stroke::new(1.0_f32, border))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::same(SPACING.s3 as i8))
+             .show(ui, |ui| {
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/avatar.rs egui_sauge/src/components/avatar.rs
+--- a/src/components/avatar.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/avatar.rs	2026-10-12 12:37:11.299401400 +0800
+@@ -167,7 +167,7 @@
+                 ui.painter().circle_stroke(
+                     center,
+                     radius,
+-                    Stroke::new(1.0, alpha(palette.text_primary, 0.04)),
++                    Stroke::new(1.0_f32, alpha(palette.text_primary, 0.04)),
+                 );
+             }
+         }
+@@ -176,7 +176,7 @@
+         ui.painter().circle_stroke(
+             center,
+             radius,
+-            Stroke::new(1.0, alpha(palette.text_primary, 0.08)),
++            Stroke::new(1.0_f32, alpha(palette.text_primary, 0.08)),
+         );
+ 
+         // Status dot.
+@@ -268,7 +268,7 @@
+             ui.painter()
+                 .circle_filled(center, d / 2.0, palette.bg_surface_alt);
+             ui.painter()
+-                .circle_stroke(center, d / 2.0, Stroke::new(1.0, palette.border_default));
++                .circle_stroke(center, d / 2.0, Stroke::new(1.0_f32, palette.border_default));
+             ui.painter().text(
+                 center,
+                 egui::Align2::CENTER_CENTER,
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/button.rs egui_sauge/src/components/button.rs
+--- a/src/components/button.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/button.rs	2026-10-12 12:37:11.265197800 +0800
+@@ -171,8 +171,8 @@
+ 
+         let (fill, stroke_color) = colors(&palette, self.variant, &response, self.disabled);
+         let stroke = match self.variant {
+-            ButtonVariant::Secondary => Stroke::new(1.0, stroke_color),
+-            ButtonVariant::Ghost if response.hovered() => Stroke::new(1.0, stroke_color),
++            ButtonVariant::Secondary => Stroke::new(1.0_f32, stroke_color),
++            ButtonVariant::Ghost if response.hovered() => Stroke::new(1.0_f32, stroke_color),
+             _ => Stroke::NONE,
+         };
+ 
+@@ -185,7 +185,7 @@
+             ui.painter().rect_stroke(
+                 ring,
+                 corner(RADIUS.md + 2.0),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+@@ -283,8 +283,8 @@
+ 
+         let (fill, stroke_color) = colors(&palette, self.variant, &response, self.disabled);
+         let stroke = match self.variant {
+-            ButtonVariant::Secondary => Stroke::new(1.0, stroke_color),
+-            ButtonVariant::Ghost if response.hovered() => Stroke::new(1.0, stroke_color),
++            ButtonVariant::Secondary => Stroke::new(1.0_f32, stroke_color),
++            ButtonVariant::Ghost if response.hovered() => Stroke::new(1.0_f32, stroke_color),
+             _ => Stroke::NONE,
+         };
+         ui.painter()
+@@ -295,7 +295,7 @@
+             ui.painter().rect_stroke(
+                 ring,
+                 corner(RADIUS.md + 2.0),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/card.rs egui_sauge/src/components/card.rs
+--- a/src/components/card.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/card.rs	2026-10-12 12:37:11.120993100 +0800
+@@ -49,7 +49,7 @@
+         let palette = palette_of(ui.ctx());
+         let frame = egui::Frame::default()
+             .fill(palette.bg_surface)
+-            .stroke(Stroke::new(1.0, palette.border_subtle))
++            .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::same(SPACING.s4 as i8))
+             .shadow(self.elevation.shadow(palette.dark_mode));
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/checkbox.rs egui_sauge/src/components/checkbox.rs
+--- a/src/components/checkbox.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/checkbox.rs	2026-10-12 12:37:11.143309700 +0800
+@@ -117,7 +117,7 @@
+             box_rect,
+             corner(RADIUS.sm),
+             fill,
+-            Stroke::new(1.5, stroke_color),
++            Stroke::new(1.5_f32, stroke_color),
+             StrokeKind::Inside,
+         );
+ 
+@@ -139,7 +139,7 @@
+             ui.painter().rect_stroke(
+                 box_rect.expand(2.0),
+                 corner(RADIUS.sm + 2.0),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/command.rs egui_sauge/src/components/command.rs
+--- a/src/components/command.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/command.rs	2026-10-12 12:37:11.131979600 +0800
+@@ -190,7 +190,7 @@
+ 
+         let frame = egui::Frame::default()
+             .fill(palette.bg_surface)
+-            .stroke(Stroke::new(1.0, palette.border_default))
++            .stroke(Stroke::new(1.0_f32, palette.border_default))
+             .corner_radius(corner(RADIUS.lg))
+             .inner_margin(egui::Margin::same(0))
+             .shadow(Elevation::Modal.shadow(palette.dark_mode));
+@@ -243,7 +243,7 @@
+                         egui::pos2(search_rect.left(), search_rect.bottom()),
+                         egui::pos2(search_rect.right(), search_rect.bottom()),
+                     ],
+-                    Stroke::new(1.0, palette.border_subtle),
++                    Stroke::new(1.0_f32, palette.border_subtle),
+                 );
+ 
+                 // Results.
+@@ -303,7 +303,7 @@
+                             r,
+                             corner(RADIUS.sm),
+                             palette.bg_surface_alt,
+-                            Stroke::new(1.0, palette.border_subtle),
++                            Stroke::new(1.0_f32, palette.border_subtle),
+                             StrokeKind::Inside,
+                         );
+                         ui.painter().galley(
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/dialog.rs egui_sauge/src/components/dialog.rs
+--- a/src/components/dialog.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/dialog.rs	2026-10-12 12:37:11.154786300 +0800
+@@ -83,7 +83,7 @@
+             .frame(
+                 egui::Frame::default()
+                     .fill(palette.bg_surface)
+-                    .stroke(Stroke::new(1.0, palette.border_default))
++                    .stroke(Stroke::new(1.0_f32, palette.border_default))
+                     .corner_radius(corner(RADIUS.lg))
+                     .inner_margin(egui::Margin::same(SPACING.s4 as i8))
+                     .shadow(Elevation::Modal.shadow(palette.dark_mode)),
+@@ -126,7 +126,7 @@
+                         egui::pos2(ui.min_rect().left(), sep_y),
+                         egui::pos2(ui.min_rect().right(), sep_y),
+                     ],
+-                    Stroke::new(1.0, palette.border_subtle),
++                    Stroke::new(1.0_f32, palette.border_subtle),
+                 );
+                 ui.add_space(SPACING.s3);
+ 
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/diff.rs egui_sauge/src/components/diff.rs
+--- a/src/components/diff.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/diff.rs	2026-10-12 12:37:11.187343400 +0800
+@@ -121,7 +121,7 @@
+ 
+         egui::Frame::default()
+             .fill(palette.bg_surface)
+-            .stroke(Stroke::new(1.0, palette.border_subtle))
++            .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::same(0))
+             .show(ui, |ui| {
+@@ -143,7 +143,7 @@
+                             egui::pos2(header_rect.left(), header_rect.bottom()),
+                             egui::pos2(header_rect.right(), header_rect.bottom()),
+                         ],
+-                        Stroke::new(1.0, palette.border_subtle),
++                        Stroke::new(1.0_f32, palette.border_subtle),
+                     );
+                 }
+ 
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/drawer.rs egui_sauge/src/components/drawer.rs
+--- a/src/components/drawer.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/drawer.rs	2026-10-12 12:37:11.097101300 +0800
+@@ -65,7 +65,7 @@
+             .frame(
+                 egui::Frame::default()
+                     .fill(palette.bg_surface)
+-                    .stroke(Stroke::new(1.0, palette.border_default))
++                    .stroke(Stroke::new(1.0_f32, palette.border_default))
+                     .inner_margin(egui::Margin::same(SPACING.s4 as i8))
+                     .shadow(Elevation::Popover.shadow(palette.dark_mode)),
+             )
+@@ -108,7 +108,7 @@
+                         egui::pos2(ui.min_rect().left(), sep_y),
+                         egui::pos2(ui.min_rect().right(), sep_y),
+                     ],
+-                    Stroke::new(1.0, palette.border_subtle),
++                    Stroke::new(1.0_f32, palette.border_subtle),
+                 );
+                 ui.add_space(SPACING.s3);
+ 
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/editor_tabs.rs egui_sauge/src/components/editor_tabs.rs
+--- a/src/components/editor_tabs.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/editor_tabs.rs	2026-10-12 12:37:10.962733900 +0800
+@@ -130,7 +130,7 @@
+                     egui::pos2(r.left(), r.bottom() - 0.5),
+                     egui::pos2(r.right(), r.bottom() - 0.5),
+                 ],
+-                Stroke::new(1.0, palette.border_default),
++                Stroke::new(1.0_f32, palette.border_default),
+             );
+         });
+         action
+@@ -179,7 +179,7 @@
+             egui::pos2(rect.right() - 0.5, rect.top() + 6.0),
+             egui::pos2(rect.right() - 0.5, rect.bottom() - 6.0),
+         ],
+-        Stroke::new(1.0, palette.border_subtle),
++        Stroke::new(1.0_f32, palette.border_subtle),
+     );
+ 
+     let mut x = rect.left() + pad;
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/feedback.rs egui_sauge/src/components/feedback.rs
+--- a/src/components/feedback.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/feedback.rs	2026-10-12 12:37:11.037870700 +0800
+@@ -149,7 +149,7 @@
+                 rect,
+                 corner(RADIUS.full),
+                 palette.bg_surface_alt,
+-                Stroke::new(1.0, palette.border_subtle),
++                Stroke::new(1.0_f32, palette.border_subtle),
+                 StrokeKind::Inside,
+             );
+             let fill_w = rect.width() * self.value;
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/gauge.rs egui_sauge/src/components/gauge.rs
+--- a/src/components/gauge.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/gauge.rs	2026-10-12 12:37:10.982916100 +0800
+@@ -223,7 +223,7 @@
+         track,
+         corner(RADIUS.full),
+         p.bg_surface_alt,
+-        Stroke::new(1.0, p.border_subtle),
++        Stroke::new(1.0_f32, p.border_subtle),
+         StrokeKind::Inside,
+     );
+     let fill_w = width * g.value;
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/header.rs egui_sauge/src/components/header.rs
+--- a/src/components/header.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/header.rs	2026-10-12 12:37:11.163817500 +0800
+@@ -69,7 +69,7 @@
+                 egui::pos2(ui.min_rect().left(), y),
+                 egui::pos2(ui.min_rect().right(), y),
+             ],
+-            Stroke::new(1.0, palette.border_subtle),
++            Stroke::new(1.0_f32, palette.border_subtle),
+         );
+         ui.add_space(SPACING.s3);
+ 
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/input.rs egui_sauge/src/components/input.rs
+--- a/src/components/input.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/input.rs	2026-10-12 12:37:10.996551800 +0800
+@@ -119,7 +119,7 @@
+                     outer,
+                     corner(RADIUS.md),
+                     palette.bg_surface,
+-                    Stroke::new(1.0, border_color),
++                    Stroke::new(1.0_f32, border_color),
+                     StrokeKind::Inside,
+                 );
+ 
+@@ -169,7 +169,7 @@
+                     ui.painter().rect_stroke(
+                         ring,
+                         corner(RADIUS.md),
+-                        Stroke::new(2.0, palette.focus_ring),
++                        Stroke::new(2.0_f32, palette.focus_ring),
+                         StrokeKind::Outside,
+                     );
+                 }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/menu.rs egui_sauge/src/components/menu.rs
+--- a/src/components/menu.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/menu.rs	2026-10-12 12:37:11.311119000 +0800
+@@ -113,7 +113,7 @@
+             ui.painter().rect_stroke(
+                 rect.expand(1.0),
+                 corner(RADIUS.sm),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+@@ -234,7 +234,7 @@
+             ui.painter().rect_stroke(
+                 rect.expand(1.0),
+                 corner(RADIUS.sm),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/nav.rs egui_sauge/src/components/nav.rs
+--- a/src/components/nav.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/nav.rs	2026-10-12 12:37:11.049674100 +0800
+@@ -147,7 +147,7 @@
+             ui.painter().rect_stroke(
+                 rect.expand(2.0),
+                 corner(RADIUS.md),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+@@ -256,7 +256,7 @@
+                 egui::pos2(r.left(), r.bottom() - 1.0),
+                 egui::pos2(r.right(), r.bottom() - 1.0),
+             ],
+-            Stroke::new(1.0, palette.border_subtle),
++            Stroke::new(1.0_f32, palette.border_subtle),
+         );
+ 
+         changed
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/number.rs egui_sauge/src/components/number.rs
+--- a/src/components/number.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/number.rs	2026-10-12 12:37:11.321967400 +0800
+@@ -126,7 +126,7 @@
+                     outer,
+                     corner(RADIUS.md),
+                     palette.bg_surface,
+-                    Stroke::new(1.0, border_color),
++                    Stroke::new(1.0_f32, border_color),
+                     StrokeKind::Inside,
+                 );
+ 
+@@ -168,7 +168,7 @@
+                         egui::pos2(outer.right() - stepper_w, outer.top() + 4.0),
+                         egui::pos2(outer.right() - stepper_w, outer.bottom() - 4.0),
+                     ],
+-                    Stroke::new(1.0, palette.border_subtle),
++                    Stroke::new(1.0_f32, palette.border_subtle),
+                 );
+ 
+                 // Suffix.
+@@ -215,7 +215,7 @@
+                     ui.painter().rect_stroke(
+                         outer.expand(1.0),
+                         corner(RADIUS.md),
+-                        Stroke::new(2.0, palette.focus_ring),
++                        Stroke::new(2.0_f32, palette.focus_ring),
+                         StrokeKind::Outside,
+                     );
+                 }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/pagination.rs egui_sauge/src/components/pagination.rs
+--- a/src/components/pagination.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/pagination.rs	2026-10-12 12:37:11.027036700 +0800
+@@ -126,7 +126,7 @@
+         rect,
+         corner(RADIUS.sm),
+         bg,
+-        Stroke::new(1.0, palette.border_default),
++        Stroke::new(1.0_f32, palette.border_default),
+         StrokeKind::Inside,
+     );
+     let color = if disabled {
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/radio.rs egui_sauge/src/components/radio.rs
+--- a/src/components/radio.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/radio.rs	2026-10-12 12:37:11.059982100 +0800
+@@ -218,7 +218,7 @@
+         stroke_color
+     };
+     ui.painter()
+-        .circle_stroke(center, dot_size / 2.0, Stroke::new(1.5, stroke_color));
++        .circle_stroke(center, dot_size / 2.0, Stroke::new(1.5_f32, stroke_color));
+     if is_selected {
+         let inner = if error {
+             palette.error
+@@ -238,7 +238,7 @@
+         ui.painter().rect_stroke(
+             egui::Rect::from_center_size(center, egui::Vec2::splat(dot_size + 4.0)),
+             corner(RADIUS.full),
+-            Stroke::new(2.0, palette.focus_ring),
++            Stroke::new(2.0_f32, palette.focus_ring),
+             StrokeKind::Outside,
+         );
+     }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/section.rs egui_sauge/src/components/section.rs
+--- a/src/components/section.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/section.rs	2026-10-12 12:37:11.200458800 +0800
+@@ -77,7 +77,7 @@
+         let palette = palette_of(ui.ctx());
+         egui::Frame::default()
+             .fill(palette.bg_surface_alt)
+-            .stroke(Stroke::new(1.0, palette.border_subtle))
++            .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::same(0))
+             .show(ui, |ui| {
+@@ -99,7 +99,7 @@
+                             egui::pos2(header_rect.left(), header_rect.bottom()),
+                             egui::pos2(header_rect.right(), header_rect.bottom()),
+                         ],
+-                        Stroke::new(1.0, palette.border_subtle),
++                        Stroke::new(1.0_f32, palette.border_subtle),
+                     );
+                 }
+                 let inner = |ui: &mut Ui| {
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/sparkline.rs egui_sauge/src/components/sparkline.rs
+--- a/src/components/sparkline.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/sparkline.rs	2026-10-12 12:37:11.333219700 +0800
+@@ -142,7 +142,7 @@
+                     ));
+                 }
+                 ui.painter()
+-                    .add(egui::Shape::line(pts.clone(), Stroke::new(1.5, color)));
++                    .add(egui::Shape::line(pts.clone(), Stroke::new(1.5_f32, color)));
+                 if self.show_last
+                     && let Some(last) = pts.last()
+                 {
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/splitter.rs egui_sauge/src/components/splitter.rs
+--- a/src/components/splitter.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/splitter.rs	2026-10-12 12:37:11.232959800 +0800
+@@ -78,7 +78,7 @@
+         let palette = palette_of(ui.ctx());
+         let frame = egui::Frame::default()
+             .fill(palette.bg_surface_alt)
+-            .stroke(Stroke::new(1.0, palette.border_subtle))
++            .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+             .inner_margin(egui::Margin::ZERO);
+ 
+         let title = self.title;
+@@ -147,7 +147,7 @@
+             egui::pos2(ui.min_rect().left(), ui.cursor().top()),
+             egui::pos2(ui.min_rect().right(), ui.cursor().top()),
+         ],
+-        Stroke::new(1.0, palette.border_subtle),
++        Stroke::new(1.0_f32, palette.border_subtle),
+     );
+     let _ = RADIUS;
+ }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/stat.rs egui_sauge/src/components/stat.rs
+--- a/src/components/stat.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/stat.rs	2026-10-12 12:37:11.242555300 +0800
+@@ -49,7 +49,7 @@
+         let palette = palette_of(ui.ctx());
+         let frame = egui::Frame::default()
+             .fill(palette.bg_surface)
+-            .stroke(Stroke::new(1.0, palette.border_subtle))
++            .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::same(SPACING.s4 as i8));
+         frame
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/status.rs egui_sauge/src/components/status.rs
+--- a/src/components/status.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/status.rs	2026-10-12 12:37:11.343099900 +0800
+@@ -293,7 +293,7 @@
+             rect,
+             corner(RADIUS.sm),
+             palette.bg_surface_alt,
+-            Stroke::new(1.0, palette.border_default),
++            Stroke::new(1.0_f32, palette.border_default),
+             StrokeKind::Inside,
+         );
+         let text_pos = egui::pos2(rect.left() + pad.x, rect.center().y - galley.size().y / 2.0);
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/status_bar.rs egui_sauge/src/components/status_bar.rs
+--- a/src/components/status_bar.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/status_bar.rs	2026-10-12 12:37:11.072563400 +0800
+@@ -48,7 +48,7 @@
+                 egui::pos2(rect.left(), rect.top()),
+                 egui::pos2(rect.right(), rect.top()),
+             ],
+-            Stroke::new(1.0, palette.border_subtle),
++            Stroke::new(1.0_f32, palette.border_subtle),
+         );
+ 
+         // Three columns: 1/3 each (caller can adjust by laying out
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/switch.rs egui_sauge/src/components/switch.rs
+--- a/src/components/switch.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/switch.rs	2026-10-12 12:37:11.006732600 +0800
+@@ -68,7 +68,7 @@
+             rect,
+             corner(RADIUS.full),
+             track_fill,
+-            Stroke::new(1.0, track_stroke),
++            Stroke::new(1.0_f32, track_stroke),
+             StrokeKind::Inside,
+         );
+ 
+@@ -89,7 +89,7 @@
+         ui.painter().circle_stroke(
+             knob_c,
+             knob_r,
+-            Stroke::new(1.0, alpha(palette.border_default, 0.6)),
++            Stroke::new(1.0_f32, alpha(palette.border_default, 0.6)),
+         );
+ 
+         if response.has_focus() {
+@@ -97,7 +97,7 @@
+             ui.painter().rect_stroke(
+                 ring,
+                 corner(RADIUS.full),
+-                Stroke::new(2.0, palette.focus_ring),
++                Stroke::new(2.0_f32, palette.focus_ring),
+                 StrokeKind::Outside,
+             );
+         }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/table.rs egui_sauge/src/components/table.rs
+--- a/src/components/table.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/table.rs	2026-10-12 12:37:11.284908400 +0800
+@@ -275,7 +275,7 @@
+                         egui::pos2(header_rect.left(), header_rect.bottom()),
+                         egui::pos2(header_rect.right(), header_rect.bottom()),
+                     ],
+-                    Stroke::new(1.0, palette.border_default),
++                    Stroke::new(1.0_f32, palette.border_default),
+                 );
+ 
+                 // Hold the selection mutable borrow at most for one row at a time.
+@@ -331,7 +331,7 @@
+                                     box_rect,
+                                     corner(RADIUS.sm),
+                                     fill,
+-                                    Stroke::new(1.5, stroke_color),
++                                    Stroke::new(1.5_f32, stroke_color),
+                                     StrokeKind::Inside,
+                                 );
+                                 if on {
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/timeline.rs egui_sauge/src/components/timeline.rs
+--- a/src/components/timeline.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/timeline.rs	2026-10-12 12:37:11.209458500 +0800
+@@ -109,7 +109,7 @@
+                                     egui::pos2(center.x, center.y + marker_size / 2.0),
+                                     egui::pos2(center.x, marker_rect.bottom() + 80.0),
+                                 ],
+-                                Stroke::new(1.5, palette.border_default),
++                                Stroke::new(1.5_f32, palette.border_default),
+                             );
+                         }
+                         // Marker disc.
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/toast.rs egui_sauge/src/components/toast.rs
+--- a/src/components/toast.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/toast.rs	2026-10-12 12:37:11.086466800 +0800
+@@ -105,7 +105,7 @@
+     let mut dismissed = false;
+     egui::Frame::default()
+         .fill(palette.bg_surface)
+-        .stroke(Stroke::new(1.0, palette.border_default))
++        .stroke(Stroke::new(1.0_f32, palette.border_default))
+         .corner_radius(corner(RADIUS.md))
+         .inner_margin(egui::Margin::same(SPACING.s3 as i8))
+         .shadow(Elevation::Popover.shadow(palette.dark_mode))
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/tooltip.rs egui_sauge/src/components/tooltip.rs
+--- a/src/components/tooltip.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/tooltip.rs	2026-10-12 12:37:11.175400300 +0800
+@@ -14,7 +14,7 @@
+         let palette = palette_of(ui.ctx());
+         egui::Frame::default()
+             .fill(palette.bg_surface)
+-            .stroke(Stroke::new(1.0, palette.border_default))
++            .stroke(Stroke::new(1.0_f32, palette.border_default))
+             .corner_radius(corner(RADIUS.md))
+             .inner_margin(egui::Margin::symmetric(
+                 SPACING.s3 as i8,
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/tree.rs egui_sauge/src/components/tree.rs
+--- a/src/components/tree.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/tree.rs	2026-10-12 12:37:11.017828100 +0800
+@@ -215,7 +215,7 @@
+         ui.painter().rect_stroke(
+             rect.expand(1.0),
+             corner(RADIUS.sm),
+-            Stroke::new(2.0, palette.focus_ring),
++            Stroke::new(2.0_f32, palette.focus_ring),
+             StrokeKind::Outside,
+         );
+     }
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/components/workbench.rs egui_sauge/src/components/workbench.rs
+--- a/src/components/workbench.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/components/workbench.rs	2026-10-12 12:37:11.109402400 +0800
+@@ -46,7 +46,7 @@
+             .frame(
+                 egui::Frame::default()
+                     .fill(palette.bg_surface_alt)
+-                    .stroke(egui::Stroke::new(1.0, palette.border_subtle))
++                    .stroke(egui::Stroke::new(1.0_f32, palette.border_subtle))
+                     .inner_margin(egui::Margin::symmetric(
+                         SPACING.s2 as i8,
+                         (SPACING.s2 - 1.0) as i8,
+@@ -79,7 +79,7 @@
+             .frame(
+                 egui::Frame::default()
+                     .fill(palette.bg_surface_alt)
+-                    .stroke(egui::Stroke::new(1.0, palette.border_subtle))
++                    .stroke(egui::Stroke::new(1.0_f32, palette.border_subtle))
+                     .inner_margin(egui::Margin::ZERO),
+             )
+             .show_inside(self.ui, body);
+@@ -96,7 +96,7 @@
+             .frame(
+                 egui::Frame::default()
+                     .fill(palette.bg_surface_alt)
+-                    .stroke(egui::Stroke::new(1.0, palette.border_subtle))
++                    .stroke(egui::Stroke::new(1.0_f32, palette.border_subtle))
+                     .inner_margin(egui::Margin::ZERO),
+             )
+             .show_inside(self.ui, body);
+diff -ru _sauge-ref/egui_sauge-2.0.0/src/theme/apply.rs egui_sauge/src/theme/apply.rs
+--- a/src/theme/apply.rs	2026-04-27 03:38:15.000000000 +0800
++++ b/src/theme/apply.rs	2026-10-12 12:37:11.219513700 +0800
+@@ -36,7 +36,7 @@
+     v.panel_fill = p.bg_app;
+     v.extreme_bg_color = p.bg_surface;
+     v.faint_bg_color = p.bg_hover;
+-    v.window_stroke = Stroke::new(1.0, p.border_default);
++    v.window_stroke = Stroke::new(1.0_f32, p.border_default);
+     v.window_corner_radius = corner(RADIUS.lg);
+ 
+     // Shadows — egui windows get Modal-level depth, popups/menus get Popover.
+@@ -49,41 +49,41 @@
+     // Non-interactive widgets (labels, separators)
+     v.widgets.noninteractive.bg_fill = p.bg_surface;
+     v.widgets.noninteractive.weak_bg_fill = p.bg_surface;
+-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border_subtle);
+-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text_secondary);
++    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
++    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text_secondary);
+     v.widgets.noninteractive.corner_radius = r_md;
+ 
+     // Inactive (rest) interactive widgets
+     v.widgets.inactive.bg_fill = p.bg_surface;
+     v.widgets.inactive.weak_bg_fill = p.bg_surface;
+-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.border_default);
+-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text_primary);
++    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border_default);
++    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
+     v.widgets.inactive.corner_radius = r_md;
+ 
+     // Hovered
+     v.widgets.hovered.bg_fill = p.bg_hover;
+     v.widgets.hovered.weak_bg_fill = p.bg_hover;
+-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.brand_default);
+-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text_primary);
++    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.brand_default);
++    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
+     v.widgets.hovered.corner_radius = r_md;
+ 
+     // Active (pressed)
+     v.widgets.active.bg_fill = p.bg_pressed;
+     v.widgets.active.weak_bg_fill = p.bg_pressed;
+-    v.widgets.active.bg_stroke = Stroke::new(1.5, p.brand_hover);
+-    v.widgets.active.fg_stroke = Stroke::new(1.0, p.text_primary);
++    v.widgets.active.bg_stroke = Stroke::new(1.5_f32, p.brand_hover);
++    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
+     v.widgets.active.corner_radius = r_md;
+ 
+     // Open (e.g. open combobox)
+     v.widgets.open.bg_fill = p.bg_surface_alt;
+     v.widgets.open.weak_bg_fill = p.bg_surface_alt;
+-    v.widgets.open.bg_stroke = Stroke::new(1.0, p.brand_default);
+-    v.widgets.open.fg_stroke = Stroke::new(1.0, p.text_primary);
++    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, p.brand_default);
++    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, p.text_primary);
+     v.widgets.open.corner_radius = r_md;
+ 
+     // Selection + focus
+     v.selection.bg_fill = multiply_alpha(p.brand_default, 0.25);
+-    v.selection.stroke = Stroke::new(2.0, p.focus_ring);
++    v.selection.stroke = Stroke::new(2.0_f32, p.focus_ring);
+ 
+     // Hyperlink
+     v.hyperlink_color = p.brand_hover;
