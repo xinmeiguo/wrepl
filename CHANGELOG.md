@@ -29,6 +29,50 @@
 > - 依赖：设计系统收进自家 fork 仓库 `xinmeiguo/egui_sauge` —— 修掉上游 74 条 `falling back to f32`（`future_incompatible`），**CI 同步改指自家仓库，上游断链不再影响发版**。
 > - 上游：已提交修复 PR <https://github.com/macnjil4/egui_sauge/pull/1>。
 > - 文档：新增 `docs/ROADMAP.md` —— 0.4.2 各项的先后顺序、拍板记录与验收标准。
+> - 修复：选择器浮层改用 `default_pos` 定位 —— 切目录不再左右抖，标题栏也拖得动了。
+
+### 选择器浮层：修掉「切目录左右抖」，并让它拖得动
+
+`picker` 换成 `egui::Window` 当外壳之后，位置一直是用
+`Window::anchor(Align2::CENTER_CENTER, …)` 摆的。而 egui 的 anchor 是**每帧**
+按"本帧窗口尺寸"重算左上角的（`area.rs`）：
+
+```rust
+if let Some((anchor, offset)) = anchor {
+    state.set_left_top_pos(
+        anchor.align_size_within_rect(size, constrain_rect).left_top() + offset);
+}
+```
+
+`size` 取的是**本帧**尺寸，于是两件事一起发生：
+
+- **切目录时窗口左右跳**：点「桌面 / 文档 / 下载 / 盘符」这些快捷位会换掉列表
+  内容，窗口尺寸随之变化，左上角就被重算一次 —— 屏幕上看到的就是左右抖；
+- **拖不动**：同一套 API 的文档写着 "Anchoring also makes the window immovable."，
+  anchor 会顺手把 `movable` 置成 `false`。
+
+改成 `default_pos`（源码原话 "Set initial position of the window"）：位置**只在
+没有记忆时**取一次，首次居中值由新增的 `first_center()` 算；之后归 egui 的 Area
+记忆 —— 拖走就记住，尺寸再怎么变也不再牵动位置。拖动区域是**整个面板**
+（`area.rs` 的 `move_response` 盖住 `state.rect()`，压在它上面的控件优先拿事件），
+所以点标题栏那条空白最保险。
+
+**验证**：本机真实鼠标事件进不了窗口（见 `diag` 模块头），而"能不能拖"在静态
+截图上根本看不出来 —— 只能在 `--selftest` 里用**合成指针事件**把这件事钉住。
+断言序列 `hover → 按下 → 拖 → 松开`，起点取窗口顶边往下 20 点（标题栏那条空白，
+避开右上角 ×），终点左上各偏 80 / 35：
+
+| 定位方式 | 断言输出 |
+|---|---|
+| `.anchor(…)`（改动前） | `✗ 选择器标题栏拖不动（位移 0.0,0.0）` → **EXIT=3** |
+| `.default_pos(…)`（改后） | `选择器标题栏可拖动：位移 (-80.0, -35.0)` |
+
+位移精确为 `0.0` 就是"窗口每帧被拉回原处"的直接证据 —— 与抖动同源，所以这条
+断言同时守住了两件事。（改动前那份锚定版是**阴性对照**：**跑同一条断言会红**，
+证明它不是一条永远通过的空断言。）
+
+**顺带**：`Picker` 新增 `last_window_rect()`（只给自检读，绘制路径不碰它），
+`show()` 把 `Window::show` 返回的外框矩形存进新字段 `last_rect`。
 
 ### 三个「起手动作」接上快捷键（`Ctrl+O` / `F5` / `Ctrl+Enter`）
 

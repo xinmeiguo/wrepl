@@ -12,10 +12,10 @@
 | # | 项 | 依赖 | 状态 |
 |---|---|---|---|
 | 1 | `egui_sauge` 上游 74 条 `falling back to f32` | 无 | ✅ 本机 fork 修掉（2026-10-12，见 §2.1.1） |
-| 2 | 清 7 条自家弃用警告（egui 0.34 面板 API） | 无 | 待做 |
-| 3 | 拖放文件 / 文件夹进窗口 | 无 | 待做 |
-| 4 | 「最近使用」目录持久化 | 无 | 待做 |
-| 5 | 键盘快捷键 | **依赖 3、4** | 待做 |
+| 2 | 清 7 条自家弃用警告（egui 0.34 面板 API） | 无 | ✅ 2026-10-12，见 §1.1.1 |
+| 3 | 拖放文件 / 文件夹进窗口 | 无 | ✅ 2026-10-12，见 §1.2.1 |
+| 4 | 「最近使用」目录持久化 | 无 | ✅ 2026-10-12，见 §1.3.1 |
+| 5 | 键盘快捷键 | **依赖 3、4** | ✅ 2026-10-12，见 CHANGELOG 0.4.2 |
 | 6 | 更大项（PDF 导出 / 退役页眉 COM / 界面预演入口） | 各自独立 | 暂缓（见 §2） |
 
 **为什么 5 依赖 3、4**：快捷键要绑的是"起手动作"（`Ctrl+O` 选目录、`F5` 扫描、
@@ -87,6 +87,23 @@ eframe 0.34 是 `logic → update → ui` 三条都调（`epi_integration.rs:294
 `error deleting lock file for incremental compilation` / `error copying object file`，
 与源码无关（见 `CONTRIBUTING.md` §2.1）。**统计警告数时要把这类行排除掉**，
 否则会误判成"egui_sauge 又出警告了"。
+
+#### 1.1.1 执行记录（2026-10-12，已验收）
+
+四处面板按上面那条 `show_inside(ui, …)` 改完，另外两处签名跟着走：
+
+| 项 | 实测 |
+|---|---|
+| 面板 | `Panel::top/left/bottom(...).show_inside(ui, …)` + `CentralPanel::default().show_inside(ui, …)`；`.exact_size(184.0).resizable(false)` **原样保留**（被弃用的是 `exact_width`/`exact_height`，不是 `exact_size`） |
+| 签名 | `App::render(&mut self, ui: &mut egui::Ui)`；内部要 `Context` 的地方用 `ui.ctx()` |
+| 生命周期 | `impl eframe::App` 里**删掉 `update`、换成 `ui`** —— eframe 0.34 的 `logic → update → ui` 三条通路都会调，留着 `update` 等于一帧画两遍 |
+| 自家警告 | **0 条**（`generated N warnings` 汇总行不再出现） |
+| 回归 | 43 项 ✓ + 第 19 组 **17/17**，0 失败 |
+| 基线产物 | 与 `E:/test/docx-009CE` **26/26 SHA256 相同**；GUI 产物 vs CLI 产物也 26/26 |
+| 实拍 | 四个面板渲染与改动前一致 |
+
+> 顺带修掉一处过时注释：`app.rs` 里引述旧版 egui 文档的 `SidePanel` /
+> `TopBottomPanel` 已改成当前 API 名，并注明"GUIDE 写的是 0.34 之前的名字"。
 
 ### 1.2 拖放文件 / 文件夹
 

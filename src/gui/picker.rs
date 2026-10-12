@@ -27,7 +27,9 @@
 //!   **所有选择器共用一份"上次拖到多大"的记忆**（尺寸天然同步）；
 //! * **没有遮罩**：面板开着照样能点主界面（比如顶栏切主题）。4a 那层遮罩会
 //!   把落到下面的点击吞掉，"开着面板切不了主题"就是它造成的；
-//! * 尺寸用 `default_size`（内容区 920×600，可缩放），居中用 `anchor`；
+//! * 尺寸用 `default_size`（内容区 920×600，可缩放）；**首次**居中用
+//!   `default_pos`（见 [`first_center`]），之后位置归 egui 记忆 —— 因此
+//!   **标题栏可以拖着走**，且窗口尺寸变化不会牵动位置；
 //! * **只换了外壳容器**：导航、侧栏、面包屑、列表、图标、调色板接入一概没动。
 //!
 //! ## 三个必须记住的实现约束
@@ -59,8 +61,10 @@ use crate::ds;
 
 // ─────────────────────────── 对外接口 ───────────────────────────
 
-/// 面板**内容区**尺寸（点）—— 交给 `Window::default_size`，居中由
-/// `anchor(CENTER_CENTER)` 负责，**别在别处硬编码偏移量**。
+/// 面板**内容区**尺寸（点）—— 交给 `Window::default_size`；**首次**居中由
+/// [`first_center`] + `Window::default_pos` 负责，**别在别处硬编码偏移量**。
+/// （别用 `anchor` / `current_pos` —— 它们每帧把位置钉死：窗口会拖不动，且
+/// 随尺寸左右跳，见 `show` 里那段。）
 ///
 /// **与 0.2.2 一致（920×600）**：1000×640 那次放大跟着整体字号一起做，
 /// 实际看着偏大。字号保持放大，面板回到原尺寸即可。
@@ -87,6 +91,20 @@ const PANEL_H: f32 = 600.0;
 /// `desired = max(desired, last_content_size)`，窗口会被一帧帧往上顶，
 /// 那是**发散**的（实测「选文件」模式从 690 长到 820，顶住客户区才停）。
 const BOTTOM_H_GUESS: f32 = 190.0;
+
+/// 面板**第一次**出现时的左上角位置：把它摆在屏幕正中。
+///
+/// 只影响"头一回开在哪"，差几像素都无所谓 —— 所以按**内容区**尺寸算就行
+/// （外框那圈 12px 内边距不再补）。
+///
+/// ★ 别把它换成 `current_pos` / `fixed_pos`，也别再塞回 `Window::anchor`：
+///   那三个都是**每帧**把位置钉死，会把「拖动」一起禁掉，而且窗口尺寸一变
+///   位置就跟着跳（2026-10-12 的「左右抖动」正是 `anchor` 造成的，见 `show`
+///   里那段注释）。`default_pos` 的语义是"**初始**位置"，只在窗口还没有位置
+///   记忆时用一次，之后归 egui 记忆 —— 既拖得动，也不再随尺寸左右跳。
+fn first_center(ctx: &egui::Context, w: f32, h: f32) -> egui::Pos2 {
+    ctx.content_rect().center() - Vec2::new(w * 0.5, h * 0.5)
+}
 
 /// 面板要干什么。四种模式决定「确认」按钮的含义与返回什么。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -310,6 +328,13 @@ pub struct Picker {
     /// 自己记一个 `Pos2`，而不是拿 `Response::drag_delta()` 反推起点 ——
     /// 那个量是"本帧位移"还是"累计位移"在 egui 各版本里改过，不依赖它。
     rubber_start: Option<egui::Pos2>,
+
+    /// 上一帧窗口的**外框**矩形（含标题栏与 12px 内边距）。
+    ///
+    /// 只给 `selftest` 看：那里要断言「标题栏拖得动」「窗口尺寸变了位置也不动」
+    /// 两件事（`show` 是唯一能拿到 `Window` 返回矩形的地方，所以只能在这里存）。
+    /// 正常绘制路径不读它。
+    last_rect: Option<egui::Rect>,
 }
 
 impl Default for Picker {
@@ -356,6 +381,7 @@ impl Picker {
             places_cache: Vec::new(),
             bottom_h: BOTTOM_H_GUESS,
             rubber_start: None,
+            last_rect: None,
         };
         p.refresh_places();
         p
@@ -478,8 +504,11 @@ impl Picker {
         // 为的是让**自绘的内容区**正好落在 920×600 上（详见下面 `.show` 里那段）。
         // **不用 `fixed_size`** —— 那样就没有缩放手感了；`resizable(true)` 真能拖，
         // 拖完之后内容按同样规则跟着走（减掉 gutter 就不发散）。
-        // 居中交给 `anchor(CENTER_CENTER)`，不再自己拿屏幕中心减偏移量
-        // （4a 那个 `-PANEL_W/2` 是拿"内容尺寸"当外框算的，本来就不精确）。
+        // 定位：**首次**摆到屏幕正中（[`first_center`] + `default_pos`），此后交给
+        // egui 记忆。原先这里是 `anchor(CENTER_CENTER)` —— 它 **每帧**都会按"本帧
+        // 尺寸"重算一次左上角，于是换目录（窗口宽度变了）窗口就在屏幕上左右跳；
+        // 而且 anchor 会顺手把窗口设成不可移动。两个毛病同源，详见下面
+        // `.default_pos` 那段注释。
         //
         // `all` 先 take 出来，免得闭包里同时借 `&mut self` 和 `&self.all`。
         let entries = std::mem::take(&mut self.all);
@@ -495,14 +524,35 @@ impl Picker {
         //   标题空了所有选择器就会共用一个空 Id（还可能跟别处的空标题窗口撞车）。
         //   钉死 Id 顺带解决另一件事 —— 所有选择器共用一份"上次拖到多大"的记忆，
         //   尺寸天然同步，不会这个 690 那个 820。
-        egui::Window::new("")
+        let win = egui::Window::new("")
             .id(egui::Id::new("wrepl_picker"))
             .open(&mut open)
             .title_bar(true)
             .collapsible(false)
             .resizable(true)
             .default_size([PANEL_W + gutter, PANEL_H])
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            // ★ 定位只给「初始位置」，**不要用 `.anchor(...)`** ——
+            //   2026-10-12 修掉的「左右抖动 + 拖不动」两件事，根因是同一个：
+            //
+            //   ① 抖动。egui 的 anchor 是**每帧无条件**的（`area.rs`）：
+            //        if let Some((anchor, offset)) = anchor {
+            //            state.set_left_top_pos(
+            //                anchor.align_size_within_rect(size, constrain_rect).left_top() + offset);
+            //        }
+            //      其中 `size` 取的是**本帧**窗口尺寸。于是每换一次目录 ——
+            //      「桌面 / 文档 / 下载 / 盘符」这些快捷位点下去，列表内容不同、
+            //      窗口宽度也不同 —— 左上角就被按新尺寸重算一次，屏幕上表现为
+            //      左右跳。
+            //   ② 拖不动。同一套 API 的文档写着 "Anchoring also makes the window
+            //      immovable."（`window.rs` 的 `.anchor` 条目），anchor 会顺手把
+            //      `movable` 置成 false。
+            //
+            //   换成 `default_pos`（源码原话 "Set initial position of the window"）：
+            //   位置只在**没有记忆**时取一次这个值，之后归 egui 的 Area 记忆 ——
+            //   用户拖走就记住，窗口尺寸再怎么变也不再牵动位置。Id 固定 ⇒ 所有
+            //   选择器共用同一份"上次拖到哪"（与"上次拖到多大"是同一套记忆，
+            //   见上面 `Window::new("")` 那段）。
+            .default_pos(first_center(ctx, PANEL_W + gutter, PANEL_H))
             // 外壳风格沿用**设计系统的窗口**那一套：`Frame::window` 读的正是
             // `visuals.window_fill / window_stroke / window_corner_radius /
             // window_shadow`，而这几项由 `ds::apply` 从 palette 写进 style。
@@ -535,6 +585,9 @@ impl Picker {
                 ui.set_height(avail.y);
                 act = self.body(ui, ctx, &entries);
             });
+        // 记下本帧窗口的**外框**矩形（标题栏 + 内边距都在里面）。只有 selftest
+        // 读它 —— 那里用它钉「标题栏拖得动」和「窗口尺寸变了位置也不动」（见字段注释）。
+        self.last_rect = win.map(|w| w.response.rect);
         self.all = entries;
 
         // 点了 ×：行为与「取消 / 关闭」等价（见 [`Outcome::Cancelled`]）。
@@ -554,6 +607,14 @@ impl Picker {
             }
             None => None,
         }
+    }
+
+    /// 上一帧窗口的**外框**矩形；还没画过就是 `None`。
+    ///
+    /// 只给 `selftest` 用（见 `last_rect` 字段说明）：它要断言「标题栏拖得动」
+    /// 与「窗口尺寸变了位置也不动」。正常绘制路径别拿它去做布局。
+    pub fn last_window_rect(&self) -> Option<egui::Rect> {
+        self.last_rect
     }
 
     /// 重扫盘符与快捷位（只在 `new` / `open` 时调）。

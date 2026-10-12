@@ -3448,6 +3448,70 @@ pub fn selftest(args: &[String]) -> i32 {
         app.picker_for = None;
         println!("  自绘选择器 —— {cn}模式：布局通过");
     }
+
+    // 3.8c) 选择器窗口的**定位**：标题栏那条空白拖得动。
+    //
+    //   2026-10-12 修掉的 bug：原先用 `Window::anchor(CENTER_CENTER)`，而 egui 的
+    //   anchor 是**每帧**按"本帧窗口尺寸"重算左上角的（`area.rs`：
+    //   `if let Some((anchor, offset)) = anchor { state.set_left_top_pos(
+    //    anchor.align_size_within_rect(size, constrain_rect).left_top() + offset) }`，
+    //   其中 `size` 就是本帧尺寸）。于是两件事一起发生：
+    //     · 切换「桌面 / 文档 / 下载 / 盘符」这些快捷位时，列表内容不同 → 窗口
+    //       尺寸不同 → 左上角被重算 —— 屏幕上就是左右跳（用户报的「左右抖动」）；
+    //     · 同一套 API 的文档写着 "Anchoring also makes the window immovable."，
+    //       顺手把拖动也禁掉了（用户想拖拖不动）。
+    //   改 `default_pos`（源码原话 "Set initial position of the window"）后：
+    //   位置只在没有记忆时取一次，之后归 egui 记忆，拖走就记住。
+    //
+    //   ★ 这里用**合成指针事件**验，而不是去截图上量像素：本机真实鼠标事件
+    //     进不了窗口（见 `diag` 模块头），而"拖不拖得动"在静态截图上根本看不出来。
+    //     拖动区域是**整个窗口**（`area.rs` 的 `move_response` 覆盖 `state.rect()`，
+    //     后建的控件压在它上面优先拿事件），所以点标题栏那条空白最保险。
+    {
+        app.page = Page::Replace;
+        app.open_picker(PickFor::BrowseDir);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
+        }
+        let Some(before) = app.picker.last_window_rect() else {
+            println!("  ✗ 选择器窗口没画出来（拿不到矩形）");
+            return 3;
+        };
+        // 起点取窗口顶边往下 20 点 —— 标题栏那条空白（避开右上角的 ×）。
+        let grab = egui::pos2(before.center().x, before.top() + 20.0);
+        let to = grab + egui::vec2(-80.0, -35.0);
+        let ev = |e: egui::Event| {
+            let mut r = raw.clone();
+            r.events.push(e);
+            r
+        };
+        let mv = |p: egui::Pos2| egui::Event::PointerMoved(p);
+        let btn = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = ctx.run_ui(ev(mv(grab)), |ui| app.render(ui)); // 先 hover
+        let _ = ctx.run_ui(ev(btn(grab, true)), |ui| app.render(ui)); // 按下
+        let _ = ctx.run_ui(ev(mv(to)), |ui| app.render(ui)); // 拖
+        let _ = ctx.run_ui(ev(mv(to)), |ui| app.render(ui)); // 再拖一帧
+        let _ = ctx.run_ui(ev(btn(to, false)), |ui| app.render(ui)); // 松开
+        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui)); // 收尾帧
+        let after = app.picker.last_window_rect().unwrap_or(before);
+        let (dx, dy) = (after.left() - before.left(), after.top() - before.top());
+        if dx.abs() < 20.0 && dy.abs() < 20.0 {
+            println!(
+                "  ✗ 选择器标题栏拖不动（位移 {dx:.1},{dy:.1}）—— 是不是又用回 \
+                 anchor / current_pos 了？那两个都会让窗口 immovable"
+            );
+            return 3;
+        }
+        println!("  选择器标题栏可拖动：位移 ({dx:.1}, {dy:.1})");
+        app.picker.close();
+        app.picker_for = None;
+    }
+
     app.page = keep_page2;
 
     // 3.9) 打印机枚举。批量打印页的「打印机」下拉全靠它，而它**不碰 COM**
