@@ -230,8 +230,15 @@ grep -rn "D:/test" src/ bench/ docs/ .github/ *.sh *.py *.md | grep -v "^target/
 
 - `D:/test/regress/CH-charref.docx` ← `regress.sh:120` 的**回归夹具**，不能删；
 - `D:/test/run-009CE/` ← `regress-samples.local.sh` 的**端到端语料 + 规则文件**，不能删；
-- `D:/test/ww/` ← **另一个项目的真实客户文档**（看着像垃圾，实则不是）；
-- `D:/test/bench023/` ← 基准语料。
+- `D:/test/ww/` ← **另一个项目的真实客户文档**（看着像垃圾，实则不是）。
+
+反过来，**看着像资产、其实是派生副本**的，也要靠比对判出来（2026-10-12 实测）：
+
+- `D:/test/bench023/` —— 949 个 docx 的性能基准语料。`small-1..60` 各份内容
+  互相一致、`onebig/` 与源逐字节相同；把 SHA256 追下去命中
+  `E:\test\docx-009CE`（26 件）→ 它是**复制放大的派生集**，源交付包还在，
+  所以可删。要重跑基准就照 `bench\README.md` 重新复制一份。
+  **判据是 `sha256sum` 比对，不是目录名** —— 名字上看不出是原件还是副本。
 
 另外：`regress-run-<PID>/` 这种**每次唯一命名**的临时工作目录
 （为什么唯一命名见 `regress.sh:55-62`）→ 可以清。
