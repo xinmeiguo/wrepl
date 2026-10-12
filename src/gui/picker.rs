@@ -260,8 +260,12 @@ pub struct Picker {
     /// 浏览历史 + 当前位置（后退 / 前进）。
     history: Vec<PathBuf>,
     hist_idx: usize,
-    /// 本次会话走过的目录（「最近使用」分区）。**只存内存**，不落盘 ——
-    /// 启动时读一个历史文件就要碰磁盘，那才是真的会影响打开速度。
+    /// 本次会话走过的目录（「最近使用」分区）。
+    ///
+    /// **0.4.2 起落盘**（`%LOCALAPPDATA%\wrepl\last-dir.txt`，经
+    /// [`crate::diag::save_last_dir`]）：关掉程序再开，选择器仍停在
+    /// 上次那个目录。**只在读目录成功时写**（见 [`Picker::push_recent`]），
+    /// 绘制路径上不碰磁盘 —— 那是上面第 4 条约束。
     recent: Vec<PathBuf>,
 
     // ── 内容 ──
@@ -317,13 +321,19 @@ impl Default for Picker {
 impl Picker {
     pub fn new() -> Self {
         let home = home_dir();
+        // 0.4.2 起：上次停在哪儿跨会话保留。读不到 / 那个目录已经没了
+        // 就照旧退回 home —— 这只是一份便利状态，读不出来不该有任何后果。
+        //
+        // `cwd` 与 `last_dir` 都用它：面板关着时两者不会差，开第一次时
+        // `open` 若没给起点就是拿 `last_dir` 当落点。
+        let start_dir = crate::diag::load_last_dir().unwrap_or_else(|| home.clone());
         let mut p = Self {
             open: false,
             mode: Mode::Files,
             title: String::new(),
             exts: Vec::new(),
             filter_label: String::new(),
-            cwd: home.clone(),
+            cwd: start_dir.clone(),
             addr: String::new(),
             addr_editing: false,
             addr_focus: false,
@@ -341,7 +351,7 @@ impl Picker {
             show_hidden: false,
             load: None,
             err: None,
-            last_dir: home,
+            last_dir: start_dir,
             drives_cache: Vec::new(),
             places_cache: Vec::new(),
             bottom_h: BOTTOM_H_GUESS,
@@ -633,8 +643,12 @@ impl Picker {
     /// 记一条「最近使用」，新的在前、去重、最多 5 条。
     fn push_recent(&mut self, dir: PathBuf) {
         self.recent.retain(|p| p != &dir);
-        self.recent.insert(0, dir);
+        self.recent.insert(0, dir.clone());
         self.recent.truncate(5);
+        // 落盘。**只有这一处**会写 —— 它由"读目录成功"触发，不在绘制路径上
+        // （模块头约束 4）。存的是 `last_dir` 那一个目录，不是这 5 条列表：
+        // 「最近使用」本来就是会话内的导航痕迹，跨会话只需要"停在哪儿"。
+        crate::diag::save_last_dir(&dir);
     }
 
     fn can_back(&self) -> bool {

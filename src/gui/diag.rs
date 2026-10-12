@@ -54,6 +54,57 @@ pub fn path_text() -> String {
         .unwrap_or_else(|| "（取不到日志路径）".to_string())
 }
 
+// ─────────────────────────── 界面状态持久化 ───────────────────────────
+//
+// 只存「上次停在哪儿」这一件事：一个目录 + 最近 5 条。刻意**不**存窗口位置、
+// 主题、排序偏好 —— 那些要么由窗口管理器管，要么改了会让"上次是什么样"
+// 变成猜谜。范围越小越不容易写坏，也越不需要迁移逻辑。
+
+/// 状态文件所在目录（与 `wrepl-gui.log` 同目录，见 `log_path`）。
+fn state_dir() -> Option<PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join("wrepl");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    })
+    .clone()
+}
+
+fn state_file() -> Option<PathBuf> {
+    Some(state_dir()?.join("last-dir.txt"))
+}
+
+/// 读回「上次停留的目录」。
+///
+/// 读不出来（文件不存在 / 被手改坏 / 那个盘现在没插着）一律当"没有" ——
+/// **绝不因此让程序起不来**。这个值只影响选择器一打开停在哪，
+/// 拿不到就退回 home，跟 0.4.1 的行为一样。
+pub fn load_last_dir() -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(state_file()?).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    // 盘拔了 / 目录被删了 → 当没有，让调用方退回 home，而不是给一条点不回来的路径。
+    p.is_dir().then_some(p)
+}
+
+/// 记下「这次的目录」。
+///
+/// 写失败（只读介质、权限不足、磁盘满）**静默忽略** —— 这是一份便利状态，
+/// 存不上不该影响任何正事。同 [`log`] 的取向。
+pub fn save_last_dir(dir: &std::path::Path) {
+    let Some(f) = state_file() else { return };
+    if let Err(e) = std::fs::write(&f, dir.to_string_lossy().as_bytes()) {
+        log(format!("上次目录写不进去（忽略）：{e}"));
+    }
+}
+
 /// 记一行。任何线程都能调。
 pub fn log(msg: impl AsRef<str>) {
     write_line(msg.as_ref());
