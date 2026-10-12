@@ -24,6 +24,144 @@
 
 ---
 
+## [未发布] - 2026-10-12
+
+> - 依赖：设计系统收进自家 fork 仓库 `xinmeiguo/egui_sauge` —— 修掉上游 74 条 `falling back to f32`（`future_incompatible`），**CI 同步改指自家仓库，上游断链不再影响发版**。
+> - 上游：已提交修复 PR <https://github.com/macnjil4/egui_sauge/pull/1>。
+> - 文档：新增 `docs/ROADMAP.md` —— 0.4.2 各项的先后顺序、拍板记录与验收标准。
+
+### 三个「起手动作」接上快捷键（`Ctrl+O` / `F5` / `Ctrl+Enter`）
+
+| 键 | 动作 | 落到哪 |
+|---|---|---|
+| `Ctrl+O` | 选目录 | 批量替换页 → 输入目录；页眉 / 打印页 → 各自的「选文档」 |
+| `F5` | 扫描（预演） | 命中/替换多少先报一遍，**不写任何文件** |
+| `Ctrl+Enter` | 执行 | 走 `start_run`，与点「执行替换」按钮**同一条路** |
+
+三条都调**既有入口**（`open_picker` / `start_run`），不新开路径 —— 所以
+「就地覆盖要先确认」那道关（统一兜在 `start_run` 入口，注释里写明"按钮、快捷键、
+将来的菜单都拦得住"）快捷键也躲不过去，selftest 专门钉住这一点。
+
+用 `ctx.input` 每帧轮询，而不是把键挂在某个 widget 上：键位要在**任何页面、
+任何焦点位置**都成立 —— 焦点在多行输入框里时用户正在打字，`Ctrl+Enter` 不该被吃。
+三个按钮各挂一条 `on_hover_text`，把对应快捷键写在提示里。
+
+**验收**：回归 78 项 ✓ + 第 19 组 17/17；与历史基线产物 `E:/test/docx-009CE`
+**26/26 SHA256 相同**；GUI 产物与 CLI 产物 **26/26 相同**。`--selftest` 新增 4 条断言
+（三页落点各一、`F5` 不弹确认框、空输入不起跑、`Ctrl+Enter` 就地覆盖仍走确认）。
+
+> 顺带修一处自己踩的坑：selftest 新增的快捷键用例为验「就地覆盖仍弹确认」，
+> 把全局 `out_to_subdir` 压成 `false` 后**忘了还原**，导致后面那次「完整批」
+> 被 `start_run` 的就地确认关**静默挡空** —— 产物目录零文件、无运行日志无报告，
+> 却照样打印「执行完成」，只看自检输出根本发现不了。回归第 9 组当场转红 4 项
+> （`验证 0/0`、产物 0 个、日志与报告都没落地）。现改为原值留存还原，并在完整批
+> 之前补**第二道** `out_to_subdir` 硬保护 —— 宁可亮红灯，不许静默跑空。
+> （源语料侥幸未受损：就地确认关拦在 `start_run` 入口，`E:/test/docx` 全程零改动。）
+
+### 文件选择器记住上次停在哪个目录（跨重启）
+
+原先 `picker.rs` 里明写「最近使用只存内存，不落盘」—— 关掉程序再开，
+选择器就忘了上次停在哪儿，每次都得重新点进去。
+
+现在存 `%LOCALAPPDATA%\wrepl\last-dir.txt`（一行一个路径，与 `wrepl-gui.log`
+同目录）：
+
+- **只在读目录成功时写**（由 `push_recent` 触发）—— 绘制路径上一行 IO 都没有，
+  这是 `picker` 模块头约束 4 的硬要求；
+- **只存一个路径**，不存那 5 条「最近使用」：后者是会话内的导航痕迹，
+  跨会话只需要"停在哪儿"；
+- **写失败只记一行日志**，不影响任何正事 —— 这是一份便利状态，不是配置；
+- **读不出来、或那个目录已经不在了**（盘拔了 / 被删了）→ 当没有，退回 home。
+  绝不因此让程序起不来。
+
+端到端实测：预置 `E:/test/docx` → 启动起点正确 → 跑完文件被刷新；
+换成不存在的 `Z:/…` → 启动不崩、退回 home。
+
+### 支持把文件 / 文件夹直接拖进窗口
+
+原先从资源管理器往窗口里拖东西**什么都不会发生**。现在按当前页决定落点：
+
+| 当前页 | 落点 | 收什么 |
+|---|---|---|
+| 批量替换 | 「输入」栏 | 目录与文件**混着收**（该栏本来就支持，工具自己遍历目录） |
+| 页眉替换 | 该页「已选文档」 | 只收 `.doc` / `.docx`，目录**展开一层**（不递归） |
+| 批量打印 | 同上，但落自己那份 | 同上 |
+
+- 按住 **Ctrl**（或 Cmd）= **追加**到现有内容，否则替换 —— 与资源管理器里
+  Ctrl 多选、以及自绘选择器那枚框选橡皮筋的习惯一致；
+- 拖拽过程中整窗盖一层半透明遮罩 + 品牌绿描边 + 「松手即可加入清单」——
+  "这个窗口能接拖放"原先在界面上没有任何静态线索。用 `egui::Area`
+  （`Order::Foreground` + `interactable(false)`）而不是往页面里插一行：
+  `hovered_files` 每帧都变，插进布局会把内容顶得来回跳；
+- 非 Word 文档被静默跳过，日志里点名跳过了几项。
+
+**内核零改动**（拖放只是"又一种把路径塞进来的壳"）：回归 55 项 + 第 19 组
+17/17 全过，与历史基线产物 **26/26 SHA256 相同**。`--selftest` 新增 6 条
+静默退化型断言（遮罩布局、两种追加语义、两个页面的白名单与落点隔离）。
+
+另加一个调试开关 `WREPL_DEBUG_DROP=hover|drop[;路径]`：本机合成鼠标进不来窗口，
+拖放是"按住不放"才有的状态，只能让程序自己做 —— 与既有的 `WREPL_DEBUG_PICKER` /
+`WREPL_DEBUG_PAGE` 同一套做法。
+
+### 清掉 `wrepl-gui` 全部 7 条弃用警告（egui 0.34 面板 API 迁移）
+
+`src/gui/app.rs` 从 0.4.0 起就带着 7 条 egui 0.34 的弃用提示，0.4.2 一次清零：
+
+- 四个面板全部迁到新 API 并改用 `show_inside(ui, …)`：
+  `TopBottomPanel::top` → `Panel::top`、`SidePanel::left` → `Panel::left`、
+  `TopBottomPanel::bottom` → `Panel::bottom`、`CentralPanel` 保持不变但换成
+  `show_inside`。左侧导航的 `.exact_size(184.0).resizable(false)` **原样保留**
+  （被弃用的是 `exact_width` / `exact_height`，不是 `exact_size`）；
+- 渲染入口从 `&egui::Context` 改成 `&mut egui::Ui`：`impl eframe::App` 里
+  **删除 `update`、新增 `ui`**，两者都转发到 `App::render`。
+  eframe 0.34 的 `logic → update → ui` 三条通路都会被调用，留着 `update`
+  就等于一帧画两遍；
+- 函数内部需要 `Context` 的地方（主题、重绘请求、两个浮层）改用
+  `ui.ctx().clone()` —— `Context` 内是 `Arc`，克隆很便宜。
+
+**界面零变化**，回归为证：43 项 ✓ + 第 19 组 17/17 全过；与历史基线产物
+`E:/test/docx-009CE` **26/26 SHA256 相同**；GUI 产物与 CLI 产物 **26/26 相同**；
+界面实拍四个面板渲染与改动前一致。
+
+> 顺带修掉一处过时注释：`app.rs` 里引述旧版 egui 文档的说法（`SidePanel` /
+> `TopBottomPanel`）已改成当前 API 名，并注明"GUIDE 写的是 0.34 之前的名字"。
+
+### 依赖：`egui_sauge` 收进自家 fork 仓库，CI 同步改指
+
+上游 `macnjil4/egui_sauge` v2.0.0 的 74 条警告是 `float_literal_f32_fallback`，
+属于 `future_incompatible`：Rust 官方注明 **"will become a hard error in a future release"**
+（rust-lang/rust#154024）。上游是个人的小项目（crates.io 总下载 57、3 star、
+最后一次提交停在 2026-04-26 的 v2.0.0 发布提交），等不到。
+
+原先的做法只是**本机**打补丁，CI 仍在拉上游 —— 上游仓库一旦改名、删库或转私有，
+发版流水线会当场断链。现在把修好的源码推上自家 fork 并让 CI 也用它：
+
+- **fork**：`xinmeiguo/egui_sauge`（GitHub fork，Apache-2.0 与 LICENSE 完整保留，
+  上游 12 个提交历史全在），提交 `095ae21`，+74 / -74 行 / 35 个文件；
+- **版本号保持 `2.0.0`** ⇒ `Cargo.toml` 与 `Cargo.lock` **零改动**；
+- **CI 改动只有两个字段**（`.github/workflows/release.yml`）：
+  `repository` → `xinmeiguo/egui_sauge`，`ref` → 一个 40 位 **commit SHA**
+  （钉 SHA 而非 tag —— tag 可被强推移动，钉 SHA 意味着无人能在代码没变的情况下改变发版产物）；
+  目录联接逻辑与 `Cargo.toml` 一个字未动；
+- **已向上游提 PR**：<https://github.com/macnjil4/egui_sauge/pull/1>
+  （GitHub 显示 +74/-74、35 文件 —— 干净的补丁，不是整文件重写）；
+- `docs/egui_sauge-fork.patch` 保留：记录 fork 相对上游的偏离，合并上游新版本时用它重放
+  （步骤见 `CONTRIBUTING.md` §1.2）。
+
+**验收**：从 GitHub 全新 clone fork（checkout 到 CI 用的那个 SHA）+ 全新 clone 本仓库，
+摆成同级目录后 `cargo check --features gui` **EXIT=0**，egui_sauge 警告 **0 条**；
+两边 `HEAD^{tree}` 完全相同，远端内容与本机一字不差。
+
+**产物行为零变化**，回归为证：18 组全过 + 第 19 组 17/17；与历史基线产物
+`E:/test/docx-009CE` **26/26 SHA256 相同**；GUI 产物与 CLI 产物 **26/26 相同**。
+
+机器码也验过：同一路径下把副本反向打回上游原样、正向再打回来，各编译一次
+LLVM IR，两份 `.ll` **SHA256 完全相同**（`6a9df610…`）—— 这 74 处只影响日志，不影响二进制。
+（CI 仍编上游源码，所以 CI 日志里那 74 行还在；发出去的 exe 与本机回归用的 exe
+机器码等价。）
+
+---
+
 ## [0.4.1] - 2026-10-12
 
 > - 新增：页眉替换新增「纯 Rust」引擎 —— 不依赖 Word，可与 Word COM 引擎切换。

@@ -1334,9 +1334,9 @@ impl App {
                 if ui
                     .add(run_btn)
                     .on_hover_text(if self.out_to_subdir {
-                        "把产物写到输出目录，源文件不动"
+                        "把产物写到输出目录，源文件不动\n快捷键：Ctrl+Enter（或 F5 先扫描一遍）"
                     } else {
-                        "就地覆盖源文件（不可撤销）——点击后会先弹一次确认"
+                        "就地覆盖源文件（不可撤销）——点击后会先弹一次确认\n快捷键：Ctrl+Enter（或 F5 先扫描一遍）"
                     })
                     .clicked()
                 {
@@ -1473,6 +1473,10 @@ impl App {
         // （实测：坐标、可见性都对，但屏幕上什么都看不见）。
         // 选路按当前页决定，此刻 `self.page` 已是本帧最终值。
         self.handle_drop(&ctx);
+
+        // 快捷键。排在最后：它要能改状态（起一批 / 开选择器），
+        // 此刻已出全部面板的借用期。
+        self.handle_shortcuts(&ctx);
     }
 
     /// 「就地覆盖」确认框。
@@ -1546,6 +1550,7 @@ impl App {
                 ui.vertical(|ui| {
                     if ui
                         .add(ds::Button::secondary("选目录").leading(ds::Icon::Folder))
+                        .on_hover_text("选输入目录（或目录里的一批 .docx）\n快捷键：Ctrl+O")
                         .clicked()
                     {
                         pick_in_dir = true;
@@ -2179,6 +2184,53 @@ impl App {
                     self.open_file(&p.display().to_string());
                 }
             }
+        }
+    }
+
+    // ── 快捷键 ──────────────────────────────────────────────────────────
+
+    /// 每帧收一次键盘输入，绑三个"起手动作"。
+    ///
+    /// | 键 | 动作 | 落到哪 |
+    /// |---|---|---|
+    /// | `Ctrl+O` | 选目录 | 批量替换页 → `InputDir`；页眉 / 打印页 → 各自的「选文档」 |
+    /// | `F5` | 扫描（预演） | `start_run(true, …)` |
+    /// | `Ctrl+Enter` | 执行 | `start_run(false, …)` |
+    ///
+    /// 三条都调**既有的入口**（`open_picker` / `start_run`），不新开路径 ——
+    /// 所以「就地覆盖要确认」那道关（兜在 `start_run` 里，见那里的注释）
+    /// 快捷键也躲不过去。
+    ///
+    /// ★ 为什么用 `ctx.input` 轮询而不是 `ui.shortcut` / `Menu`：
+    ///   键位要在**任何页面、任何焦点位置**都成立（包括焦点在多行输入框里 ——
+    ///   那时用户正要打字，`Ctrl+Enter` 不该被吃掉）。挂在某个 widget 上会随
+    ///   焦点漂移，轮询全局输入则不会。
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // 有任务在跑就不接 —— 与底栏「执行替换」按钮的置灰条件一致。
+        let running = self.job.is_some();
+        let has_input = !self.input.trim().is_empty();
+        let (ctrl, f5, ctrl_enter) = ctx.input(|i| {
+            let m = i.modifiers;
+            let c = m.ctrl || m.command;
+            (c, i.key_pressed(egui::Key::F5), c && i.key_pressed(egui::Key::Enter))
+        });
+
+        if ctrl && ctx.input(|i| i.key_pressed(egui::Key::O)) {
+            // 「选目录」的落点跟着当前页走：批量替换页选的是**输入目录**，
+            // 另两页的起手动作是选文档（它们没有"目录"这个概念）。
+            match self.page {
+                Page::Replace => self.open_picker(PickFor::InputDir),
+                Page::Header => self.open_picker(PickFor::HeaderDocs),
+                Page::Print => self.open_picker(PickFor::PrintDocs),
+            }
+            return;
+        }
+        if f5 && !running && has_input {
+            self.start_run(true, ctx);
+            return;
+        }
+        if ctrl_enter && !running && has_input {
+            self.start_run(false, ctx);
         }
     }
 
@@ -3236,6 +3288,98 @@ pub fn selftest(args: &[String]) -> i32 {
         app.wt.set_docs(PickDoc::Print, Vec::new());
     }
 
+    // 3.7b) 三个快捷键：`Ctrl+O` / `F5` / `Ctrl+Enter`。
+    //
+    // 这三条都是**静默退化型** —— 绑错了不报错，只是按了没反应或做错事。
+    // 关键是要钉住它们"落到既有入口"这件事：`F5` 走预演（不落盘）、
+    // `Ctrl+Enter` 走实跑，而实跑在就地覆盖时**必须先弹确认** ——
+    // 快捷键不能绕过那道关（它兜在 `start_run` 入口里）。
+    {
+        use crate::wordtool::PickDoc;
+
+        let keep_input = app.input.clone();
+        let keep_page = app.page;
+        // ★ 这两样**必须原样还回去**。本块为了验「Ctrl+Enter 就地覆盖仍弹确认」，
+        //   把 `out_to_subdir` 压成 `false`；若忘了恢复，后面第 4 步那次「完整批」
+        //   就会被 `start_run` 入口的「就地确认」关拦住 —— 静默 return、什么也不跑，
+        //   产物目录零文件、运行日志与报告都不落地，而自检照样打印"执行完成"。
+        //   2026-10-12 实测踩过一次（回归第 9 组 4 项转红），故原值一律留存还原。
+        let keep_out = app.out_to_subdir;
+        let keep_confirm = app.confirm_inplace;
+
+        /// 造一帧"按下了某个键"的输入。
+        fn key(raw: &egui::RawInput, k: egui::Key, ctrl: bool) -> egui::RawInput {
+            let mut r = raw.clone();
+            r.modifiers.ctrl = ctrl;
+            r.events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: r.modifiers,
+            });
+            r
+        }
+
+        // ── `Ctrl+O` 落点跟着当前页走 ──
+        for (page, page_name, want) in [
+            (Page::Replace, "批量替换", PickFor::InputDir),
+            (Page::Header, "页眉替换", PickFor::HeaderDocs),
+            (Page::Print, "批量打印", PickFor::PrintDocs),
+        ] {
+            app.page = page;
+            let _ = ctx.run_ui(key(&raw, egui::Key::O, true), |ui| app.render(ui));
+            if app.picker_for != Some(want) {
+                println!(
+                    "  ✗ Ctrl+O 在「{page_name}」页应开 {want:?}，实际 {:?}",
+                    app.picker_for
+                );
+                return 3;
+            }
+            app.picker.close();
+            app.picker_for = None;
+        }
+        println!("  Ctrl+O 三页各自落到对应选择器：通过");
+
+        // ── `F5` = 预演（dry），不落盘 ──
+        app.page = Page::Replace;
+        app.input = "D:/wrepl-selftest/不存在也没关系.docx".to_string();
+        let _ = ctx.run_ui(key(&raw, egui::Key::F5, false), |ui| app.render(ui));
+        // 预演不该要求"就地覆盖确认" —— 它不写任何东西。
+        if app.confirm_inplace {
+            println!("  ✗ F5 预演不该弹就地覆盖确认框");
+            return 3;
+        }
+        println!("  F5 预演不弹确认框（不落盘）：通过");
+
+        // ── 没填输入时两个执行键都不该起跑 ──
+        app.input.clear();
+        let _ = ctx.run_ui(key(&raw, egui::Key::F5, false), |ui| app.render(ui));
+        let _ = ctx.run_ui(key(&raw, egui::Key::Enter, true), |ui| app.render(ui));
+        if app.confirm_inplace {
+            println!("  ✗ 没填输入时按 Ctrl+Enter 不该弹确认框");
+            return 3;
+        }
+        println!("  没填输入时 F5 / Ctrl+Enter 都不起跑：通过");
+
+        // ── `Ctrl+Enter` 就地覆盖 → 必须弹确认（快捷键不绕过那道关）──
+        app.input = "D:/wrepl-selftest/甲.docx".to_string();
+        app.out_to_subdir = false;
+        let _ = ctx.run_ui(key(&raw, egui::Key::Enter, true), |ui| app.render(ui));
+        if !app.confirm_inplace {
+            println!("  ✗ Ctrl+Enter 就地覆盖时必须弹确认框（它绕过了 start_run 的把关）");
+            return 3;
+        }
+        app.confirm_inplace = false;
+        println!("  Ctrl+Enter 就地覆盖仍走确认框：通过");
+
+        app.page = keep_page;
+        app.input = keep_input;
+        app.out_to_subdir = keep_out; // ← 关键：不还原会让第 4 步的完整批被就地确认关拦空跑
+        app.confirm_inplace = keep_confirm;
+        app.wt.set_docs(PickDoc::Header, Vec::new());
+    }
+
     // 3.8) 新增的两页（页眉替换 / 批量打印）骨架，外加页眉替换的**四种执行方式状态**：
     //      引擎（纯 Rust / Word COM）× 落盘（写副本 / 就地覆盖），以及就地覆盖那张
     //      确认框。**只是画，不触发任何动作**，所以无头环境、没装 Word 的机器上也能跑。
@@ -3325,7 +3469,16 @@ pub fn selftest(args: &[String]) -> i32 {
         }
     }
 
-    // 4) 真跑一次批量
+    // 4) 真跑一次批量。
+    //    硬保护（**第二道**）：开头 2) 查过一次 `out_to_subdir`，但上面 3.7b 等
+    //    用例会临时把它压成 false 去试分支；万一哪个用例忘了还原，必须在**跑之前**
+    //    响亮拦下 —— 否则完整批会被 `start_run` 入口的就地确认关静默挡空
+    //    （产物零文件、无运行日志无报告，却照样打印"执行完成"，回归极难定位）。
+    //    宁可当红灯，也不许静默跑空。
+    if !app.out_to_subdir {
+        println!("  ✗ 完整批硬保护触发：out_to_subdir 被前面用例改脏（应为 true），拒绝就地跑");
+        return 2;
+    }
     let dry = app.do_run_selftest(true);
     if !dry {
         println!("  ✗ 预演阶段有错误：{}", app.error.clone().unwrap_or_default());
