@@ -1203,7 +1203,21 @@ impl App {
 
     // ─────────────────────── 界面 ───────────────────────
 
-    pub fn render(&mut self, ctx: &egui::Context) {
+    /// 画一帧。
+    ///
+    /// 入参是 eframe 给的 **root `Ui`**（整窗、无内边距、无底色）。
+    ///
+    /// ★ egui 0.34 起面板只有 `Panel::*::show_inside(ui, …)` 这一条路，旧的
+    ///   `show(ctx, …)` 被标成 deprecated —— `wrepl-gui` 因此长期挂着 7 条告警
+    ///   （3 条 `TopBottomPanel`/`SidePanel` 别名 + 4 条 `show`）。搬到这里之后
+    ///   那 7 条归零，`CONTRIBUTING.md` 里「自家代码零告警」才名副其实。
+    ///
+    /// `Context` 从 `ui.ctx()` 取一份**克隆**（`Context` 内是 `Arc`，克隆很便宜）：
+    /// 主题、重绘请求与两个浮层（确认框 / 选择器）仍按 `&Context` 写，不必为了
+    /// 搬布局把它们全改一遍。
+    pub fn render(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
         // ① 先把后台线程攒下的进度收进来（不阻塞），这一帧就能画出来
         self.pump_job();
         // 新两页的任务状态在 `wt` 里，也每帧收一次
@@ -1219,12 +1233,12 @@ impl App {
         // `set_theme + apply_theme_with(palette, Comfortable)`，浅/深两套 palette
         // 各自对应迁移前 `Visuals::light()/dark()` 的角色。
         if self.applied_light != Some(self.light_theme) {
-            ds::apply(ctx, self.light_theme);
+            ds::apply(&ctx, self.light_theme);
             self.applied_light = Some(self.light_theme);
         }
 
         // ── TopBar：品牌 + 全局开关（GUIDE §1：「TopBar · brand · user menu」）──
-        egui::TopBottomPanel::top("title").show(ctx, |ui| {
+        egui::Panel::top("title").show_inside(ui, |ui| {
             let pal = ds::palette_of(ui.ctx());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1254,10 +1268,11 @@ impl App {
         //
         // GUIDE §2：3–12 个常驻区块一律用 SidePanel + NavItem（≤5 且是"同一实体的
         // 子视图"才用 Tabs）。三页各有自己的动作与状态、随时可切，属于前者。
-        egui::SidePanel::left("nav")
+        // （GUIDE 写的是 0.34 之前的名字；同一件东西现在叫 `Panel::left`。）
+        egui::Panel::left("nav")
             .exact_size(184.0)
             .resizable(false)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 // ★ 让内容**铺满整个面板宽度**（2026-10-11 那条黑条的根治）。
                 //
                 // `egui::Frame` 铺底色时用的是 `内容 min_rect + 内边距`，不是面板矩形 ——
@@ -1288,7 +1303,7 @@ impl App {
                 }
             });
 
-        egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+        egui::Panel::bottom("actions").show_inside(ui, |ui| {
             // 这一栏是「批量替换」专用的（执行按钮 / 打开目录 / 报告 / 清日志）。
             // 另两页各自把动作放在页面卡片里，所以这里直接不画。
             if self.page != Page::Replace {
@@ -1325,7 +1340,7 @@ impl App {
                     })
                     .clicked()
                 {
-                    self.start_run(false, ctx);
+                    self.start_run(false, &ctx);
                 }
                 ui.add_space(ds::SPACING.s5);
                 let open_lbl = if self.out_to_subdir {
@@ -1408,14 +1423,15 @@ impl App {
         // 运行日志**排在页面里**（中央滚动区的最后一块），与 0.2.2 一致。
         //
         // 0.2.3 中间把它改成过「贴底的独立面板」，想消掉"日志下面那片空白"。
-        // 结果是撞上 egui 0.29 的一个坑：`TopBottomPanel` 存进 state 的是**内容矩形**
+        // 结果是撞上 egui 0.29 的一个坑：`TopBottomPanel`（现在叫 `Panel::bottom`）
+        // 存进 state 的是**内容矩形**
         // 的高度（不是面板矩形），下一帧又把它当面板高度读回来；而日志里那个
         // `auto_shrink([false, false])` 的 ScrollArea 会把"可用高度"整块吃掉 ——
         // 于是内容矩形每帧比面板高一截，形成正反馈。实测**强制重绘 5 帧，面板就从
         // 168 涨到填满整个窗口**，「运行日志」的标题直接顶到标题栏下面。
         // 教训：底部面板里不要放"吃满可用高度"的东西；固定高度也压不住（会变成
         // 一条死横条），不如回到原位置 —— 日志跟着页面滚，最简单也最稳。
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 match self.page {
                     Page::Replace => {
@@ -1434,7 +1450,7 @@ impl App {
         });
 
         // 就地覆盖确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
-        self.confirm_inplace_dialog(ctx);
+        self.confirm_inplace_dialog(&ctx);
 
         // 「页眉替换 / 批量打印」两页的「选择文档」按钮**不自己弹对话框**：
         // 选择器是常驻的、全程序只有一台，所以由这里统一收口 —— 界面上那些
@@ -1450,7 +1466,7 @@ impl App {
 
         // 自绘文件选择器比确认框还要靠前（`Foreground` 面板 + 全屏遮罩），
         // 所以放在最后。它自带遮罩，两者不会同时被点到。
-        self.handle_picker(ctx);
+        self.handle_picker(&ctx);
     }
 
     /// 「就地覆盖」确认框。
@@ -2380,16 +2396,21 @@ impl App {
     }
 }
 
-/// eframe 的入口：每帧调一次 `update`，其余全交给 `render`。
+/// eframe 的入口：每帧调一次 `ui`，其余全交给 `render`。
 /// 这样布局代码也能在无窗口环境里被 `selftest` 直接驱动（见 `selftest`）。
 ///
-/// 0.34 起 `App::ui` 成为**必需**方法（拿到的是 root `Ui`），旧的
-/// `App::update(ctx, frame)` 被标 `#[deprecated]` 但**仍会被调用**。
-/// 迁移第 1 步只升依赖、不动面板结构：`render(ctx)` 仍从 `update` 进，
-/// 所以这里留一个空的 `ui`。等第 2 步接设计系统时再决定是否把布局搬进 `ui`。
+/// ★ 2026-10-12：把布局从 `update(ctx)` 搬进 `ui(ui)`，并**删掉 `update`**。
+///
+///   起因是 egui 0.34 的面板迁移：`Panel::*::show_inside(ui, …)` 需要一枚 `Ui`，
+///   而 `update` 只给 `ctx`。既然要动，就一步到位 —— `ui` 本来也是 0.34 起
+///   推荐、且**必需**的那个入口（`update` 已 deprecated，eframe 内部
+///   `epi_integration.rs:294/299` 先调 `update` 再调 `ui`，两条都在就都会跑）。
+///   留着 `update` 只会多一条谁都不该再用的通路，还白白吃一个 `#[allow(deprecated)]`。
+///
+///   ⚠ 两条通路**不能同时**非空 —— 那会一帧画两遍。这里只留 `ui`。
 impl eframe::App for App {
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 空实现：真正的绘制仍在 `update` → `render(ctx)` 里。
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
     }
 
     /// 窗口清屏色。
@@ -2400,14 +2421,6 @@ impl eframe::App for App {
     /// 之前界面中间那条扎眼的黑条就是它。设成主题背景色，缝即便还在也隐身。
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         ds::window_bg(self.light_theme)
-    }
-
-    // 0.34 已把 `update` 标为 deprecated（推荐改用 `ui`），但框架仍然调用它，
-    // 且我们的布局代码就是按 `&egui::Context` 写的。第 1 步刻意保留这条通路，
-    // 避免"升依赖"和"改结构"混在一次提交里 —— 所以显式压掉弃用告警。
-    #[allow(deprecated)]
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.render(ctx);
     }
 }
 
@@ -2828,7 +2841,7 @@ pub fn selftest(args: &[String]) -> i32 {
         egui::vec2(1280.0, 800.0),
     ));
     for _ in 0..3 {
-        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
     }
     println!("  布局 3 帧通过（无 panic）");
 
@@ -2870,7 +2883,7 @@ pub fn selftest(args: &[String]) -> i32 {
         .join("\n");
     app.clear_armed = true;
     for _ in 0..2 {
-        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+        let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
     }
     app.clear_armed = false;
     app.input = keep_input;
@@ -2880,10 +2893,10 @@ pub fn selftest(args: &[String]) -> i32 {
     //      它是跟着「输出到子文件夹」启停的，普通一趟渲染只能照到其中一态。
     let keep_out = app.out_to_subdir;
     app.out_to_subdir = false;
-    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
     app.out_to_subdir = true;
     app.mirror = true;
-    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
     app.mirror = false;
     app.out_to_subdir = keep_out;
     println!("  「完整镜像」可用 / 置灰两态：布局通过");
@@ -2921,7 +2934,7 @@ pub fn selftest(args: &[String]) -> i32 {
                 // 确认框只在"纯 Rust + 就地覆盖"这条路上出现
                 app.wt.hdr_confirm = in_place && engine == Engine::Rust;
                 for _ in 0..2 {
-                    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+                    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
                 }
             }
         }
@@ -2948,7 +2961,7 @@ pub fn selftest(args: &[String]) -> i32 {
     ] {
         app.open_picker(what);
         for _ in 0..2 {
-            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
         }
         // 照完就收：面板是**常驻**的（跨次打开记着上次停在哪），不收的话
         // 后面几帧会一直浮着那块全屏遮罩，把后面的自检项全挡住。

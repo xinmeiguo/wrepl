@@ -186,16 +186,17 @@ pub fn apply(ctx: &egui::Context, light: bool) {
 /// ★ 为什么必须显式给（2026-10-11，追"中间那条黑条"追出来的）
 ///
 /// eframe 的默认实现返回**全透明**，落到窗口上就是**纯黑**。平时看不出来 ——
-/// `SidePanel` / `CentralPanel` 各自把自己的矩形铺满；但只要两块面板之间留下一道
+/// `Panel::left` / `CentralPanel` 各自把自己的矩形铺满；但只要两块面板之间留下一道
 /// 谁都没刷到的缝，缝里露出的就是这个清屏色。
 ///
 /// 实测（给 `panel_fill` 涂蓝、`noninteractive.bg_stroke` 涂品红的色标探针）：
 /// 侧栏右侧那条 11px 的"黑条"换遍所有主题色纹丝不动，而真正的 1px 分隔线在它右边
-/// 一格 —— 说明它压根不是画出来的，是 `SidePanel` 的 `Frame` 只铺到 `exact_size`
+/// 一格 —— 说明它压根不是画出来的，是 `Panel::left`（egui 0.34 前的
+/// `SidePanel`）的 `Frame` 只铺到 `exact_size`
 /// 宽、而面板预留宽度还多一圈内边距，余下那一段没人画。
 ///
 /// 设成主题的 `bg_app` 之后，这类缝即使还在也与两侧同色（等于隐身）。
-/// 这只是**兜底**：真正消缝的是 `app.rs` 里 `SidePanel` 那句
+/// 这只是**兜底**：真正消缝的是 `app.rs` 里 `Panel::left` 那句
 /// `ui.set_min_width(ui.available_width())`。
 pub fn window_bg(light: bool) -> [f32; 4] {
     let c = if light {
