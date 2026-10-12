@@ -255,6 +255,34 @@ pub fn debug_page_mode() -> Option<String> {
     Some(v)
 }
 
+/// `WREPL_DEBUG_DROP=hover|drop` —— 复现拖放的两态。
+///
+/// `hover` = 悬着东西不松手（整窗遮罩那一条路）；`drop` = 直接落地（走
+/// [`crate::gui::app::App`] 的落点分派）。
+///
+/// 存在的理由同上：本机合成鼠标进不来窗口，而拖放是**按住不放**才有的状态，
+/// 真实操作根本构造不出来 —— 不给开关就只能靠"信代码写了"。
+/// 形如 `WREPL_DEBUG_DROP=drop;D:/wrepl-selftest` 可带上要拖的路径（`;` 分隔）。
+pub fn debug_drop_mode() -> Option<(bool, Vec<std::path::PathBuf>)> {
+    let v = std::env::var("WREPL_DEBUG_DROP").ok()?;
+    let mut it = v.splitn(2, ';');
+    let mode = it.next()?.trim().to_ascii_lowercase();
+    if mode.is_empty() {
+        return None;
+    }
+    let paths = it
+        .next()
+        .map(|s| {
+            s.split([';', ','])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((mode == "hover", paths))
+}
+
 // ─────────────────────────── 时间戳 ───────────────────────────
 
 /// 本机时区的 `YYYY-MM-DD HH:MM:SS.mmm`。走 Win32 `GetLocalTime`，

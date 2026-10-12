@@ -1465,8 +1465,14 @@ impl App {
         }
 
         // 自绘文件选择器比确认框还要靠前（`Foreground` 面板 + 全屏遮罩），
-        // 所以放在最后。它自带遮罩，两者不会同时被点到。
+        // 所以放在确认框之后。它自带遮罩，两者不会同时被点到。
         self.handle_picker(&ctx);
+
+        // 拖放**必须排在 `handle_picker` 之后** —— 选择器自己带一层全屏遮罩
+        // （`Order::Foreground`），而拖放提示那层画在它下面会被整片盖掉
+        // （实测：坐标、可见性都对，但屏幕上什么都看不见）。
+        // 选路按当前页决定，此刻 `self.page` 已是本帧最终值。
+        self.handle_drop(&ctx);
     }
 
     /// 「就地覆盖」确认框。
@@ -2176,6 +2182,197 @@ impl App {
         }
     }
 
+    // ── 拖放 ────────────────────────────────────────────────────────────
+
+    /// 每帧收一次拖放输入，**落点按当前页决定**。
+    ///
+    /// 与自绘面板、系统对话框并列 —— 拖放只是"又一种把路径塞进来的壳"，
+    /// 落点仍走 [`App::apply_picked`] 那条唯一漏斗，所以不会出现"拖进来的和
+    /// 选进来的行为不一样"。
+    ///
+    /// ★ `dropped_files` / `hovered_files` 是 [`egui::RawInput`] 里**每帧**的
+    ///   输入，落到哪一帧就在那一帧取走，**不能缓存**（缓存下来会重复消费同一批）。
+    fn handle_drop(&mut self, ctx: &egui::Context) {
+        // 拖拽中的提示：只在真的悬着东西时画，且不进页面布局。
+        // 插进页面里的话，`hovered_files` 每帧都变，内容会被顶得来回跳。
+        self.drop_overlay(ctx);
+
+        // `DroppedFile.path` 是 `Option` —— 浏览器后端拖进来的是文件内容、
+        // 没有路径。本程序只认本地路径，`None` 的直接丢掉（不能给它一个空串，
+        // 那会变成"往清单里塞一条空路径"，后面才炸）。
+        //
+        // 正常情况下这里是空的；只有 `WREPL_DEBUG_DROP=hover|drop` 才会拿到东西
+        // —— 本机合成鼠标进不来窗口（见 `diag` 模块开头），拖放是"按住不放"
+        // 才有的状态，真实操作构造不出来，只能让程序自己做。
+        let injected = crate::diag::debug_drop_mode();
+        let dropped: Vec<PathBuf> = if let Some((hover, paths)) = &injected {
+            if *hover {
+                return; // 只画遮罩，不落地
+            }
+            paths.clone()
+        } else {
+            std::mem::take(&mut ctx.input(|i| i.raw.dropped_files.clone()))
+                .into_iter()
+                .filter_map(|f| f.path)
+                .collect()
+        };
+        if dropped.is_empty() {
+            return;
+        }
+        crate::diag::log(format!("拖放：收到 {} 项", dropped.len()));
+
+        // 按住 Ctrl = 追加到现有内容，否则替换 —— 与资源管理器里 Ctrl 多选
+        // 的习惯一致，也和 `picker.rs` 里那枚框选橡皮筋一致。
+        let append = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+
+        match self.page {
+            // 「输入」栏本来就吃目录与文件的混合列表（`input_paths` 会遍历目录），
+            // 所以这里**不过滤**，原样收下。
+            Page::Replace => self.drop_into_input(dropped, append),
+            // 两个「已选文档」入口的白名单是 `.doc` / `.docx`，与那两个按钮
+            // 的选择器一致；目录**展开一层**（不递归）—— 递归展开会在拖进一个
+            // 交付包目录时静默吞进几百个文件，用户没要求。
+            Page::Header => self.drop_into_docs(dropped, append, crate::wordtool::PickDoc::Header),
+            Page::Print => self.drop_into_docs(dropped, append, crate::wordtool::PickDoc::Print),
+        }
+    }
+
+    /// 拖到「批量替换」页：写进 `input` 栏。
+    ///
+    /// 目录与文件**混着收** —— 工具自己会遍历目录，这里不替它做判断。
+    fn drop_into_input(&mut self, paths: Vec<PathBuf>, append: bool) {
+        let mut text = String::new();
+        for p in &paths {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&p.display().to_string());
+        }
+        if append && !self.input.trim().is_empty() {
+            let mut merged = self.input.trim_end().to_string();
+            merged.push('\n');
+            merged.push_str(&text);
+            self.input = merged;
+        } else {
+            self.input = text;
+        }
+        self.push_log(format!(
+            "拖入 {} 项到「输入」{}",
+            paths.len(),
+            if append { "（已追加）" } else { "" }
+        ));
+    }
+
+    /// 拖到「页眉替换 / 批量打印」两页：只收 Word 文档，目录展开一层。
+    ///
+    /// 白名单 `.doc` / `.docx` 与那两个按钮的选择器一致 —— 拖进来的和选进来
+    /// 的必须是同一批东西，否则两条路会给出不同的候选集。
+    fn drop_into_docs(
+        &mut self,
+        paths: Vec<PathBuf>,
+        append: bool,
+        which: crate::wordtool::PickDoc,
+    ) {
+        let mut kept: Vec<String> = Vec::new();
+        let mut skipped = 0usize;
+        for p in &paths {
+            if p.is_dir() {
+                // 目录只展开一层，不递归。
+                let Ok(rd) = std::fs::read_dir(p) else {
+                    skipped += 1;
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let ep = e.path();
+                    if ep.is_file() && is_word_doc(&ep) {
+                        kept.push(ep.display().to_string());
+                    }
+                }
+            } else if is_word_doc(p) {
+                kept.push(p.display().to_string());
+            } else {
+                skipped += 1;
+            }
+        }
+        if kept.is_empty() {
+            self.push_log(format!(
+                "拖入的 {} 项里没有 Word 文档（只收 .doc / .docx）{}",
+                paths.len(),
+                if skipped > 0 {
+                    format!("，已跳过 {skipped} 项")
+                } else {
+                    String::new()
+                }
+            ));
+            return;
+        }
+        if append {
+            // 追加：先取回现有列表再拼上，与 `apply_picked` 的"整表替换"区分开。
+            let mut all: Vec<String> = self.wt.docs_of(which).to_vec();
+            all.extend(kept.iter().cloned());
+            self.wt.set_docs(which, all);
+        } else {
+            self.wt.set_docs(which, kept.clone());
+        }
+        self.push_log(format!(
+            "拖入 {} 个 Word 文档到「{}」{}",
+            kept.len(),
+            match which {
+                crate::wordtool::PickDoc::Print => "批量打印",
+                _ => "页眉替换",
+            },
+            if append { "（已追加）" } else { "" }
+        ));
+    }
+
+    /// 拖拽进行中的整窗遮罩提示。
+    ///
+    /// "这个窗口能接拖放"在界面上没有任何静态线索，拖过来的当口得说一句。
+    /// 用 `egui::Area`（`Order::Foreground` + `interactable(false)`）而不是往
+    /// 页面里插一行 —— 后者会被上面那个"每帧都变"的问题顶得跳。
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        // 真实悬停，或者 `WREPL_DEBUG_DROP=hover` —— 后者是为了截图/复现
+        // 那个"按住不放"的状态，见 `diag::debug_drop_mode`。
+        let forced = crate::diag::debug_drop_mode().is_some_and(|(h, _)| h);
+        if !forced && ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let pal = ds::palette_of(ctx);
+        // ★ 用 `egui::Area`（`Order::Foreground`）而不是往页面里插一行：
+        //   插进布局的话 `hovered_files` 每帧都变，内容会被顶得来回跳。
+        //   `interactable(false)` = 纯提示，不吃掉底下任何点击。
+        //
+        //   面积取 `content_rect`（面板区，不含顶栏 / 底栏那两条）——
+        //   这也正是拖放真正能落下的范围；已弃用的 `screen_rect` 不要再用。
+        egui::Area::new(egui::Id::new("wrepl-drop-overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let rect = ui.ctx().content_rect();
+                let (r, _) = ui.allocate_exact_size(rect.size(), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(
+                    r,
+                    6.0,
+                    egui::Color32::from_black_alpha(if pal.dark_mode { 150 } else { 90 }),
+                );
+                painter.rect_stroke(
+                    r.shrink(3.0),
+                    6.0,
+                    egui::Stroke::new(2.0_f32, pal.brand_default),
+                    egui::StrokeKind::Middle,
+                );
+                painter.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "松手即可加入清单",
+                    egui::FontId::proportional(20.0),
+                    pal.text_primary,
+                );
+            });
+    }
+
     /// 兜底：用系统原生对话框重来一遍（面板右下角「...」）。
     ///
     /// 逻辑与自绘面板**完全一致**，只是换了个选路径的壳 —— 结果都汇到
@@ -2514,6 +2711,24 @@ fn short_name(p: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string()
+}
+
+/// 是不是 Word 文档 —— `.doc` / `.docx`，**不看大小写**。
+///
+/// 拖放的白名单与「页眉替换 / 批量打印」那两页的选择器白名单是同一个来源
+/// （`fallback_dialog` 里的 `add_filter("Word 文档", &["doc", "docx"])`），
+/// 所以拖进来的必须是同一批东西，否则两条路给出的候选集会不一样。
+///
+/// 之所以自己判而不在 `is_dir()` 之后交给别处：拖进来的路径是**任意**用户
+/// 塞进来的，什么都可能有，扩展名这一关不能省。
+fn is_word_doc(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            e == "doc" || e == "docx"
+        })
+        .unwrap_or(false)
 }
 
 /// 「输入」那一栏文本里的**第一个**路径。
@@ -2900,6 +3115,126 @@ pub fn selftest(args: &[String]) -> i32 {
     app.mirror = false;
     app.out_to_subdir = keep_out;
     println!("  「完整镜像」可用 / 置灰两态：布局通过");
+
+    // 3.8) 拖放：遮罩（拖拽中）与落点（三个页面各一种）都要画得出来。
+    //
+    // 遮罩那条路平时照不到 —— `hovered_files` 只在真的悬着东西时非空，
+    // 而它一帧一变，普通渲染跑不到。落点三页则各自有独立的过滤规则
+    // （批量替换不过滤、另两页只收 .doc/.docx 且目录展开一层），
+    // 走错一条就是"拖进来的和选进来的候选集不一样"。
+    {
+        use crate::wordtool::PickDoc;
+
+        // 拖放这一段会改 `input` / `page` / 两个文档列表，后面 3.9 的预演要用
+        // `input` —— 先存一份再动手。
+        let keep_input = app.input.clone();
+        let keep_page = app.page;
+
+        fn dropped(p: &[&str]) -> Vec<egui::DroppedFile> {
+            p.iter()
+                .map(|s| egui::DroppedFile {
+                    path: Some(PathBuf::from(s)),
+                    ..Default::default()
+                })
+                .collect()
+        }
+
+        // 遮罩：悬停时画一帧（不 drop，只看布局不炸）。
+        // `HoveredFile` 只有 `path` + `mime`（没有 `DroppedFile` 那些字节/时间戳）。
+        let mut hover = raw.clone();
+        hover.hovered_files = ["D:/wrepl-selftest/x.docx"]
+            .iter()
+            .map(|s| egui::HoveredFile {
+                path: Some(PathBuf::from(s)),
+                ..Default::default()
+            })
+            .collect();
+        let _ = ctx.run_ui(hover, |ui| app.render(ui));
+        println!("  拖拽悬停遮罩：布局通过");
+
+        // 落点 ①：批量替换页 —— 目录与文件混着收，不过滤。
+        app.page = Page::Replace;
+        let mut d1 = raw.clone();
+        d1.dropped_files = dropped(&["D:/wrepl-selftest/目录", "D:/wrepl-selftest/甲.docx"]);
+        let _ = ctx.run_ui(d1, |ui| app.render(ui));
+        let got = app.input.clone();
+        let want = "D:/wrepl-selftest/目录\nD:/wrepl-selftest/甲.docx";
+        if got.trim() != want {
+            println!("  ✗ 拖放到「输入」不对：\n    期望 {want}\n    实际 {got}");
+            return 3;
+        }
+        println!("  拖放到「输入」（目录+文件混收）：通过");
+
+        // 不按 Ctrl 再拖一次 = **替换**（不是追加）。这条要钉住：
+        // 「第二次拖放没按 Ctrl 就把上一次的清掉了」是设计如此，不是 bug ——
+        // 钉它是为了让"没按 Ctrl 会清空"这件事变成有意为之，而不是碰巧。
+        let mut d2 = raw.clone();
+        d2.dropped_files = dropped(&["D:/wrepl-selftest/乙.docx"]);
+        let _ = ctx.run_ui(d2, |ui| app.render(ui));
+        let got = app.input.clone();
+        if got.trim() != "D:/wrepl-selftest/乙.docx" {
+            println!("  ✗ 不按 Ctrl 拖放应是替换语义，实际：{got}");
+            return 3;
+        }
+        println!("  第二次拖放（无 Ctrl）替换而非追加：通过");
+
+        // 按住 Ctrl 再拖 = **追加**，上一次的还在。
+        let mut d3 = raw.clone();
+        d3.dropped_files = dropped(&["D:/wrepl-selftest/丙.docx"]);
+        d3.modifiers.ctrl = true;
+        let _ = ctx.run_ui(d3, |ui| app.render(ui));
+        let got = app.input.clone();
+        if !got.contains("乙.docx") || !got.contains("丙.docx") {
+            println!("  ✗ 按住 Ctrl 拖放应追加，实际：{got}");
+            return 3;
+        }
+        println!("  按住 Ctrl 拖放追加：通过");
+        app.input.clear();
+
+        // 落点 ②：页眉替换页 —— 只收 Word 文档，别的静默跳过。
+        app.page = Page::Header;
+        let mut d4 = raw.clone();
+        d4.dropped_files = dropped(&[
+            "D:/wrepl-selftest/甲.docx",
+            "D:/wrepl-selftest/笔记.txt",
+            "D:/wrepl-selftest/报表.xlsx",
+        ]);
+        let _ = ctx.run_ui(d4, |ui| app.render(ui));
+        let docs = app.wt.docs_of(PickDoc::Header);
+        if docs.len() != 1 || !docs[0].ends_with("甲.docx") {
+            println!("  ✗ 页眉页拖放白名单不对：{docs:?}");
+            return 3;
+        }
+        println!("  拖放到「页眉替换」（只收 .doc/.docx）：通过");
+
+        // 落点 ③：批量打印页 —— 走的是另一个列表，别串到页眉那份。
+        app.page = Page::Print;
+        let mut d5 = raw.clone();
+        d5.dropped_files = dropped(&["D:/wrepl-selftest/丙.doc"]);
+        let _ = ctx.run_ui(d5, |ui| app.render(ui));
+        // 两个断言合起来钉住"落点独立"：打印页自己收到，且**没有**串到页眉那份。
+        if app.wt.docs_of(PickDoc::Print).len() != 1
+            || !app.wt.docs_of(PickDoc::Print)[0].ends_with("丙.doc")
+        {
+            println!(
+                "  ✗ 批量打印页没收到拖进来的文档：{:?}",
+                app.wt.docs_of(PickDoc::Print)
+            );
+            return 3;
+        }
+        if app.wt.docs_of(PickDoc::Header).iter().any(|s| s.ends_with("丙.doc")) {
+            println!("  ✗ 打印页的拖放串到了页眉那份列表里");
+            return 3;
+        }
+        println!("  拖放到「批量打印」（.doc 也收、落点独立）：通过");
+
+        // 复原：拖放这一段动了 `input`、`page` 与两个文档列表，
+        // 后面 3.9 的预演还要用 `input` —— 留着改过的值会连累它。
+        app.page = keep_page;
+        app.input = keep_input;
+        app.wt.set_docs(PickDoc::Header, Vec::new());
+        app.wt.set_docs(PickDoc::Print, Vec::new());
+    }
 
     // 3.8) 新增的两页（页眉替换 / 批量打印）骨架，外加页眉替换的**四种执行方式状态**：
     //      引擎（纯 Rust / Word COM）× 落盘（写副本 / 就地覆盖），以及就地覆盖那张
