@@ -13,6 +13,22 @@
 //! · **映射网盘**（`Z:` 这类）—— 文件系统层面与本地盘无异，`std::fs` 一视同仁；
 //!   盘符栏会把它标成「网络」并显示它映射到哪个 UNC
 //! · **局域网 UNC**（`\\server\share\...`）—— 地址栏直接粘，`std::fs` 照样读
+//! · **只浏览**（[`Mode::Browse`]）—— 「打开源目录 / 打开报告」两个入口用它：
+//!   不看什么都不选也能开，省掉一个资源管理器窗口
+//!
+//! ## 外壳：一个真窗口（第 5a 步）
+//!
+//! 面板从"内嵌模态（`Area` + 全屏遮罩）"换成了 `egui::Window`：
+//!
+//! * 标题栏可拖、右上角带 ×（`Window::open` 写一个 bool）、右下角可缩放 ——
+//!   都是 egui 自带的，这里只调参数；
+//! * **标题栏不写字**：面板左上角（侧栏首行）已经有一模一样的标题，再在标题栏
+//!   写一遍就是同一个名字出现两次。`Window::new("")`，但 Id 显式钉死，好让
+//!   **所有选择器共用一份"上次拖到多大"的记忆**（尺寸天然同步）；
+//! * **没有遮罩**：面板开着照样能点主界面（比如顶栏切主题）。4a 那层遮罩会
+//!   把落到下面的点击吞掉，"开着面板切不了主题"就是它造成的；
+//! * 尺寸用 `default_size`（内容区 920×600，可缩放），居中用 `anchor`；
+//! * **只换了外壳容器**：导航、侧栏、面包屑、列表、图标、调色板接入一概没动。
 //!
 //! ## 三个必须记住的实现约束
 //!
@@ -43,14 +59,36 @@ use crate::ds;
 
 // ─────────────────────────── 对外接口 ───────────────────────────
 
-/// 面板尺寸（点）。居中位置由它算出来，别在别处硬编码偏移量。
+/// 面板**内容区**尺寸（点）—— 交给 `Window::default_size`，居中由
+/// `anchor(CENTER_CENTER)` 负责，**别在别处硬编码偏移量**。
 ///
 /// **与 0.2.2 一致（920×600）**：1000×640 那次放大跟着整体字号一起做，
 /// 实际看着偏大。字号保持放大，面板回到原尺寸即可。
+///
+/// 注意它是**内容区**不是外框：egui 把 `default_size` 当"窗口的内部尺寸"用，
+/// 外框还要再各加一圈 12px 内边距。4a 那版 `ui.set_width/set_height` 圈的
+/// 也正是这块矩形 —— 所以从内嵌面板换到 `Window` 之后，内容区一点没变。
+///
+/// 高度**只给 `default_size`，不再另钉 `min_size`**：2026-10-12 试过用
+/// `min_size` 把四个模式的高度统一，结果外框被抬到 730 点，xin 的原话是
+/// 「太高了 还是以前的好」。`Window` 按内容收放是它本来的手感，
+/// `Files`/`Save` 比 `Folder`/`Browse` 高 16 px（多一行「文件名」）就随它去。
 const PANEL_W: f32 = 920.0;
 const PANEL_H: f32 = 600.0;
 
-/// 面板要干什么。三种模式决定「确认」按钮的含义与返回什么。
+/// 底部那块（状态栏 + 分隔线 + 动作条）高度的**开局猜测值**（点）。
+///
+/// 列表高度 = 可用高度 − 这块的高度，而这块的高度**只能画完才知道**
+/// （列表在它上面），所以第一帧先用它顶上，画完再把真值量进
+/// [`Picker::bottom_h`]，下一帧起就是准的。
+///
+/// **故意给得比实际大**：宁可第一帧列表矮一点、下一帧长回来，也不能给小了
+/// —— 给小了内容就会超出可用高度，而 egui 的 `Resize` 每帧做
+/// `desired = max(desired, last_content_size)`，窗口会被一帧帧往上顶，
+/// 那是**发散**的（实测「选文件」模式从 690 长到 820，顶住客户区才停）。
+const BOTTOM_H_GUESS: f32 = 190.0;
+
+/// 面板要干什么。四种模式决定「确认」按钮的含义与返回什么。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// 选一个**文件夹**（返回当前所在目录，或选中的那一个目录）。
@@ -59,12 +97,27 @@ pub enum Mode {
     Files,
     /// **另存为**（返回 `当前目录 / 文件名框内容`）。
     Save,
+    /// **只浏览** —— 「打开源目录 / 打开报告」这类入口用它。
+    ///
+    /// 语义是"看一眼那儿有什么"，不是"选一个交出去"：底部按钮是
+    /// 「打开」（选中文件才可按）与「关闭」，**不显示文件名框**，
+    /// 也不摆「...」那个系统对话框逃生口（浏览模式没有"选"的语义，
+    /// 原生对话框帮不上忙）。
+    ///
+    /// 用户在面板里**双击文件** = 这一趟真正想要的：把返回的路径交给
+    /// 调用方用系统默认程序打开（见 `App::apply_picked`）。
+    ///
+    /// 为什么不让它继续弹资源管理器：本机每新建一个 OS 窗口都要交
+    /// 「窗口税」（见模块头），而"打开目录看产物"恰恰是最常点的一个。
+    Browse,
 }
 
 /// 面板的出口。
 #[derive(Clone, Debug)]
 pub enum Outcome {
-    /// 选好了。`Folder` / `Save` 一定是 1 个路径，`Files` 是 N 个。
+    /// 选好了。`Folder` / `Save` 一定是 1 个路径，`Files` 是 N 个，
+    /// `Browse` 则是"用户在面板里选中或双击的那些**文件**"（目录不算数 ——
+    /// 浏览目录靠双击进去，不是靠这个返回值）。
     Picked(Vec<PathBuf>),
     /// 用户点了右下角的「...」——调用方改用 `rfd` 原生对话框。
     Fallback,
@@ -237,6 +290,22 @@ pub struct Picker {
     /// 盘符与快捷位的缓存（见模块头注释第 2 条）。
     drives_cache: Vec<Drive>,
     places_cache: Vec<(&'static str, PathBuf)>,
+
+    /// 底部那一块（状态栏 + 分隔线 + 动作条）**上一帧量出来的高度**。
+    ///
+    /// 用来算列表该分多少高度。**不能写死一个常数**：`Save` / `Files` 模式的
+    /// 「文件名」框带一行标签，比别的模式高 30 多像素；写成一个偏小的常数，
+    /// 内容就会超出窗口可用高度，而 egui 的 `Resize` 每帧做
+    /// `desired = max(desired, last_content_size)`（`resize.rs:258/323`），
+    /// 于是窗口被一帧帧往上顶 —— 实测「选文件」模式从 690 一路长到 820，
+    /// 顶住客户区才停。开局值见 [`BOTTOM_H_GUESS`]。
+    bottom_h: f32,
+
+    /// 框选（橡皮筋）的起点；没在拖就是 `None`。
+    ///
+    /// 自己记一个 `Pos2`，而不是拿 `Response::drag_delta()` 反推起点 ——
+    /// 那个量是"本帧位移"还是"累计位移"在 egui 各版本里改过，不依赖它。
+    rubber_start: Option<egui::Pos2>,
 }
 
 impl Default for Picker {
@@ -275,6 +344,8 @@ impl Picker {
             last_dir: home,
             drives_cache: Vec::new(),
             places_cache: Vec::new(),
+            bottom_h: BOTTOM_H_GUESS,
+            rubber_start: None,
         };
         p.refresh_places();
         p
@@ -319,6 +390,10 @@ impl Picker {
         self.err = None;
         self.sel.clear();
         self.anchor = None;
+        self.rubber_start = None;
+        // 换个模式，底部那块的高度就不一样了（`Save` / `Files` 多一行「文件名」框）
+        // —— 从猜测值重新收敛，别把上一个模式量到的值带过来。
+        self.bottom_h = BOTTOM_H_GUESS;
         // 每次打开都从"面包屑"开始 —— 上次可能停在手输状态，留着会让人以为坏了。
         self.addr_editing = false;
         self.open = true;
@@ -351,6 +426,16 @@ impl Picker {
         self.navigate(dir);
     }
 
+    /// 强制收掉面板。
+    ///
+    /// 只有**无头自检**用得着：它在同一个进程里连着开好几个面板照帧，
+    /// 照完必须收回来，否则后面那几帧会一直浮着一块遮罩。
+    /// 用户路径上不需要它 —— 面板自己在选中 / 取消 / Esc 时就关了。
+    pub fn close(&mut self) {
+        self.open = false;
+        self.load = None;
+    }
+
     /// 每帧调用。面板关着时返回 `None`；有结果时返回一次并自动关闭。
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Outcome> {
         if !self.open {
@@ -365,44 +450,90 @@ impl Picker {
             return Some(Outcome::Cancelled);
         }
 
-        // 0.34：`screen_rect()` 拆成 viewport_rect / content_rect，旧实现就是
-        // `content_rect()`。遮罩要铺满可绘制区，用后者（行为不变）。
-        let screen = ctx.content_rect();
         let mut act: Option<Act> = None;
 
-        // ① 遮罩：吞掉落到底下主界面的点击（不然面板开着还能点到后面的按钮）。
-        //    `Order::Middle` 高于页面（`Background`）、低于面板（`Foreground`），
-        //    正好夹在中间。刻意用**不同 Layer** 而不用同层绘制顺序定序 —— 后者不稳。
-        egui::Area::new(egui::Id::new("wrepl-picker-veil"))
-            .order(egui::Order::Middle)
-            .fixed_pos(egui::Pos2::ZERO)
-            .interactable(true)
-            .show(ctx, |ui| {
-                ui.allocate_response(screen.size(), Sense::click_and_drag());
-                ui.painter()
-                    .rect_filled(screen, 0.0, Color32::from_black_alpha(100));
-            });
-
-        // ② 面板本体。`all` 先 take 出来，免得闭包里同时借 `&mut self` 和 `&self.all`。
-        //    尺寸用常量，居中偏移由它算出来 —— 否则改了宽度忘了改那个 `-470.0`，
-        //    面板就会偏在屏幕一边（宽度一改，居中量就跟着变）。
+        // 面板本体：一个**真窗口**（`egui::Window`）—— 2026-10-11「第 5a 步」从
+        // "内嵌模态面板"（自己摆位置 + 铺全屏遮罩的 `Area`）换过来。为什么换壳：
+        //
+        // · 内嵌面板得自己算居中位置、自己画一块全屏遮罩，而且**关不掉、拖不动**；
+        //   `Window` 把这三样都自带：标题栏（可拖）、×（`Window::open` 给一个 bool）、
+        //   右下角的缩放角 —— 一样都不用自己实现。
+        // · **刻意不要遮罩**。4a 那份遮罩有个遗留毛病：它吞掉落到底下主界面的点击，
+        //   于是"面板开着就没法点顶栏切主题"。去掉之后"点外面照样能操作主界面"
+        //   才是窗口化交互该有的手感。
+        //
+        // 几何：`default_size` 是**内容区**尺寸（egui 源码原话 "Default inner size of
+        // a window"），与 4a 里 `set_width/set_height` 圈出来的 920×600 是同一块矩形
+        // —— 只是这里写 `PANEL_W + gutter`，多出来的 `gutter` 是滚动条槽，
+        // 为的是让**自绘的内容区**正好落在 920×600 上（详见下面 `.show` 里那段）。
+        // **不用 `fixed_size`** —— 那样就没有缩放手感了；`resizable(true)` 真能拖，
+        // 拖完之后内容按同样规则跟着走（减掉 gutter 就不发散）。
+        // 居中交给 `anchor(CENTER_CENTER)`，不再自己拿屏幕中心减偏移量
+        // （4a 那个 `-PANEL_W/2` 是拿"内容尺寸"当外框算的，本来就不精确）。
+        //
+        // `all` 先 take 出来，免得闭包里同时借 `&mut self` 和 `&self.all`。
         let entries = std::mem::take(&mut self.all);
-        egui::Area::new(egui::Id::new("wrepl-picker"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(
-                (screen.center().x - PANEL_W / 2.0).max(8.0),
-                (screen.center().y - PANEL_H / 2.0).max(8.0),
-            ))
+        // 面板内那层 ScrollArea 给滚动条预留的宽度（DS 把 `floating_allocated_width`
+        // 定成常显细条的 4px）。内容宽度要减掉它、`default_size` 要加上它 ——
+        // 两处的理由见 `.show(...)` 里那段注释。
+        let gutter = ctx.global_style().spacing.scroll.floating_allocated_width;
+        // × 直接由 `Window::open` 管：用户点它时 egui 把这个 bool 写成 `false`。
+        let mut open = true;
+        // ★ 标题栏**不写字**：面板左上角（侧栏首行）已经有一模一样的标题，
+        //   标题栏再写一遍就是同一个名字出现两次。
+        //   空标题必须配一个**显式 Id**：`Window::new(title)` 是拿标题当 Id 的，
+        //   标题空了所有选择器就会共用一个空 Id（还可能跟别处的空标题窗口撞车）。
+        //   钉死 Id 顺带解决另一件事 —— 所有选择器共用一份"上次拖到多大"的记忆，
+        //   尺寸天然同步，不会这个 690 那个 820。
+        egui::Window::new("")
+            .id(egui::Id::new("wrepl_picker"))
+            .open(&mut open)
+            .title_bar(true)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([PANEL_W + gutter, PANEL_H])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            // 外壳风格沿用**设计系统的窗口**那一套：`Frame::window` 读的正是
+            // `visuals.window_fill / window_stroke / window_corner_radius /
+            // window_shadow`，而这几项由 `ds::apply` 从 palette 写进 style。
+            // 只把内边距钉回**第 1 步**的 `Margin::same(12)`（不是 style 的
+            // `window_margin`）—— 与 4a 的内边距一字不差。
+            .frame(
+                egui::Frame::window(ctx.global_style().as_ref())
+                    .inner_margin(egui::Margin::same(12)),
+            )
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .inner_margin(egui::Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.set_width(PANEL_W);
-                        ui.set_height(PANEL_H);
-                        act = self.body(ui, ctx, &entries);
-                    });
+                // ★ 内容宽度钉到 `可用 − 滚动条预留`。这一句是**必须**的，
+                //   少了它窗口会每帧变宽 4px、一路顶到屏幕边（实测 946→950→954→…）。
+                //
+                //   成因两句：
+                //   ① 面板里那个竖向 ScrollArea 按 DS 给滚动条留的
+                //      `floating_allocated_width`（当前 4px）**额外**占一格，
+                //      于是"内容比可用区宽 4px"；
+                //   ② egui 的 `Resize` 每帧做 `desired = max(desired, last_content_size)`
+                //      （resize.rs:258/323，官方注释写明是"为了不因分隔线这类撑满
+                //      宽度的控件自动缩回去"）。
+                //   两者一乘 = 发散循环。
+                //
+                //   把宽度先减掉这一格，① 的溢出与 ② 的抬升正好抵消：`内容 == 期望`，
+                //   循环停在不动点。**减掉的这 4px 就是滚动条槽本身**，所以自绘区域
+                //   所见与 4a 逐像素一致（4a 也是把槽画在这 4px 上）；只是窗口外框
+                //   因此比 4a 宽 4px（`default_size` 同步 +gutter 补回来），属"外壳变化"。
+                //   高度侧没有这个问题（`ScrollArea::vertical` 不占高），照旧钉住即可。
+                let avail = ui.available_size();
+                ui.set_width((avail.x - gutter).max(1.0));
+                ui.set_height(avail.y);
+                act = self.body(ui, ctx, &entries);
             });
         self.all = entries;
+
+        // 点了 ×：行为与「取消 / 关闭」等价（见 [`Outcome::Cancelled`]）。
+        if !open {
+            crate::diag::log("选择器关闭：点了 ×");
+            self.open = false;
+            self.load = None;
+            return Some(Outcome::Cancelled);
+        }
 
         match act {
             Some(Act::Close(o)) => {
@@ -692,6 +823,27 @@ impl Picker {
                     None
                 } else {
                     Some(vec![resolve_typed(&self.cwd, typed)])
+                }
+            }
+            Mode::Browse => {
+                // 浏览模式把"选中的文件"当作"要打开的文件"。一个都没选 → `None`，
+                // 底部「打开」跟着置灰 —— 这时唯一可做的就是「关闭」。
+                //
+                // 与 `Files` 的差别只有两点：**不认文件名框**（那个框本模式不画），
+                // 以及"没选东西"时的含义不同 —— `Files` 在那里是"还没选好"，
+                // 这里是"本来就不打算打开任何东西"。
+                let files: Vec<PathBuf> = self
+                    .sel
+                    .iter()
+                    .filter_map(|&v| self.view.get(v))
+                    .filter_map(|&i| entries.get(i))
+                    .filter(|e| !e.is_dir)
+                    .map(|e| self.cwd.join(&e.name))
+                    .collect();
+                if files.is_empty() {
+                    None
+                } else {
+                    Some(files)
                 }
             }
         }
@@ -1175,8 +1327,16 @@ impl Picker {
         ui.separator();
 
         // ④ 列表
-        //    扣掉的 100 是**下面还要摆的东西**：状态栏 + 分隔线 + 底部动作条。
-        let list_h = (ui.available_height() - 100.0).max(120.0);
+        //    高度 = 可用 − **底部那一块上一帧量出来的高度**（状态栏 + 分隔线 + 动作条）。
+        //
+        //    ⚠ 这里原来写的是 `- 100.0`。给「文件名」框加了一行标签之后，
+        //    `Files` / `Save` 模式实际要 130 多像素，于是每帧都超出可用高度
+        //    → `Resize` 按 `last_content_size` 把窗口往上顶 → 下一帧可用高度更大
+        //    → 再顶 …… 实测「选文件」的窗口从 690 一路长到 820，顶住客户区才停。
+        //    （和 4a 那次宽度发散是同一个机制，只是换了根轴。）
+        //    改成量出来的值：第一帧用 [`BOTTOM_H_GUESS`] 先留够，之后收敛到真值。
+        let avail_h = ui.available_height();
+        let list_h = (avail_h - self.bottom_h).max(120.0);
         // 列表底板 + 外框。**必须在内容之前画**（Z 序 = 绘制顺序），
         // 否则这块实心底会把行里的文字整个盖住。
         let list_rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(full_w, list_h));
@@ -1187,6 +1347,21 @@ impl Picker {
             egui::Stroke::new(1.0_f32, pal.border),
             egui::StrokeKind::Inside,
         );
+
+        // ★ 框选（橡皮筋）：在列表区域按住左键拖出一个矩形，松手选中矩形里的行。
+        //   注册在**行之前** —— 后注册的在上层，行照旧吃点击；行只感知 `click`、
+        //   不感知 `drag`，所以拖拽必然落到这一块上，两者不打架。
+        let rubber = ui.interact(
+            list_rect,
+            ui.id().with("picker-rubber"),
+            egui::Sense::click_and_drag(),
+        );
+        if rubber.drag_started() {
+            self.rubber_start = ui.ctx().pointer_interact_pos();
+        }
+        // 每行的矩形：拖完用来判"框住了哪几行"。`show_rows` 只画可见行，
+        // 而橡皮筋被夹在 `list_rect` 里，看不见的行本来也碰不到。
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let loading = self
             .load
             .as_ref()
@@ -1225,6 +1400,17 @@ impl Picker {
                 egui::ScrollArea::vertical()
                     .max_height(list_h)
                     .auto_shrink([false, false])
+                    // ★ 只留「滚动条」和「滚轮」，**砍掉"拖内容来滚动"**：
+                    //   留着它，ScrollArea 自己也感知 drag，会和上面那枚橡皮筋
+                    //   抢这次拖拽，框选就时灵时不灵。滚动条与滚轮照旧好使，
+                    //   桌面列表本来也不靠拖内容滚（那是触摸屏的路子）。
+                    //
+                    //   注：`drag_to_scroll(bool)` 在 egui 0.34 已弃用，
+                    //   新口子是 `scroll_source(ScrollSource)`。
+                    .scroll_source(
+                        egui::containers::scroll_area::ScrollSource::SCROLL_BAR
+                            | egui::containers::scroll_area::ScrollSource::MOUSE_WHEEL,
+                    )
                     .show_rows(ui, row_h, self.view.len(), |ui, range| {
                         let txt_c = ui.visuals().text_color();
                         // 图标高度跟着行高走 —— 改行高时图标不会脱节。
@@ -1237,6 +1423,8 @@ impl Picker {
                             if !ui.is_rect_visible(rect) {
                                 continue;
                             }
+                            // 记下来给框选用（见上面 `row_rects` 那段）。
+                            row_rects.push((row, rect));
                             // 行底色四周内缩 1 px：不去压列表外框那一条边线。
                             let bg = rect.shrink2(egui::vec2(1.0, 0.5));
                             let selected = self.sel.contains(&row);
@@ -1308,6 +1496,63 @@ impl Picker {
                     });
             }
 
+            // ★ 橡皮筋：拖的过程中画框，松手才把框里的行选上。
+            //   松手才动 `sel` —— 拖的过程中就来回改选择，底色会在鼠标后面追着闪。
+            //
+            //   起点用 `self.rubber_start`（`drag_started()` 那一帧记下的），
+            //   不用 `Response::drag_delta()` 反推：那个量在本帧/累计之间变过。
+            let band = match (self.rubber_start, ui.ctx().pointer_interact_pos()) {
+                (Some(a), Some(b)) if rubber.dragged() || rubber.drag_stopped() => {
+                    // 夹在列表里：拖出列表的部分不该算数（也不算到别的控件头上）。
+                    Some(egui::Rect::from_two_pos(a, b).intersect(list_rect))
+                }
+                _ => None,
+            };
+            if let Some(band) = band {
+                // 太小当误触：那只是一次普通点击，交给行自己处理（见下面 `clicked`）。
+                let real = band.width() > 3.0 || band.height() > 3.0;
+                if real {
+                    // 半透明的强调色：底下那些行的图标和名字要能透出来。
+                    let p = ui.painter();
+                    p.rect_filled(
+                        band,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            pal.dir.r(),
+                            pal.dir.g(),
+                            pal.dir.b(),
+                            40,
+                        ),
+                    );
+                    p.rect_stroke(
+                        band,
+                        0.0,
+                        egui::Stroke::new(1.0_f32, pal.dir),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if real && rubber.drag_stopped() {
+                    // 按住 Ctrl 是在原选择上加，否则重新开始（与资源管理器一致）。
+                    let add = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                    if !add {
+                        self.sel.clear();
+                    }
+                    for (row, r) in &row_rects {
+                        if band.intersects(*r) {
+                            self.sel.insert(*row);
+                        }
+                    }
+                    // 锚点落到最后一行：接着按 Shift 能从这里继续连选。
+                    self.anchor = self.sel.iter().next_back().copied();
+                    crate::diag::log(format!("框选：命中 {} 项", self.sel.len()));
+                    // 这一次拖拽不该再被当成"点了某一行"。
+                    clicked = None;
+                }
+            }
+            if rubber.drag_stopped() {
+                self.rubber_start = None;
+            }
+
             // 诊断开关：这台机器上合成鼠标输入到不了窗口（`SendInput` 与
             // `PostMessage` 都被管控套件拦掉），要复现"点一下"只能让程序自己做。
             // 不设 `WREPL_DEBUG_CLICK` 时这一整段空转，不影响正常使用。
@@ -1360,7 +1605,7 @@ impl Picker {
                     self.sel.insert(row);
                     self.anchor = Some(row);
                     // 文件 / 另存为模式下点文件名，顺手填进文件名框（少敲一次）
-                    if !is_dir && self.mode != Mode::Folder {
+                    if !is_dir && !matches!(self.mode, Mode::Folder | Mode::Browse) {
                         self.file_name = name.clone();
                     }
                 }
@@ -1369,6 +1614,12 @@ impl Picker {
 
         // ⑤ 状态栏：左边「几个项目」（筛选时补一句筛出多少）、右边「选了几项」，
         //    读取失败的原因也挂在这一行。参照 Files 的 "N items / 1 item selected"。
+        //
+        //    ★ 「底部从哪开始」在这量 —— 必须**在列表之后**。写在 ④ 前面的话
+        //    量到的是「列表高 + 底部高」，而列表高又是拿它算的，两边互相追着跑：
+        //    实测会卡成 244/120 的两帧死循环（探针日志里 measured=384 与 260
+        //    交替出现，差值正好等于 list_h 的差值）。
+        let bottom_top = ui.cursor().min.y;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let n_all = entries.len();
@@ -1403,7 +1654,18 @@ impl Picker {
         ui.horizontal(|ui| {
             let need_name = matches!(self.mode, Mode::Save | Mode::Files);
             if need_name {
-                let w = if self.mode == Mode::Save { 360.0 } else { 260.0 };
+                // 宽度：`Files`（选择文件）从 260 收到 200 —— 只收这一档，
+                // `Save` 仍 360。
+                //
+                // 为什么要收：底栏那一行要同时放「文件名」框 + 整张筛选清单
+                // （7 个 `*.xxx`，实测 271 px）+「显示隐藏项」+「取消 / 打开」，
+                // 而一行可用宽度只有 719 px。放不下的时候右半边溢出去，
+                // 实测「显示隐藏项」最后两个字被「取消」按钮盖住（只看得见
+                // 「…显示隐」）。收窄 60 px 之后整行正好放得下。
+                //
+                // 只动宽度、不动「筛选」的文案：上一版把它缩成「等 7 种」+
+                // 悬停看全清单，被否了 —— 整张清单照旧列出来。
+                let w = if self.mode == Mode::Save { 360.0 } else { 200.0 };
                 // 标签按 GUIDE 挪到字段正上方（原来是并排的「文件名」+ 框）。
                 let resp = ds::InputField::new(&mut self.file_name)
                     .label("文件名")
@@ -1441,6 +1703,8 @@ impl Picker {
                     Mode::Folder => "选择此文件夹",
                     Mode::Files => "打开",
                     Mode::Save => "保存",
+                    // 浏览模式：选中什么就打开什么（没选 = 置灰）。
+                    Mode::Browse => "打开",
                 };
                 let can = self.confirm(entries).is_some();
                 if ui.add(ds::Button::primary(ok_label).disabled(!can)).clicked() {
@@ -1449,22 +1713,36 @@ impl Picker {
                     }
                 }
                 ui.add_space(8.0);
-                if ui.add(ds::Button::secondary("取消")).clicked() {
+                // 浏览模式的出口是"关掉它"，不是"放弃这次选择"—— 文案跟着变。
+                let cancel_label = if self.mode == Mode::Browse {
+                    "关闭"
+                } else {
+                    "取消"
+                };
+                if ui.add(ds::Button::secondary(cancel_label)).clicked() {
                     act = Some(Act::Close(Outcome::Cancelled));
                 }
                 ui.add_space(10.0);
                 // 兜底：自绘面板搞不定的场合退回系统对话框。
                 // 故意做得小而不显眼 —— 它是逃生口，不是主路径。
                 // 文字用 ASCII 的 `...`：`⋯`(U+22EF) 在本机是豆腐块（见上面 arrow 那段）。
-                if ui
-                    .add(ds::Button::ghost("..."))
-                    .on_hover_text("改用系统对话框（原生）")
-                    .clicked()
+                //
+                // 浏览模式不摆它：本模式不"选"任何东西，原生对话框没有对应的动作
+                // 可做（关掉面板就是全部操作）。按钮位省下来，底部更清爽。
+                if self.mode != Mode::Browse
+                    && ui
+                        .add(ds::Button::ghost("..."))
+                        .on_hover_text("改用系统对话框（原生）")
+                        .clicked()
                 {
                     act = Some(Act::Close(Outcome::Fallback));
                 }
             });
         });
+
+        // 量一下底部这一块（状态栏 + 分隔线 + 动作条）实际占了多高，留给下一帧
+        // 算列表高度 —— 见 ④ 上面那段：写死一个偏小的常数会把窗口顶大。
+        self.bottom_h = (ui.cursor().min.y - bottom_top).max(0.0);
 
         // ⑦ 全局 Enter（地址栏 / 文件名框已经吃掉的除外）。
         //    这里用 `ui.input` / `ui.memory` 而不是 `ctx` —— 绘制已经挪进
@@ -2512,7 +2790,7 @@ mod tests {
 
     /// 三种模式各自的「确认」返回什么。
     #[test]
-    fn 三种模式的确认结果() {
+    fn 各模式的确认结果() {
         let cwd = PathBuf::from(r"C:\proj");
 
         // ① 选目录：没选中任何目录 → 就是当前目录
@@ -2598,6 +2876,45 @@ mod tests {
         p.show_hidden = true;
         p.refresh_view(&entries);
         assert_eq!(p.view, vec![0], "视图该按 entries 重建，而不是对着空的 self.all 算");
+    }
+
+    /// **浏览模式**：选中文件才可按「打开」，什么都没选时按钮置灰；
+    /// 目录不算数（浏览模式下"打开目录"应当靠双击进入，不是靠这个按钮）。
+    ///
+    /// 这个模式是给「打开源目录 / 打开报告」用的 —— 那两个入口原先会弹
+    /// 系统资源管理器，现在是自绘面板（见 `Mode::Browse` 的说明）。
+    #[test]
+    fn 浏览模式只把选中的文件当结果() {
+        let mut p = Picker::new();
+        p.mode = Mode::Browse;
+        p.cwd = PathBuf::from(r"C:\proj");
+        p.all = vec![entry("报告.xlsx", false), entry("子目录", true)];
+        p.view = vec![0, 1];
+
+        // ① 什么都没选 → 置灰
+        assert_eq!(p.confirm(&p.all), None, "没选中文件时「打开」按钮该置灰");
+
+        // ② 选中一个文件 → 就是它
+        p.sel.insert(0);
+        assert_eq!(
+            p.confirm(&p.all),
+            Some(vec![PathBuf::from(r"C:\proj\报告.xlsx")])
+        );
+
+        // ③ 只选中目录 → 依然置灰（不能把目录当成"要打开的文件"）
+        p.sel.clear();
+        p.sel.insert(1);
+        assert_eq!(p.confirm(&p.all), None, "目录不是「要打开的文件」");
+
+        // ④ 选中多个 → 都给出去（调用方逐个打开）
+        p.sel.clear();
+        p.sel.insert(0);
+        p.sel.insert(1);
+        assert_eq!(
+            p.confirm(&p.all),
+            Some(vec![PathBuf::from(r"C:\proj\报告.xlsx")]),
+            "目录要被过滤掉，只剩那个文件"
+        );
     }
 
     /// 只写文件名 → 补到当前目录；绝对路径 / UNC → 原样用。

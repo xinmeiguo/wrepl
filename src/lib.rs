@@ -17,6 +17,7 @@
 //! | 模块 | 职责 |
 //! |---|---|
 //! | [`docx`] | ZIP 容器读写、part 扫描、字节级定点改写 |
+//! | [`hdr`] | 页眉替换（文本 / 图片）——纯 Rust 改 OOXML，不依赖 Word |
 //! | [`engine`] | 匹配引擎——`scan` 与 `apply` 共用，不允许"预览一套、执行一套" |
 //! | [`rules`] | 规则模型与三种来源（命令行 / 文本文件 / Excel）的解析 |
 //! | [`naming`] | 文件名同步改名（与 [`engine`] **同一套**匹配语义） |
@@ -28,6 +29,7 @@
 pub mod cli;
 pub mod docx;
 pub mod engine;
+pub mod hdr;
 pub mod naming;
 pub mod pipeline;
 pub mod probe;

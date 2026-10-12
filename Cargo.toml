@@ -1,6 +1,6 @@
 [package]
 name = "wrepl"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # 用 build.rs 把主线程栈预留**钉死在 1 MB** —— 见 build.rs 文件头。
 #
@@ -111,4 +111,12 @@ path = "src/main.rs"
 [[bin]]
 name = "wrepl-gui"
 path = "src/gui/main.rs"
+required-features = ["gui"]
+
+# 诊断用探针：把 wordtool 的 COM 子模块搬进一个**没有 egui 依赖**的 bin，
+# 逐步打印每一步 COM 的返回值。只在查「COM 那条路到底断在哪」时用。
+# 和 gui 一样挂 `windows` 依赖，所以同样需要 gui feature。
+[[bin]]
+name = "wt_probe"
+path = "src/bin/wt_probe.rs"
 required-features = ["gui"]

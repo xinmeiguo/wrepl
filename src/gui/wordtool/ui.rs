@@ -27,6 +27,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use eframe::egui::{self, RichText};
 
 use crate::ds;
+use wrepl::hdr;
 
 use super::com::ComInit;
 use super::printers::{self, Printer};
@@ -42,6 +43,12 @@ pub enum PickDoc {
     Header,
     /// 批量打印页的「选择文档」
     Print,
+    /// 页眉替换页的「选择图片…」（**只选一张**）。
+    ///
+    /// 2026-10-11 起并入自绘选择器 —— 原来它单独弹 `rfd` 系统对话框，
+    /// 是本程序里最后一个绕开自绘面板的"选文件"入口。结果落到
+    /// [`WordTool::img_path`]（单值，不是列表），见 [`WordTool::set_image`]。
+    HeaderImage,
 }
 
 /// 页眉替换的两种子模式。
@@ -51,7 +58,57 @@ pub enum HeaderMode {
     Image,
 }
 
-/// 后台 STA 线程回传的消息。
+/// 页眉替换用哪套引擎。**两套都留着**（2026-10-11 定）：哪条路出问题就切另一条。
+///
+/// * 纯 Rust（[`crate::hdr`]）—— 与「批量替换」同一原理，不要求装 Word；
+///   按 `default` / `first` / `even` **三种页眉部件逐个**处理。
+/// * Word COM（[`super::services`]）—— 老路子，要求装 Microsoft Word，
+///   只写 **default（主页眉）这一个部件**。
+///
+/// ## ★ 容易读错的一句：\"只写主页眉部件\" ≠ \"首页不变\"
+///
+/// 两者是**两件事**，2026-10-11 xin 亲自试出来并纠正过我：
+///
+/// * **部件层面**：COM 只写 `headerReference type="default"` 指向的那个部件；
+///   `first` / `even` 两个部件它不碰。
+/// * **显示层面**：页面到底显示哪个部件，由 `w:titlePg`（首页不同）与
+///   `settings.xml` 的 `evenAndOddHeaders`（奇偶页不同）两个开关决定。
+///   **两个开关都没开时（这批模板的常态：实测 5 份 LYO 全是"否/否"），
+///   首页、奇数页、偶数页统统显示主页眉** —— 所以首页和偶数页上看到的
+///   就是替换后的新内容。
+///
+/// 只有"开关开着 **且** 对应部件里真有表格"时，两套引擎的结果才会不同；
+/// 而这批模板里 `first` / `even` 部件恰恰是空的（表格数 0），
+/// 纯 Rust 那套也是按"页眉里没有表格，未处理"跳过。
+///
+/// 为什么两套都留而不是二选一：COM 那套在报告"页眉替换没生效"时**看不到真实报错**
+/// （界面日志没落盘，见 [`WordTool::log`] 里新加的镜像），在没查清根因之前
+/// 把纯 Rust 定成唯一路径，等于把"能不能修好"押在我一个人身上。
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Engine {
+    Rust,
+    Com,
+}
+
+/// 纯 Rust 引擎的落盘位置 —— 就一个勾选框，所以界面侧用 `bool` 就够
+/// （见 [`WordTool::hdr_in_place`]），拼活的时候再翻成 [`hdr::Out`]。
+///
+/// 为什么不直接存 `hdr::Out`：勾选框要的是 `&mut bool`，为它绕一层 enum
+/// 只会多出"两个真相"（勾选框与 enum 谁说了算）。
+///
+/// ## 一道要跑的活
+///
+/// 为什么不是直接存闭包：闭包只能跑一次，而"就地覆盖"要先弹确认框、
+/// 用户点了确认才真跑 —— 中间隔着若干帧。所以这里存的是**参数**，
+/// 真要跑的时候现拼闭包（见 [`WordTool::spawn_job`]）。
+enum HeaderJob {
+    /// 纯 Rust：改什么 + 落哪
+    Rust(hdr::Action, hdr::Out),
+    /// Word COM：只需要知道是文本还是图片（落盘只有"就地"一种）
+    Com(HeaderMode),
+}
+
+/// 后台线程回传的消息。
 enum WtMsg {
     Log(String),
     Progress { current: usize, total: usize },
@@ -68,6 +125,24 @@ struct Task {
 pub struct WordTool {
     // ---------- 页眉替换 ----------
     pub hdr_mode: HeaderMode,
+    /// 用哪套引擎跑（纯 Rust / Word COM）。
+    pub hdr_engine: Engine,
+    /// 纯 Rust 引擎：直接改写源文件？（默认 **false = 写到源文件旁的 out 子目录**）
+    ///
+    /// 界面侧用 `bool` 而不是 `hdr::Out`：勾选框要的就是 `&mut bool`，
+    /// 绕一层 enum 只会多出"两个真相"（勾选框与 enum 谁说了算）。
+    /// 拼活时再翻成 [`hdr::Out`]（见 [`WordTool::build_job`]）。
+    ///
+    /// 默认**不勾**：这一页处理的是交付件，先拿副本验证比事后恢复便宜得多。
+    pub hdr_in_place: bool,
+    /// 「就地覆盖」的确认框是否打开。
+    ///
+    /// `pub` 是为了让无头自检能把它置上、从而**照到确认框那一帧** ——
+    /// 本机的合成鼠标事件进不到窗口（见 `diag` 模块头），不这么做这条分支
+    /// 永远没被渲染过。运行期只有本页自己写它。
+    pub hdr_confirm: bool,
+    /// 等确认后要跑的活（确认框点"确认"时取走）。
+    hdr_pending: Option<HeaderJob>,
     pub hdr_docs: Vec<String>,
     pub text_en: String,
     pub text_cn: String,
@@ -102,6 +177,10 @@ impl WordTool {
     pub fn new() -> Self {
         Self {
             hdr_mode: HeaderMode::Text,
+            hdr_engine: Engine::Rust,
+            hdr_in_place: false,
+            hdr_confirm: false,
+            hdr_pending: None,
             hdr_docs: Vec::new(),
             text_en: String::new(),
             text_cn: String::new(),
@@ -135,7 +214,14 @@ impl WordTool {
         match what {
             PickDoc::Header => self.hdr_docs = docs,
             PickDoc::Print => self.print_docs = docs,
+            // 图片是**单值**，走 [`WordTool::set_image`]；这里收不到它。
+            PickDoc::HeaderImage => {}
         }
+    }
+
+    /// 自绘选择器选完图片之后，由 `App` 回填（只取第一张）。
+    pub fn set_image(&mut self, path: String) {
+        self.img_path = path;
     }
 
     /// 已选的文档（供 `App` 开选择器时猜起点目录）。
@@ -143,10 +229,25 @@ impl WordTool {
         match what {
             PickDoc::Header => &self.hdr_docs,
             PickDoc::Print => &self.print_docs,
+            // 图片只一张，没有"已选列表"；把当前那张借出去当起点 ——
+            // 再选一次时会停在上次选的那张图旁边，而不是回到默认目录。
+            // 空串时 `App` 那边的 `doc_start` 会当作"没有起点"处理。
+            PickDoc::HeaderImage => std::slice::from_ref(&self.img_path),
         }
     }
 
+    /// 往界面日志里追加一行，**并同时镜像到 `wrepl-gui.log`**。
+    ///
+    /// 镜像为什么收口在这里、而不是各调用点各写一遍：界面线程自己发的那些行
+    /// （"开始页眉文本替换…：N 个文档"这类，记录的正是**这一趟请求了什么**）
+    /// 原来只落在界面上，关窗即失；工作线程回传的行（`WtMsg::Log`）倒是镜像了。
+    /// 两头不齐的直接后果：日志里看得到"已完成：x.docx"，却看不出用的是哪套引擎、
+    /// 请求的是什么内容 —— 排查"替换没生效"时最需要的那半句恰好缺了。
+    ///
+    /// 收口到一处，两个来源都不会漏；`WtMsg::Log` 那边也不要再单独镜像，
+    /// 否则工作线程的每一行都会落两遍。
     fn log(&mut self, s: String) {
+        crate::diag::log(format!("[wordtool] {s}"));
         self.log.push(s);
         if self.log.len() > 500 {
             self.log.drain(0..self.log.len() - 500);
@@ -196,8 +297,15 @@ impl WordTool {
         }
     }
 
-    /// 在独立 STA 线程里跑一趟 Word COM 任务。
-    fn start<F>(&mut self, verb: &str, f: F)
+    /// 在独立线程里跑一趟活。
+    ///
+    /// `verb` 只用于日志；`need_com` 决定要不要在这个线程上初始化 STA。
+    ///
+    /// **纯 Rust 的活必须走 `need_com = false`**：`ComInit::sta()` 会 `CoInitializeEx`
+    /// 一次，那本身无害，但一旦失败（没装 Word、被管控套件拦了）就会在**真正开跑之前**
+    /// 直接把整趟活判死 —— 而纯 Rust 根本不需要 COM。页眉替换改成纯 Rust 之后，
+    /// 这里是最容易被漏掉的一根线头。
+    fn start<F>(&mut self, verb: &str, need_com: bool, f: F)
     where
         F: FnOnce(&mut dyn FnMut(String), &mut dyn FnMut(usize, usize)) -> (i32, i32)
             + Send
@@ -211,29 +319,31 @@ impl WordTool {
         self.last_result = None;
         let verb_s = verb.to_string();
         std::thread::spawn(move || {
-            let _com = match ComInit::sta() {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(WtMsg::Log(format!("COM 初始化失败：{e}")));
-                    let _ = tx.send(WtMsg::Done {
-                        verb: verb_s,
-                        ok: 0,
-                        fail: 0,
-                    });
-                    return;
+            if need_com {
+                match ComInit::sta() {
+                    Ok(c) => {
+                        // 保活到活干完（Drop 时 CoUninitialize）
+                        let (ok, fail) = run_body(f, &tx);
+                        drop(c);
+                        let _ = tx.send(WtMsg::Done {
+                            verb: verb_s,
+                            ok,
+                            fail,
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WtMsg::Log(format!("COM 初始化失败：{e}")));
+                        let _ = tx.send(WtMsg::Done {
+                            verb: verb_s,
+                            ok: 0,
+                            fail: 0,
+                        });
+                        return;
+                    }
                 }
-            };
-            let (ok, fail) = f(
-                &mut |s: String| {
-                    let _ = tx.send(WtMsg::Log(s));
-                },
-                &mut |cur: usize, total: usize| {
-                    let _ = tx.send(WtMsg::Progress {
-                        current: cur,
-                        total,
-                    });
-                },
-            );
+            }
+            let (ok, fail) = run_body(f, &tx);
             let _ = tx.send(WtMsg::Done {
                 verb: verb_s,
                 ok,
@@ -264,7 +374,11 @@ impl WordTool {
         let mut finished: Option<(String, i32, i32)> = None;
         for m in messages {
             match m {
-                WtMsg::Log(s) => self.log(s),
+                WtMsg::Log(s) => {
+                    // 镜像收口在 `WordTool::log` 里，这里只管把它塞进界面日志。
+                    // 这里再镜像一次的话，工作线程的每行都会落两遍。
+                    self.log(s);
+                }
                 WtMsg::Progress { current, total } => {
                     if let Some(t) = &mut self.task {
                         t.progress = Some((current, total));
@@ -316,27 +430,24 @@ impl WordTool {
                 }
                 HeaderMode::Image => {
                     ui.horizontal(|ui| {
+                        // 选图片和「选择文档」走同一台自绘选择器（`PickDoc::HeaderImage`）：
+                        // 原来它是全程序最后一个还在弹系统对话框的入口。
                         if ui
-                            .add(ds::Button::secondary("选择图片…").leading(ds::Icon::FolderOpen))
+                            .add(
+                                ds::Button::secondary("选择图片…")
+                                    .leading(ds::Icon::FolderOpen)
+                                    .disabled(busy),
+                            )
                             .clicked()
                         {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("请选择要替换进单元格的图片")
-                                .add_filter(
-                                    "图片文件",
-                                    &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff"],
-                                )
-                                .pick_file()
-                            {
-                                self.img_path = p.to_string_lossy().into_owned();
-                            }
+                            self.want_pick = Some(PickDoc::HeaderImage);
                         }
                         ui.add_space(ds::SPACING.s4);
                         ui.add(ds::Checkbox::with_label(&mut self.img_scale, "按表格高度等比缩放"));
                     });
                     ui.add_space(ds::SPACING.s3);
-                    // 图片走的是系统对话框、界面上没有对应输入框，所以这里必须留一处
-                    // 能看见"到底选了哪张"—— 只显示路径本身，不加前缀说明文字。
+                    // 图片没有对应的输入框，所以这里必须留一处能看见"到底选了哪张"
+                    // —— 只显示路径本身，不加前缀说明文字。
                     let disp = if self.img_path.is_empty() {
                         "（未选）".to_string()
                     } else {
@@ -380,7 +491,38 @@ impl WordTool {
 
         ui.add_space(ds::SPACING.s4);
 
-        // ---- 卡片 3：执行 ----
+        // ---- 卡片 3：执行方式（引擎 + 落盘）----
+        //
+        // 为什么把"改什么"和"怎么改"分开成两张卡：上面那张卡是内容（文本 / 图片），
+        // 这张是**手段**（哪个引擎跑、产物落哪）。两件事的"要不要动"彼此无关，
+        // 混在一张卡里会让人以为换引擎要重填内容。
+        card(ui, |ui| {
+            card_title(ui, "执行方式");
+            ds::RadioGroup::new(&mut self.hdr_engine)
+                .horizontal()
+                .option(ds::RadioOption::new(Engine::Rust, "纯 Rust（不用装 Word）"))
+                .option(ds::RadioOption::new(Engine::Com, "Word COM（需装 Word）"))
+                .show(ui);
+            ui.add_space(ds::SPACING.s3);
+
+            // 两个档位各自的说明文字**一律不摆**（2026-10-11 xin 要求）：
+            // 「执行方式」只留选择项本身 —— 勾选框的标签已经把后果写在上面了。
+            match self.hdr_engine {
+                Engine::Rust => {
+                    ui.add(ds::Checkbox::with_label(
+                        &mut self.hdr_in_place,
+                        "直接改写源文件（不勾 = 写到源文件旁的 out 子目录）",
+                    ));
+                }
+                // COM 这一档**只有就地改写一种落盘**，没有可勾的选项，
+                // 所以这里什么都不画（引擎自身在本机装没装 Word，选了就知道）。
+                Engine::Com => {}
+            }
+        });
+
+        ui.add_space(ds::SPACING.s4);
+
+        // ---- 卡片 4：执行 ----
         let can = !busy
             && !self.hdr_docs.is_empty()
             && match self.hdr_mode {
@@ -401,22 +543,14 @@ impl WordTool {
                     )
                     .clicked();
                 if clicked {
-                    let docs = self.hdr_docs.clone();
-                    match self.hdr_mode {
-                        HeaderMode::Text => {
-                            let (en, cn) = (self.text_en.clone(), self.text_cn.clone());
-                            self.log(format!("开始页眉文本替换：{} 个文档", docs.len()));
-                            self.start("页眉文本替换", move |log, prog| {
-                                services::text_replace_run(&docs, &en, &cn, log, prog)
-                            });
-                        }
-                        HeaderMode::Image => {
-                            let (img, scale) = (self.img_path.clone(), self.img_scale);
-                            self.log(format!("开始页眉图片替换：{} 个文档", docs.len()));
-                            self.start("页眉图片替换", move |log, prog| {
-                                services::image_replace_run(&docs, &img, scale, log, prog)
-                            });
-                        }
+                    let job = self.build_job();
+                    // 就地覆盖 = 唯一"可能弄坏源文件"的路径，先确认一次再跑。
+                    // 纯 Rust 那一档另外还有 self_check 兜底（写回原字节），
+                    // 但那是**出错时**的保护；确认框管的是"我确实要这个动作"。
+                    self.hdr_confirm = matches!(&job, HeaderJob::Rust(_, hdr::Out::InPlace));
+                    self.hdr_pending = Some(job);
+                    if !self.hdr_confirm {
+                        self.spawn_job();
                     }
                 }
                 ui.add_space(ds::SPACING.s4);
@@ -426,6 +560,117 @@ impl WordTool {
 
         ui.add_space(ds::SPACING.s4);
         self.log_section(ui);
+
+        // 确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
+        self.hdr_confirm_dialog(ui.ctx());
+    }
+
+    /// 按界面上的当前选择拼出这一趟要跑的活。**只读不写** —— 尤其不能在这里
+    /// 动 `hdr_pending`：`build_job` 之后紧跟着就是"要不要先确认"的判断，
+    /// 顺手把活存进去、又顺手跑掉，就会变成"确认框还没点、文件已经改了"。
+    fn build_job(&self) -> HeaderJob {
+        match self.hdr_engine {
+            Engine::Rust => {
+                let action = match self.hdr_mode {
+                    HeaderMode::Text => hdr::Action::Text {
+                        en: self.text_en.clone(),
+                        cn: self.text_cn.clone(),
+                    },
+                    HeaderMode::Image => hdr::Action::Image {
+                        path: std::path::PathBuf::from(&self.img_path),
+                        scale_to_table: self.img_scale,
+                    },
+                };
+                let out = if self.hdr_in_place {
+                    hdr::Out::InPlace
+                } else {
+                    hdr::Out::SiblingOut
+                };
+                HeaderJob::Rust(action, out)
+            }
+            Engine::Com => HeaderJob::Com(self.hdr_mode),
+        }
+    }
+
+    /// 把 [`WordTool::hdr_pending`] 里那道活开跑。没有活就什么也不做。
+    fn spawn_job(&mut self) {
+        let Some(job) = self.hdr_pending.take() else {
+            return;
+        };
+        let docs = self.hdr_docs.clone();
+        match job {
+            HeaderJob::Rust(action, out) => {
+                let kind = mode_cn(self.hdr_mode);
+                let verb = format!("页眉{kind}替换（纯 Rust）");
+                self.log(format!(
+                    "开始{verb}：{} 个文档；落盘：{}",
+                    docs.len(),
+                    match out {
+                        hdr::Out::InPlace => "就地覆盖源文件",
+                        hdr::Out::SiblingOut => "写到各源文件旁的 out 子目录（源文件不动）",
+                    }
+                ));
+                // ★ need_com = false：纯 Rust 不需要 Word，也不该因为
+                //   `CoInitializeEx` 失败而整趟不做。
+                self.start(&verb, false, move |log, prog| {
+                    hdr::run(&docs, &action, out, log, prog)
+                });
+            }
+            HeaderJob::Com(mode) => match mode {
+                HeaderMode::Text => {
+                    let (en, cn) = (self.text_en.clone(), self.text_cn.clone());
+                    self.log(format!(
+                        "开始页眉文本替换（Word COM）：{} 个文档；只写「主页眉」部件，\
+                         就地改写源文件（文档未启用首页不同/奇偶页不同时，\
+                         首页与偶数页显示的也是主页眉）",
+                        docs.len()
+                    ));
+                    self.start("页眉文本替换", true, move |log, prog| {
+                        services::text_replace_run(&docs, &en, &cn, log, prog)
+                    });
+                }
+                HeaderMode::Image => {
+                    let (img, scale) = (self.img_path.clone(), self.img_scale);
+                    self.log(format!(
+                        "开始页眉图片替换（Word COM）：{} 个文档；只写「主页眉」部件，\
+                         就地改写源文件",
+                        docs.len()
+                    ));
+                    self.start("页眉图片替换", true, move |log, prog| {
+                        services::image_replace_run(&docs, &img, scale, log, prog)
+                    });
+                }
+            },
+        }
+    }
+
+    /// 「就地覆盖」确认框。只做一件事：在真的动源文件之前停一下。
+    fn hdr_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.hdr_confirm {
+            return;
+        }
+        match ds::ConfirmDialog::new(
+            "直接改写源文件？",
+            "此操作不可撤销：选中的文档会被逐个就地覆盖，且不额外留备份。\
+             \n不放心就取消，把「直接改写源文件」的勾去掉 —— \
+             产物会写到每份文档旁的 out\\ 子目录，源文件一个字节不动。",
+        )
+        .danger()
+        .confirm_label("确认改写")
+        .cancel_label("取消")
+        .show(ctx)
+        {
+            // 先关框、再开跑，否则下一帧还会画这个确认框。
+            Some(true) => {
+                self.hdr_confirm = false;
+                self.spawn_job();
+            }
+            Some(false) => {
+                self.hdr_confirm = false;
+                self.hdr_pending = None;
+            }
+            None => {}
+        }
     }
 
     // ==================== 渲染：批量打印 ====================
@@ -540,7 +785,12 @@ impl WordTool {
                     .add(
                         ds::Button::primary("开始打印")
                             .size(ds::ButtonSize::Lg)
-                            .leading(ds::Icon::Package)
+                            // 打印机图标走 Phosphor 的 `PRINTER`：DS 的 `Icon`
+                            // 枚举里没有打印机语义（原先借的是 `Package` —— 一个
+                            // 包裹/箱子，与"打印"没关系）。`Icon::Glyph` 是
+                            // egui_sauge 特意留的逃生口，直接塞 Phosphor 码点即可，
+                            // 不用去动 ds.rs 的公共 API（GUIDE §12 也是这么说的）。
+                            .leading(ds::Icon::Glyph(egui_phosphor::regular::PRINTER))
                             .disabled(!can),
                     )
                     .clicked();
@@ -561,7 +811,7 @@ impl WordTool {
                             None => "默认打印机".to_string(),
                         }
                     ));
-                    self.start("打印", move |log, prog| {
+                    self.start("打印", true, move |log, prog| {
                         services::print_run(&docs, &range, printer.as_deref(), log, prog)
                     });
                 }
@@ -651,6 +901,35 @@ impl WordTool {
 }
 
 // ==================== 自由函数（避免与 `&mut self` 的借用冲突）====================
+
+/// 页眉替换子模式的中文名（日志用）。
+fn mode_cn(m: HeaderMode) -> &'static str {
+    match m {
+        HeaderMode::Text => "文本",
+        HeaderMode::Image => "图片",
+    }
+}
+
+/// 把一趟活的日志 / 进度接到 channel 上，然后跑它。
+///
+/// 抽出来是因为 [`WordTool::start`] 现在有两个入口（要 COM / 不要 COM），
+/// 而"接线"这一段两者一模一样。留两份只会让哪天改日志格式时漏掉一支。
+fn run_body<F>(f: F, tx: &mpsc::Sender<WtMsg>) -> (i32, i32)
+where
+    F: FnOnce(&mut dyn FnMut(String), &mut dyn FnMut(usize, usize)) -> (i32, i32),
+{
+    f(
+        &mut |s: String| {
+            let _ = tx.send(WtMsg::Log(s));
+        },
+        &mut |cur: usize, total: usize| {
+            let _ = tx.send(WtMsg::Progress {
+                current: cur,
+                total,
+            });
+        },
+    )
+}
 
 /// 统一的卡片容器 —— 直接用设计系统的 [`ds::Card`]。
 ///

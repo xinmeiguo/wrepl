@@ -57,10 +57,13 @@ use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use wrepl::pipeline::{self, Options, RunResult};
 use wrepl::rules::{self, Rule, Scope};
-use wrepl::{naming, report};
+// `naming` 原本只被「文件名改名预览」用 —— 那块 2026-10-11 下线后就没人引了，
+// 于是从导入里摘掉。真要把预览放回来，记得把它加回：
+//     use wrepl::{naming, report};
+use wrepl::report;
 
 use crate::picker::{Mode, Outcome, Picker};
-use crate::wordtool::HeaderMode;
+use crate::wordtool::{Engine, HeaderMode};
 
 const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
 const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
@@ -91,6 +94,16 @@ enum PickFor {
     HeaderDocs,
     /// 「批量打印」页的「选择文档（可多选）」
     PrintDocs,
+    /// 「页眉替换」页的「选择图片…」（**只选一张**）
+    HeaderImage,
+    /// 「打开源目录 / 打开输出目录」—— 用自绘面板浏览那个目录。
+    ///
+    /// 这两个入口原先会 `explorer` 拉开资源管理器：那是一个新的 OS 窗口，
+    /// 本机要为此交 0.8~2 秒的「窗口税」（见 `picker` 模块头）。改成自绘面板后
+    /// 一个窗口都不新建；面板里双击文件照样能把它打开（见 [`App::open_file`]）。
+    BrowseDir,
+    /// 「打开报告」—— 同上，只是起点是报告文件所在的目录。
+    BrowseReport,
 }
 
 /// 界面里的一行规则。
@@ -299,9 +312,6 @@ pub struct App {
     log: Vec<String>,
     error: Option<String>,
     toast: Option<(String, bool)>,
-    /// 改名预览的缓存：`(输入+规则指纹, 预览行)`。逐帧重算会一直扫目录，
-    /// 目录一大界面就"拖拉"，所以只在输入或规则真的变了时才重算。
-    rename_preview: Option<(String, Vec<(String, Color32)>)>,
 
     /// 正在跑的那一批（None = 空闲）
     job: Option<Job>,
@@ -333,7 +343,7 @@ pub struct App {
     picker_for: Option<PickFor>,
 
     // ── 顶部三页切换（0.3.0 起）──
-    /// 当前页：正文替换（原有）/ 页眉替换 / 批量打印。
+    /// 当前页：批量替换（原有）/ 页眉替换 / 批量打印。
     page: Page,
     /// 页眉替换与批量打印的状态 + 任务（走 Word COM）。
     wt: crate::wordtool::WordTool,
@@ -341,11 +351,15 @@ pub struct App {
 
 /// 顶部的三个页。
 ///
-/// 「正文替换」是工具原本的能力，与另两页**没有共同依赖**——它纯 Rust 改 OOXML，
+/// 「批量替换」是工具原本的能力，与另两页**没有共同依赖**——它纯 Rust 改 OOXML，
 /// 不需要 Word；「页眉替换 / 批量打印」走 Word COM，**需要目标机器装 Word**。
+///
+/// ★ 导航上的标签 2026-10-11 由「正文替换」改成「批量替换」（用户要求）。
+///   `Page::Replace` 这个**内部名字没动** —— 它对应的是"在正文里做替换"这份能力，
+///   改它要连带动 CLI、报告与一堆注释，收益为零。标签只是给人看的。
 #[derive(PartialEq, Clone, Copy)]
 enum Page {
-    /// 正文批量替换（原有）
+    /// 正文批量替换（原有）。界面标签叫「批量替换」。
     Replace,
     /// 页眉首单元格替换（文本 / 图片）
     Header,
@@ -395,7 +409,6 @@ impl App {
             log: Vec::new(),
             error: None,
             toast: None,
-            rename_preview: None,
             job: None,
             confirm_inplace: false,
             inplace_confirmed: false,
@@ -406,8 +419,8 @@ impl App {
             wt: crate::wordtool::WordTool::new(),
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
-        // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save` 时启动就把选择器
-        // 打开，再配合 `WREPL_DEBUG_CLICK` 就能无人值守地复现"点一下"。
+        // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save|hdrdocs|printdocs|img|browse`
+        // 时启动就把选择器打开，再配合 `WREPL_DEBUG_CLICK` 就能无人值守地复现"点一下"。
         // 本机的合成鼠标输入进不来窗口（见 `diag` 里的说明），只能让程序自己做。
         // 不设这个环境变量时，下面整段是空转。
         match crate::diag::debug_picker_mode().as_deref() {
@@ -415,10 +428,14 @@ impl App {
             Some("file") => app.open_picker(PickFor::InputFiles),
             Some("out") => app.open_picker(PickFor::OutputDir),
             Some("save") => app.open_picker(PickFor::ExportXlsx),
-            // 另两页的「选择文档」——同一个面板、同一个入口分派，只是结果
-            // 落到 `WordTool` 那边（见 `apply_picked`）。
+            // 另两页的「选择文档 / 选择图片」——同一个面板、同一个入口分派，
+            // 只是结果落到 `WordTool` 那边（见 `apply_picked`）。
             Some("hdrdocs") => app.open_picker(PickFor::HeaderDocs),
             Some("printdocs") => app.open_picker(PickFor::PrintDocs),
+            Some("img") => app.open_picker(PickFor::HeaderImage),
+            // 浏览模式（底部「打开源目录 / 打开报告」）——它有自己的一套底部按钮
+            // （「打开」+「关闭」，没有「...」），值得单独照一帧。
+            Some("browse") => app.open_picker(PickFor::BrowseDir),
             Some(other) => {
                 crate::diag::log(format!("[诊断] 未知的 WREPL_DEBUG_PICKER={other:?}，忽略"))
             }
@@ -802,52 +819,20 @@ impl App {
         true
     }
 
-    // ─────────────────────── 文件名改名预览 ───────────────────────
-
-    /// 预览缓存键：输入路径 + 链式开关 + 整张规则表。
-    /// 键构造只碰内存，不扫目录，所以真正贵的 I/O 只在必要时发生。
-    fn rename_preview_key(&self) -> String {
-        let mut s = String::with_capacity(64);
-        s.push_str(self.input.trim());
-        s.push('\u{1}');
-        s.push_str(if self.chain { "1" } else { "0" });
-        for r in &self.rows {
-            s.push('\u{2}');
-            s.push_str(&r.find);
-            s.push('\u{3}');
-            s.push_str(&r.replace);
-        }
-        s
-    }
-
-    /// 真正干活的那一段：扫一遍目录，对前 8 个文件试算新名。
-    fn compute_rename_preview(&self) -> Vec<(String, Color32)> {
-        let mut out: Vec<(String, Color32)> = Vec::new();
-        let rule_list = self.build_rules().unwrap_or_default();
-        if rule_list.is_empty() || self.input.trim().is_empty() {
-            return out;
-        }
-        let opts = self.options_for(true);
-        let Ok((files, _)) = pipeline::collect_targets(&self.input_paths(), &opts) else {
-            return out;
-        };
-        for (i, (src, _)) in files.iter().take(8).enumerate() {
-            let name = src
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            match naming::rename_file_name(&name, &rule_list, self.chain) {
-                Ok(p) if p.changed() => out.push((
-                    format!("{}. {} → {}", i + 1, p.old_name, p.new_name),
-                    OK_C,
-                )),
-                Ok(_) => out.push((format!("{}. {}（不改）", i + 1, name), DIM_C)),
-                Err(e) => out.push((format!("{}. 改名失败：{e:#}", i + 1), ERR_C)),
-            }
-        }
-        out
-    }
+    // ─────────────────────── 文件名改名预览（已下线）───────────────────────
+    //
+    // 这里原本有一套「改名预览」：勾了「同步替换文件名」后，把**会被改名的**文件
+    // 逐条列成 `旧名 → 新名`。2026-10-11 反馈要求**整块不再体现**，理由是它和
+    // 下面的「执行结果」重复 —— 那栏本来就有「改名 N」的计数，而已经看得见的
+    // 规则表 + 输入路径足够判断会改成什么；预览多占一屏，还会随目录变大而刷屏。
+    //
+    // ★ 只是**界面上不再显示**，能力一个都没丢：
+    //   · `--rename` / `--preset … --rename` 照旧；
+    //   · 界面上「同步替换文件名」勾选框照旧（`self.rename_files`，它才决定改不改名）；
+    //   · 执行完，「执行结果」里的「改名」计数与产物目录的报告照旧。
+    //
+    // 真要放回来：把 `rename_preview_key` / `compute_rename_preview` 从 git 历史里
+    // 取回，在 `section_rules` 末尾照原样渲染即可（当时是 8 条 + 一行汇总）。
 
     // ─────────────────────── 执行 ───────────────────────
 
@@ -1196,20 +1181,22 @@ impl App {
         self.trim_log(cap);
     }
 
-    fn open_path(&mut self, p: &str) {
+    /// 用系统默认程序打开一个**文件**（.xlsx 报告 / .docx / 图片…）。
+    ///
+    /// 与自绘面板的分工：**面板负责"看"，这里负责"把看到的那一个打开"**。
+    /// 原先这里叫 `open_path`、对文件取父目录再拉资源管理器 —— 现在
+    /// "看"这件事交给 [`PickFor::BrowseDir`] 那套自绘面板了（不新建 OS 窗口），
+    /// 留下来的只有"打开"这一个动作。
+    ///
+    /// 走 `explorer`：它拿到**文件**路径时等价于 `ShellExecute`（拿目录路径才是
+    /// "打开资源管理器"）。这是全程序唯一还会新建 OS 窗口的地方，而且只在
+    /// 用户主动双击 / 点「打开」时发生 —— 不是点一下就弹。
+    fn open_file(&mut self, p: &str) {
         let p = p.trim();
-        if p.is_empty() {
+        if p.is_empty() || !Path::new(p).is_file() {
             return;
         }
-        let target = if Path::new(p).is_dir() {
-            p.to_string()
-        } else {
-            Path::new(p)
-                .parent()
-                .map(|x| x.display().to_string())
-                .unwrap_or_else(|| p.to_string())
-        };
-        if let Err(e) = std::process::Command::new("explorer").arg(&target).spawn() {
+        if let Err(e) = std::process::Command::new("explorer").arg(p).spawn() {
             self.error = Some(format!("打不开：{e}"));
         }
     }
@@ -1271,9 +1258,20 @@ impl App {
             .exact_size(184.0)
             .resizable(false)
             .show(ctx, |ui| {
+                // ★ 让内容**铺满整个面板宽度**（2026-10-11 那条黑条的根治）。
+                //
+                // `egui::Frame` 铺底色时用的是 `内容 min_rect + 内边距`，不是面板矩形 ——
+                // 侧栏内容（三个 NavItem）比可用宽度窄，于是底色只铺到 `exact_size`
+                // 就停了；而面板本身还多预留了一圈内边距，`CentralPanel` 又从更右边
+                // 开始画，中间就空出一条（本机实测 11px）谁都没刷到的缝，露出窗口
+                // 清屏色 = 黑条。
+                //
+                // 把内容的最小宽度顶到可用宽度，Frame 就必然铺满，缝从根上没有了。
+                // （`ds::window_bg` 那条只是兜底。）
+                ui.set_min_width(ui.available_width());
                 ui.add_space(10.0);
                 for (page, label, icon) in [
-                    (Page::Replace, "正文替换", ds::Icon::FileText),
+                    (Page::Replace, "批量替换", ds::Icon::FileText),
                     (Page::Header, "页眉替换", ds::Icon::Edit),
                     (Page::Print, "批量打印", ds::Icon::Package),
                 ] {
@@ -1291,7 +1289,7 @@ impl App {
             });
 
         egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
-            // 这一栏是「正文替换」专用的（执行按钮 / 打开目录 / 报告 / 清日志）。
+            // 这一栏是「批量替换」专用的（执行按钮 / 打开目录 / 报告 / 清日志）。
             // 另两页各自把动作放在页面卡片里，所以这里直接不画。
             if self.page != Page::Replace {
                 return;
@@ -1330,24 +1328,25 @@ impl App {
                     self.start_run(false, ctx);
                 }
                 ui.add_space(ds::SPACING.s5);
-                let (open_lbl, open_p) = if self.out_to_subdir {
-                    ("打开输出目录", self.output.clone())
+                let open_lbl = if self.out_to_subdir {
+                    "打开输出目录"
                 } else {
-                    ("打开源目录", self.input_dir().display().to_string())
+                    "打开源目录"
                 };
                 if ui
                     .add(ds::Button::secondary(open_lbl).leading(ds::Icon::FolderOpen))
                     .clicked()
                 {
-                    self.open_path(&open_p);
+                    // 走自绘面板浏览，不拉资源管理器 —— 后者是新的 OS 窗口，
+                    // 本机每建一个要交 0.8~2 秒「窗口税」（见 `picker` 模块头）。
+                    self.open_picker(PickFor::BrowseDir);
                 }
                 ui.add_space(ds::SPACING.s2);
                 if ui
                     .add(ds::Button::secondary("打开报告").leading(ds::Icon::FileText))
                     .clicked()
                 {
-                    let p = self.report_path().display().to_string();
-                    self.open_path(&p);
+                    self.open_picker(PickFor::BrowseReport);
                 }
                 ui.add_space(ds::SPACING.s5);
                 // 执行期间不给清：那一整段日志等一下要落盘成「运行日志.txt」
@@ -1445,6 +1444,7 @@ impl App {
             self.open_picker(match who {
                 crate::wordtool::PickDoc::Header => PickFor::HeaderDocs,
                 crate::wordtool::PickDoc::Print => PickFor::PrintDocs,
+                crate::wordtool::PickDoc::HeaderImage => PickFor::HeaderImage,
             });
         }
 
@@ -1606,14 +1606,16 @@ impl App {
                      重复跑不会覆盖最初那版）。写副本时源文件本来就不动，无需备份。",
                 );
             });
-            ui.add_space(ds::SPACING.s3);
-
-            let _ = ds::InputField::new(&mut self.exclude)
-                .label("排除")
-                .placeholder("*_bak*")
-                .helper("按文件名 glob 排除，留空 = 不排除")
-                .desired_width(240.0)
-                .show(ui);
+            // 「排除」输入框**不再显示**（2026-10-11 反馈）。
+            //
+            // 它是"按文件名 glob 再多排掉一批"用的（例如 `*_bak*`），日常几乎用不到，
+            // 摆在「文件与输出」里反而让人怀疑"不填会漏掉什么"。
+            //
+            // ★ 隐掉这个入口**不影响**任何默认行为：
+            //   · Word 临时锁文件（`~$*.docx`）是 `pipeline::exclude_reason` 里的
+            //     **内置**规则，跟这个框无关 —— 执行结果里"跳过"那批照旧是它；
+            //   · 真要再加排除通配符，命令行版仍有 `--exclude`，`--preset` 也还认。
+            // 字段本身留在 `App` 上（`options_for` 仍会读它），随时可以把这个入口放回来。
 
             // 选路径的动作放在布局之后执行：避免在借用 self 的闭包里嵌套借用。
             // 四个入口都走**同一个自绘面板**，靠 `PickFor` 区分结果落到哪个字段。
@@ -1703,7 +1705,6 @@ impl App {
                             let n = self.rows.len();
                             self.rows.clear();
                             self.last_rule_hits.clear();
-                            self.rename_preview = None;
                             self.clear_armed = false;
                             self.push_log(format!("已清空 {n} 条规则"));
                             self.toast = Some((format!("已清空 {n} 条规则"), true));
@@ -1842,17 +1843,28 @@ impl App {
             // 去跳过前面的行（`skip_ahead_auto_ids`），而我们有输入框+按钮好几个控件，
             // 靠它推不准；显式按行号定 id，滚动时输入框的光标/焦点才不会跳到别的行上。
             if !self.rows.is_empty() {
-                // 行高 = 内容 26 + 上下内边距 3+3 = 32；**不含行间距**（show_rows 自己加）。
-                const ROW_H: f32 = 32.0;
-                // 表格最多占这么高，再多就自己滚；12 行够看，也不至于把整页挤没。
-                const MAX_H: f32 = 420.0;
+                // 一行规则的真实占位：
+                //   单行输入框 `ui_scale::ROW_H`(28) + 隔行底色 Frame 的上下内边距(3+3) = 34。
+                //
+                // ★ 这个值必须**同时**喂给 `show_rows` 和视口高度计算，并与下面那个
+                //   `inner_margin` 同源。egui 的实现（scroll_area.rs:963-966）里，
+                //   `show_rows` 是假设"每行实际就渲染 row_height 这么高"的：
+                //       内容总高          = (row_height + item_spacing.y) * n - item_spacing.y
+                //       可见行范围 = 视口高 / (row_height + item_spacing.y)
+                //   以前这里写死 32（比真实帧高少 2），行数一多，滚到底时最后一行会差一点。
+                const ROW_PAD: f32 = 3.0; // 行的上下内边距，与下面 Frame 的 inner_margin 同源
+                let row_h = ui_scale::ROW_H + ROW_PAD * 2.0;
+
+                // 表格默认露出 7 行；超出的部分给一条纵向滚动条。
+                // 高度算法（含"上限 + 下限"那段关键处理）与日志区、跳过清单共用
+                // `fixed_rows_scroll`；行间距从当前 Style 现读，不写死 6.0。
+                const VISIBLE_ROWS: usize = 7;
+                let row_gap = ui.spacing().item_spacing.y;
+
                 let n_rows = self.rows.len();
                 let rows = &mut self.rows;
-                egui::ScrollArea::vertical()
-                    .id_salt("rules-table")
-                    .max_height(MAX_H)
-                    .auto_shrink([false, true])
-                    .show_rows(ui, ROW_H, n_rows, |ui, range| {
+                fixed_rows_scroll("rules-table", VISIBLE_ROWS, row_h, row_gap)
+                    .show_rows(ui, row_h, n_rows, |ui, range| {
                         for i in range {
                             ui.push_id(i, |ui| {
                                 let r = &mut rows[i];
@@ -1867,8 +1879,10 @@ impl App {
                                     .inner_margin(egui::Margin {
                                         left: 0,
                                         right: 0,
-                                        top: 3,
-                                        bottom: 3,
+                                        // 与上面的 `row_h` 同源：这两处必须一致，
+                                        // 否则 show_rows 推算的行范围与实际绘制对不上。
+                                        top: ROW_PAD as i8,
+                                        bottom: ROW_PAD as i8,
                                     })
                                     .corner_radius(egui::CornerRadius::same(3))
                                     .show(ui, |ui| {
@@ -1927,27 +1941,8 @@ impl App {
                 ui.add_space(16.0);
             }
 
-            // 文件名改名预览：勾了「同步替换文件名」就先把新名字摆出来。
-            //
-            // 这段以前**每帧**重算一遍：扫目录（walkdir）+ 对每个文件跑规则。
-            // 目录一大，界面就会一直有 I/O，看起来"拖拉"。现在按
-            // 「输入 + 规则指纹」缓存，只有真正改了东西才重算。
-            if self.rename_files {
-                let key = self.rename_preview_key();
-                if self.rename_preview.as_ref().map(|(k, _)| k != &key) != Some(false) {
-                    let lines = self.compute_rename_preview();
-                    self.rename_preview = Some((key, lines));
-                }
-                if let Some((_, lines)) = &self.rename_preview {
-                    if !lines.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("文件名改名预览").strong());
-                        for l in lines {
-                            ui.label(RichText::new(l.0.clone()).color(l.1));
-                        }
-                    }
-                }
-            }
+            // 「文件名改名预览」整块**不再体现**（2026-10-11 反馈）。
+            // 原因与保留的能力见上方「文件名改名预览（已下线）」那段注释。
         });
 
         // 选文件要借 &mut self，只能放在上面的闭包之外执行。
@@ -1984,6 +1979,13 @@ impl App {
         // 会停在上次挑的那处，而不是回到默认目录。
         let hdr_first = doc_start(self.wt.docs_of(crate::wordtool::PickDoc::Header));
         let print_first = doc_start(self.wt.docs_of(crate::wordtool::PickDoc::Print));
+        // 选图片同理：停在上次那张图旁边。
+        let img_first = doc_start(self.wt.docs_of(crate::wordtool::PickDoc::HeaderImage));
+        // 两个「浏览」入口的起点 —— 就是底部那两个按钮想让人看的地方：
+        // **产物落点**（就地替换 = 源目录；写副本 = 输出目录）。
+        // 直接问 `product_dir()`，不自己拼：它已经把"输出目录留空"那种情况
+        // 算进去了（那时产物落在 `<输入>/out` 旁边的规则由它一处说了算）。
+        let browse_dir = self.product_dir();
 
         let (mode, title, start, exts, default_name): (Mode, &str, PathBuf, Vec<&str>, String) =
             match what {
@@ -2034,6 +2036,33 @@ impl App {
                     "选择文档 —— 批量打印",
                     print_first,
                     vec!["doc", "docx"],
+                    String::new(),
+                ),
+                // 图片：只选一张，筛选按各引擎实际认得的格式给
+                // （`hdr::detect` 认 PNG/GIF/BMP/JPEG，这里再放 tif/tiff 也无妨：
+                //  多选的格式最终仍由引擎那边判，选错了它会明确报错）。
+                PickFor::HeaderImage => (
+                    Mode::Files,
+                    "选择图片 —— 页眉替换",
+                    img_first,
+                    vec!["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff"],
+                    String::new(),
+                ),
+                // 两个「浏览」入口：`Mode::Browse` 不选东西，只让人看 ——
+                // 面板里双击文件即用系统默认程序打开它（见 `apply_picked`）。
+                // **不传筛选**：浏览时"这一格是什么、旁边还有什么"都该看得见。
+                PickFor::BrowseDir => (
+                    Mode::Browse,
+                    "浏览 —— 产物落点",
+                    browse_dir,
+                    vec![],
+                    String::new(),
+                ),
+                PickFor::BrowseReport => (
+                    Mode::Browse,
+                    "浏览 —— 报告落点",
+                    self.report_path(),
+                    vec![],
                     String::new(),
                 ),
             };
@@ -2114,6 +2143,20 @@ impl App {
                     paths.iter().map(|p| p.display().to_string()).collect(),
                 );
             }
+            PickFor::HeaderImage => {
+                // 界面上只有一个图片槽位，只收第一张（`Files` 模式下也只选了一张）。
+                if let Some(p) = paths.into_iter().next() {
+                    self.wt.set_image(p.display().to_string());
+                }
+            }
+            // 浏览模式返回的是"用户想打开的东西"：面板里双击文件，或选中后点「打开」。
+            // 目录不会出现在这里（`Mode::Browse` 只把文件算作结果），
+            // 所以这里只管打开；用户若只是看了看就点「关闭」，一个结果都不会有。
+            PickFor::BrowseDir | PickFor::BrowseReport => {
+                for p in &paths {
+                    self.open_file(&p.display().to_string());
+                }
+            }
         }
     }
 
@@ -2149,6 +2192,15 @@ impl App {
                 })
                 .add_filter("Word 文档", &["doc", "docx"])
                 .pick_files(),
+            PickFor::HeaderImage => rfd::FileDialog::new()
+                .set_title("选择图片 —— 页眉替换")
+                .add_filter("图片文件", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff"])
+                .pick_file()
+                .map(|p| vec![p]),
+            // 两个「浏览」入口**没有**兜底：`Mode::Browse` 的面板本来就不摆「...」
+            // 那个逃生口（浏览模式不"选"东西，原生对话框没有对应动作可做）。
+            // 这一支留在 match 里只为穷尽性 —— 走不到。
+            PickFor::BrowseDir | PickFor::BrowseReport => None,
         };
         if let Some(paths) = picked {
             self.apply_picked(what, paths);
@@ -2241,17 +2293,25 @@ impl App {
             if !res.skipped.is_empty() {
                 ui.add_space(6.0);
                 ui.label(RichText::new("跳过的文件").strong());
-                for s in &res.skipped {
-                    ui.label(
-                        RichText::new(format!(
-                            "· {}　{}",
-                            s.path.file_name().and_then(|x| x.to_str()).unwrap_or("?"),
-                            s.reason
-                        ))
-                        .small()
-                        .color(DIM_C),
-                    );
-                }
+                // 固定露出几行，再多就出滚动条 —— 与规则表、日志共用同一个
+                // `fixed_rows_scroll`。这几行的字号是 `.small()`，行高直接问当前
+                // Style 要（`TextStyle::Small` 解析出来的 FontId），不写死数字。
+                const VISIBLE_ROWS: usize = 4;
+                let row_h = ui.text_style_height(&egui::TextStyle::Small);
+                let row_gap = ui.spacing().item_spacing.y;
+                fixed_rows_scroll("skipped-files", VISIBLE_ROWS, row_h, row_gap).show(ui, |ui| {
+                    for s in &res.skipped {
+                        ui.label(
+                            RichText::new(format!(
+                                "· {}　{}",
+                                s.path.file_name().and_then(|x| x.to_str()).unwrap_or("?"),
+                                s.reason
+                            ))
+                            .small()
+                            .color(DIM_C),
+                        );
+                    }
+                });
             }
         });
     }
@@ -2264,23 +2324,9 @@ impl App {
             // 误以为改动有意义，而下一帧就会被真实轨迹覆盖掉。
             // 完整的一份在每次执行后落到产物目录的「运行日志.txt」里。
             //
-            // **不再给日志套 ScrollArea**（0.2.3 试过）：日志区跟着页面滚就行，
-            // 套一层内滚动条只会让人以为日志被截断了 —— 而且正是它把底部面板
-            // 撑爆的（见 `render` 里那段）。
-            const SHOW: usize = 240;
-            let total = self.log.len();
-            let start = total.saturating_sub(SHOW);
-            if start > 0 {
-                ui.label(
-                    RichText::new(format!("……（前面还有 {start} 行，省略）"))
-                        .small()
-                        .color(DIM_C),
-                );
-            }
-            for line in &self.log[start..] {
-                ui.label(RichText::new(line).monospace().size(ui_scale::LOG));
-            }
-            if total == 0 {
+            // 固定露出 `VISIBLE_ROWS` 行，更早的部分交给内层滚动条
+            //（与「替换规则」表共用同一个 `fixed_rows_scroll`）。
+            if self.log.is_empty() {
                 // 空态：写清"日志是什么、会去哪"，比一个「空」字有用。
                 ui.label(
                     RichText::new(
@@ -2290,7 +2336,46 @@ impl App {
                     .small()
                     .color(DIM_C),
                 );
+                return;
             }
+
+            const VISIBLE_ROWS: usize = 5;
+
+            // 一行日志的真实高度。日志是**中英混排**的等宽文本：含汉字的那一行由汉字
+            // 字体决定行高（Proportional 家族里排第一的就是 CJK），纯 ASCII 行才由
+            // 等宽字体决定。取两者较大值 —— 宁可盒子略高，也不把字裁掉。
+            let row_h = ui.ctx().fonts_mut(|f| {
+                f.row_height(&egui::FontId::monospace(ui_scale::LOG))
+                    .max(f.row_height(&egui::FontId::proportional(ui_scale::LOG)))
+            });
+            let row_gap = ui.spacing().item_spacing.y;
+
+            // 渲染上限：跑起来时 `log` 能涨到两万行（见 `log_cap`），全量逐帧铺一遍会卡死。
+            // 只画最后 `SHOW` 行；更早的交待一句 —— 完整的一份在产物目录的日志文件里。
+            const SHOW: usize = 300;
+            let total = self.log.len();
+            let start = total.saturating_sub(SHOW);
+            if start > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "……（前面还有 {start} 行未在此显示；完整日志见产物目录的「运行日志.txt」）"
+                    ))
+                    .small()
+                    .color(DIM_C),
+                );
+            }
+
+            // `stick_to_bottom`：日志天然跟着尾巴走 —— 跑到一半时人要看的是**最新**几行，
+            // 钉在底部就不用每来一行都手动往下拖。人一旦自己往上滚，这个粘性会自动让位。
+            // 这里**不能**用 `show_rows`：日志行会被折行（长路径），固定行高模型一旦被打破，
+            // 滚动位置就对不上了。
+            fixed_rows_scroll("run-log", VISIBLE_ROWS, row_h, row_gap)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &self.log[start..] {
+                        ui.label(RichText::new(line).monospace().size(ui_scale::LOG));
+                    }
+                });
         });
     }
 }
@@ -2305,6 +2390,16 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // 空实现：真正的绘制仍在 `update` → `render(ctx)` 里。
+    }
+
+    /// 窗口清屏色。
+    ///
+    /// ★ 不能省（2026-10-11 踩过）：eframe 默认返回**全透明**，落到窗口上就是纯黑。
+    /// 侧栏与内容区之间一旦有一道谁都没刷到的缝（侧栏 `Frame` 只铺 `exact_size`
+    /// 宽、面板预留宽度还多一圈内边距，就会留缝），缝里露出来的正是这个颜色——
+    /// 之前界面中间那条扎眼的黑条就是它。设成主题背景色，缝即便还在也隐身。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        ds::window_bg(self.light_theme)
     }
 
     // 0.34 已把 `update` 标为 deprecated（推荐改用 `ui`），但框架仍然调用它，
@@ -2328,6 +2423,38 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         ui.set_width(ui.available_width());
         add(ui);
     });
+}
+
+/// 固定露出 `rows` 行的纵向滚动区 —— **规则表 / 运行日志 / 跳过清单共用同一套高度算法**。
+///
+/// 参数：`row_h` = 一行内容的真实高度（**不含**行间距），`gap` = `item_spacing.y`。
+/// 总高与 egui `show_rows` 内部所用的公式同源：
+/// `rows * (row_h + gap) - gap`（最后一行后面不再加间距，所以减掉一个）。
+///
+/// ★★ 为什么必须**同时**给上限和下限（这是踩过的坑，别再改回去）
+///
+/// `max_height` 只是**上限**。egui 里视口高 = `min(父容器可用高度, 上限)`
+/// （`scroll_area.rs` 的 `begin()`：`available_outer.size().at_most(max_size)`），
+/// 而这几块的父容器正是 `CentralPanel` 那个**外层** `ScrollArea` ——
+/// 1180×820 的窗口里它只给到一百出头的像素，表格于是被压成 2 行高
+///（0.4.1 之前"规则表只露两行"就是这么来的）。
+///
+/// 解法是再给一条**下限** `min_scrolled_height`，它的文档语义正好合用：
+/// *"只有当内容本身就比它矮时才会更小"* —— 内容够高就锁死在这 `rows` 行
+///（超出部分交给这条内层滚动条承担），内容更矮则自然收缩、不留空白
+///（配合 `auto_shrink([false, true])`，两种情形都对）。
+///
+/// 返回的是**配好的** `ScrollArea`，由调用方决定怎么消费：
+/// · 大量**定高**行（规则表）→ 接 `.show_rows(ui, row_h, n, ..)`，只渲染可见区间；
+/// · 内容会**折行**（日志、跳过清单）→ 接 `.show(ui, ..)`，**不能**用 `show_rows`
+///   （固定行高模型一旦被折行打破，滚动位置就对不上）。
+fn fixed_rows_scroll(id: &str, rows: usize, row_h: f32, gap: f32) -> egui::ScrollArea {
+    let h = rows as f32 * (row_h + gap) - gap;
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(h)
+        .min_scrolled_height(h)
+        .auto_shrink([false, true])
 }
 
 /// 表头 / 隔行的淡底色。
@@ -2761,13 +2888,19 @@ pub fn selftest(args: &[String]) -> i32 {
     app.out_to_subdir = keep_out;
     println!("  「完整镜像」可用 / 置灰两态：布局通过");
 
-    // 3.8) 新增的两页（页眉替换 / 批量打印）骨架：各画两帧。
-    //      这两页是 v0.3.0 新加的，普通一趟渲染只照到「正文替换」一页，
-    //      所以这里把另外两页也各渲染两帧钉住排版——**只是画，不触发任何
-    //      Word COM 动作**，所以无头环境、没装 Word 的机器上也能跑。
+    // 3.8) 新增的两页（页眉替换 / 批量打印）骨架，外加页眉替换的**四种执行方式状态**：
+    //      引擎（纯 Rust / Word COM）× 落盘（写副本 / 就地覆盖），以及就地覆盖那张
+    //      确认框。**只是画，不触发任何动作**，所以无头环境、没装 Word 的机器上也能跑。
+    //      为什么要枚举这四种：2026-10-11 页眉替换改成"两条路都留着"之后，
+    //      每一条分支挂的控件不同（勾选框只在纯 Rust 下出现），而本机的合成鼠标
+    //      事件进不到窗口（见 `diag` 模块头）—— 不在这里主动摆出每种组合、各画一帧，
+    //      那些分支就永远没被渲染过，排版里的 panic 也就一路躲到用户手上才爆。
     //      塞几行假路径是为了让「已选文档」列表与计数这两种状态也画出来。
     let keep_page = app.page;
     let keep_hdr_mode = app.wt.hdr_mode;
+    let keep_engine = app.wt.hdr_engine;
+    let keep_in_place = app.wt.hdr_in_place;
+    let keep_confirm = app.wt.hdr_confirm;
     for (page, mode) in [
         (Page::Header, HeaderMode::Text),
         (Page::Header, HeaderMode::Image),
@@ -2781,15 +2914,49 @@ pub fn selftest(args: &[String]) -> i32 {
         app.wt.print_docs = (1..=3)
             .map(|i| format!("D:/wrepl-selftest/P{i}.docx"))
             .collect();
-        for _ in 0..2 {
-            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+        for engine in [Engine::Rust, Engine::Com] {
+            for in_place in [false, true] {
+                app.wt.hdr_engine = engine;
+                app.wt.hdr_in_place = in_place;
+                // 确认框只在"纯 Rust + 就地覆盖"这条路上出现
+                app.wt.hdr_confirm = in_place && engine == Engine::Rust;
+                for _ in 0..2 {
+                    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+                }
+            }
         }
     }
     app.page = keep_page;
     app.wt.hdr_mode = keep_hdr_mode;
+    app.wt.hdr_engine = keep_engine;
+    app.wt.hdr_in_place = keep_in_place;
+    app.wt.hdr_confirm = keep_confirm;
     app.wt.hdr_docs.clear();
     app.wt.print_docs.clear();
-    println!("  页眉替换（文本 / 图片）+ 批量打印：布局各 2 帧通过");
+    println!("  页眉替换（文本 / 图片 × 两种引擎 × 两种落盘 + 确认框）+ 批量打印：布局通过");
+
+    // 3.8b) 自绘选择器里**只有浏览模式才有的**那套底部按钮：确定键是「打开」
+    //       （选中文件才可按）、取消键是「关闭」（不是「取消」），而且**不摆**
+    //       「...」那个系统对话框逃生口。它与另外三种模式的底部排布不同 ——
+    //       正是"新分支没被画过"的典型（本机合成鼠标进不到窗口），所以单独照两帧。
+    //       顺带照一帧「选择图片」面板：页眉替换页 2026-10-11 并入自绘后才有的入口。
+    let keep_page2 = app.page;
+    app.page = Page::Replace; // 面板浮在任意页之上，底页画哪张都一样
+    for (what, cn) in [
+        (PickFor::BrowseDir, "浏览"),
+        (PickFor::HeaderImage, "选图片"),
+    ] {
+        app.open_picker(what);
+        for _ in 0..2 {
+            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui.ctx()));
+        }
+        // 照完就收：面板是**常驻**的（跨次打开记着上次停在哪），不收的话
+        // 后面几帧会一直浮着那块全屏遮罩，把后面的自检项全挡住。
+        app.picker.close();
+        app.picker_for = None;
+        println!("  自绘选择器 —— {cn}模式：布局通过");
+    }
+    app.page = keep_page2;
 
     // 3.9) 打印机枚举。批量打印页的「打印机」下拉全靠它，而它**不碰 COM**
     //      （纯 Win32 `EnumPrintersW`），所以无头环境照样能验。

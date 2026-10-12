@@ -1,7 +1,7 @@
 //! egui_sauge 设计系统接入层。
 //!
 //! 迁移**第 2 步**：把设计系统的字体表、九档字号层级与主题接到 wrepl 上。
-//! 组件替换只做「正文替换」一页（见 [`crate::app`]），但字体与主题是
+//! 组件替换只做「批量替换」一页（见 [`crate::app`]），但字体与主题是
 //! **全程序**的 —— 这是设计系统的固有性质（`apply_theme_with` 写的是
 //! `egui::Context` 级样式），也和第 2 步里「导航改成左侧 `NavItem` 边栏」
 //! 这项本就属于全局的改动一致。
@@ -156,4 +156,59 @@ pub fn apply(ctx: &egui::Context, light: bool) {
         Palette::dark()
     };
     egui_sauge::apply_theme_with(ctx, &palette, Density::Comfortable);
+
+    // 滚动条改成**常显的细条**（2026-10-11）。
+    //
+    // egui 默认的 `ScrollStyle::floating()` 把 `dormant_handle_opacity` 设成 0.0：
+    // 条**画了**，但不滚动、不悬停到条上时透明度是 0 —— 也就是"其实有、看不见"。
+    // 界面里会出内滚动条的那几处（替换规则表 / 运行日志 / 跳过清单）恰恰需要
+    // "一眼看出内容被截断了"，所以按 egui 自己在 `ScrollStyle::floating_allocated_width`
+    // 上的推荐取值改成常显：预留 4px、休眠期也给 0.45 的不透明度。
+    //
+    // · 只作用于"内容确实超出"的滚动区 —— 可见性仍是 `VisibleWhenNeeded`，
+    //   装得下的时候不会平白多出一条；
+    // · 走 `all_styles_mut` 是为了浅/深两套 Style 都改到（`set_theme` 会切另一套）；
+    // · 放在 `apply_theme_with` **之后**：那一步会重写 style，写在前面会被盖掉。
+    ctx.all_styles_mut(|style| {
+        let sc = &mut style.spacing.scroll;
+        sc.floating = true;
+        sc.floating_width = 4.0;
+        sc.floating_allocated_width = 4.0;
+        sc.dormant_handle_opacity = 0.45;
+        sc.dormant_background_opacity = 0.0;
+        sc.active_handle_opacity = 0.65;
+        sc.interact_handle_opacity = 0.9;
+    });
+}
+
+/// 窗口清屏色，给 `eframe::App::clear_color` 用（返回的是**线性化前**的 0–1 分量）。
+///
+/// ★ 为什么必须显式给（2026-10-11，追"中间那条黑条"追出来的）
+///
+/// eframe 的默认实现返回**全透明**，落到窗口上就是**纯黑**。平时看不出来 ——
+/// `SidePanel` / `CentralPanel` 各自把自己的矩形铺满；但只要两块面板之间留下一道
+/// 谁都没刷到的缝，缝里露出的就是这个清屏色。
+///
+/// 实测（给 `panel_fill` 涂蓝、`noninteractive.bg_stroke` 涂品红的色标探针）：
+/// 侧栏右侧那条 11px 的"黑条"换遍所有主题色纹丝不动，而真正的 1px 分隔线在它右边
+/// 一格 —— 说明它压根不是画出来的，是 `SidePanel` 的 `Frame` 只铺到 `exact_size`
+/// 宽、而面板预留宽度还多一圈内边距，余下那一段没人画。
+///
+/// 设成主题的 `bg_app` 之后，这类缝即使还在也与两侧同色（等于隐身）。
+/// 这只是**兜底**：真正消缝的是 `app.rs` 里 `SidePanel` 那句
+/// `ui.set_min_width(ui.available_width())`。
+pub fn window_bg(light: bool) -> [f32; 4] {
+    let c = if light {
+        Palette::light()
+    } else {
+        Palette::dark()
+    }
+    .bg_app;
+    let [r, g, b, _] = c.to_array();
+    [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        1.0,
+    ]
 }

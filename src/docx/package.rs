@@ -277,24 +277,59 @@ where
     Ok(out)
 }
 
-/// 把一个 zip 里的全部条目搬进 `zw`，其中 `replaced` 里列出的条目换成新内容。
+/// 只列出容器里的条目名（**不解压任何内容**）。
+///
+/// 用途：新增部件前先看名字占没占（页眉图片替换要挑一个不冲突的
+/// `word/media/…`）。`inspect` 会把整包都解压一遍并算 SHA256 —— 只为拿一份
+/// 名单去读几十 MB 的媒体，纯属白干。
+///
+/// 顺序＝zip 中央目录顺序，与 [`inspect`] / [`text_parts`] 一致。
+pub fn part_names(path: &Path) -> Result<Vec<String>> {
+    let file = File::open(path).with_context(|| format!("打不开文件：{}", path.display()))?;
+    let mut ar = ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("不是合法的 zip/docx 容器：{}", path.display()))?;
+    let mut out = Vec::with_capacity(ar.len());
+    for i in 0..ar.len() {
+        let zf = ar
+            .by_index(i)
+            .with_context(|| format!("读取第 {} 个条目失败", i))?;
+        out.push(zf.name().to_string());
+    }
+    Ok(out)
+}
+
+/// 把一个 zip 里的全部条目搬进 `zw`，其中 `replaced` 里列出的条目换成新内容，
+/// `added` 里列出的**新条目**（原件里没有的）追加在最后。
 ///
 /// 两个落盘入口（写副本 / 就地覆写）共用这一段，避免"两边各写一套、慢慢漂移"。
+///
+/// ## `added` 为什么必须单独有一席之地
+///
+/// 只按 `replaced` 查表的写法**天然丢新增条目**：循环体是"遍历原件的条目"，
+/// 原件里没有的名字永远不会被访问到。而页眉图片替换必须往包里塞
+/// `word/media/…`（原来没有这个部件）—— 走老写法会得到一个"rels 指向了
+/// 一个不存在的 part"的坏包，Word 直接报错。
+///
+/// `added` 里的名字若**与原件同名**，一律忽略（原件优先）：那属于改写
+/// （该走 `replaced`），不该被这里悄悄替换掉。
 fn write_entries<R, W>(
     ar: &mut ZipArchive<R>,
     zw: &mut ZipWriter<W>,
     replaced: &HashMap<String, Vec<u8>>,
+    added: &[(String, Vec<u8>)],
 ) -> Result<()>
 where
     R: Read + Seek,
     W: Write + Seek,
 {
     let order = physical_order(ar)?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for i in order {
         let zf = ar
             .by_index(i)
             .with_context(|| format!("读取第 {} 个条目失败", i))?;
         let name = zf.name().to_string();
+        seen.insert(name.clone());
 
         match replaced.get(&name) {
             None => {
@@ -326,6 +361,25 @@ where
             }
         }
     }
+
+    // 新增条目统一追加在尾部。压缩方式固定 Deflated —— 新部件没有"原样"可言，
+    // 用同一个方法写，两次运行的结果才可比。
+    //
+    // 时间戳钉在 zip 纪元（1980-01-01）：新部件不是从原件搬来的，本来就没有
+    // "原来的时间"可继承；若用"当前时间"，同一份输入跑两次的产物字节就会不同，
+    // 而**可复现**是这个工具的硬要求（报告里要能自证两次结果一致）。
+    for (name, bytes) in added {
+        if seen.contains(name) {
+            continue; // 原件里已有同名条目 → 归 `replaced` 管，这里不越权
+        }
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default());
+        zw.start_file(name.clone(), opts)
+            .with_context(|| format!("写入新增部件 {name} 失败"))?;
+        zw.write_all(bytes)
+            .with_context(|| format!("写入新增部件 {name} 内容失败"))?;
+    }
     Ok(())
 }
 
@@ -340,6 +394,19 @@ pub fn write_with_replacements(
     src: &Path,
     dst: &Path,
     replaced: &HashMap<String, Vec<u8>>,
+) -> Result<()> {
+    write_with_replacements_ext(src, dst, replaced, &[])
+}
+
+/// 与 [`write_with_replacements`] 相同，但**还能往包里加新部件**（`added`）。
+///
+/// 页眉图片替换需要它：新图片必须作为 `word/media/…` 进包，而原件里没有这个名字。
+/// 其余调用方（正文替换）传空数组，行为与从前逐字节一致。
+pub fn write_with_replacements_ext(
+    src: &Path,
+    dst: &Path,
+    replaced: &HashMap<String, Vec<u8>>,
+    added: &[(String, Vec<u8>)],
 ) -> Result<()> {
     if !src.exists() {
         bail!("输入文件不存在：{}", src.display());
@@ -373,7 +440,7 @@ pub fn write_with_replacements(
         .open(dst)
         .with_context(|| format!("创建输出文件失败：{}", dst.display()))?;
     let mut zw = ZipWriter::new(BufWriter::new(out));
-    write_entries(&mut ar, &mut zw, replaced)?;
+    write_entries(&mut ar, &mut zw, replaced, added)?;
 
     let mut bw = zw.finish().context("收尾 zip 失败")?;
     bw.flush().context("写入磁盘失败")?;
@@ -391,11 +458,15 @@ pub fn write_with_replacements(
 /// 在内存里把新包拼出来（原件字节 → 新包字节），并复原容器层记账字段。
 ///
 /// 拆出来是为了就地覆写：那条路不能边读边写同一个文件，必须先把新内容整个拼好。
-fn build_zip_bytes(src_bytes: &[u8], replaced: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
+fn build_zip_bytes(
+    src_bytes: &[u8],
+    replaced: &HashMap<String, Vec<u8>>,
+    added: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>> {
     let mut ar = ZipArchive::new(std::io::Cursor::new(src_bytes))
         .context("不是合法的 zip/docx 容器")?;
     let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    write_entries(&mut ar, &mut zw, replaced)?;
+    write_entries(&mut ar, &mut zw, replaced, added)?;
 
     let cur = zw.finish().context("收尾 zip 失败")?;
     let mut out = cur.into_inner();
@@ -433,7 +504,7 @@ fn build_zip_bytes(src_bytes: &[u8], replaced: &HashMap<String, Vec<u8>>) -> Res
 /// 就地改写 `path` **本身**：自己把原件读进来，再走 [`rewrite_in_place_with`]。
 pub fn rewrite_in_place(path: &Path, replaced: &HashMap<String, Vec<u8>>) -> Result<()> {
     let orig = std::fs::read(path).with_context(|| format!("读取失败：{}", path.display()))?;
-    rewrite_in_place_with(path, replaced, &orig)
+    rewrite_in_place_with_ext(path, replaced, &[], &orig)
 }
 
 /// 与 [`rewrite_in_place`] 同一件事，但**原件字节由调用方给**。
@@ -451,7 +522,19 @@ pub fn rewrite_in_place_with(
     replaced: &HashMap<String, Vec<u8>>,
     orig: &[u8],
 ) -> Result<()> {
-    let out = build_zip_bytes(orig, replaced)?;
+    rewrite_in_place_with_ext(path, replaced, &[], orig)
+}
+
+/// 与 [`rewrite_in_place_with`] 相同，另支持**新增部件**（`added`）。
+///
+/// 页眉图片替换在就地覆盖模式下走这条：新图片要进 `word/media/`。
+pub fn rewrite_in_place_with_ext(
+    path: &Path,
+    replaced: &HashMap<String, Vec<u8>>,
+    added: &[(String, Vec<u8>)],
+    orig: &[u8],
+) -> Result<()> {
+    let out = build_zip_bytes(orig, replaced, added)?;
     if let Err(e) = write_at(path, 0, &out, true) {
         // ★ 回滚的结果**必须看**，不能 `let _ =` 吞掉。
         //
