@@ -367,6 +367,10 @@ CLI 加 `--verify-after`、GUI 执行时**恒开**。逐文件做三件事，全
 
 ## 从源码构建
 
+> 本节只讲**怎么编出来**。**开发这个项目的完整工作流** —— 本机环境、
+> 硬约束（零警告 / 内核零漂移）、验证链、提交与发版规范、新增功能的标准路径 ——
+> 见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ```bash
 # ① 只要命令行版 —— 不拉 eframe / winit / glow，编译最快
 cargo build --release
