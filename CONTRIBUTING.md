@@ -253,6 +253,24 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 本机真实值放在同目录的 `regress-samples.local.sh`（已 gitignore）。
 没有它就跑占位值，语法没毛病但会整片报红 —— 这是设计如此。
 
+**「逻辑入库、夹具自备」的分界**（clone 源码后照着配就行）：
+
+| 在仓库里（可复用的逻辑） | 要自备（本机数据，已 gitignore） |
+|---|---|
+| `regress.sh` —— 78 项检查本身 | `corpus/` —— 真实交付包（含客户名/项目号） |
+| `regress-group19.py` —— 第 19 组判定 | `samples/` —— 单文件样本（含 `T-选项矩阵.docx`） |
+| `run_option_matrix.py` —— 第 3 组矩阵 | `regress-samples.local.sh` —— 本机真实值 |
+| `regress-samples.example.sh` —— 配置模板 | `CHSRC` 指的字符引用夹具（一份含 `&#nnn;` 的 docx） |
+
+**缺夹具的表现**：核心项（要 `corpus/` 的那些）会整片报红 —— 没有语料确实测不了。
+但**可选夹具**缺了只打印黄色的 `−` 并计入「跳过」，**不算失败、退出码仍为 0**：
+`CORPUS_BASELINE`（历史基线）、`MATRIX`（选项矩阵）、`CHSRC`（字符引用夹具）。
+这样 clone 后没配齐也不会看到一片红，能分清"我缺数据"和"代码坏了"。
+
+⚠️ 从前 `CHSRC` 是**写死**在 `regress.sh` 里的绝对路径（全脚本唯一一处不可覆盖的
+输入），外人配好语料也照红 —— 2026-10-13 已提成变量 `WREPL_CHSRC` / `CHSRC`。
+**新增输入时一律走 `${WREPL_XXX:-默认}` 形式，别再写死本机路径。**
+
 ### 3.2 CHANGELOG（发版的硬要求）
 
 `.github/workflows/release.yml` 会抽**与 tag 同名小节开头的那组引用行**，
@@ -344,7 +362,8 @@ grep -rn "D:/test" src/ bench/ docs/ .github/ *.sh *.py *.md | grep -v "^target/
 
 反查能救命的例子（都是真实踩过的）：
 
-- `D:/test/regress/CH-charref.docx` ← `regress.sh:120` 的**回归夹具**，不能删；
+- `D:/test/regress/CH-charref.docx` ← `regress.sh` 第 4 组的**回归夹具**
+  （路径由 `regress-samples.local.sh` 的 `CHSRC` 指向，不再写死在脚本里），不能删；
 - `D:/test/run-009CE/` ← `regress-samples.local.sh` 的**端到端语料 + 规则文件**，不能删；
 - `D:/test/ww/` ← **另一个项目的真实客户文档**（看着像垃圾，实则不是）。
 

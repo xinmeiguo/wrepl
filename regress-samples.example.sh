@@ -11,6 +11,8 @@
 #
 # 没有这个文件也能跑 —— 语法没毛病，但 cp 找不到文件、grep 对不上期望值，
 # 会整片报红。这是设计如此，不是坏了。
+# 例外：下面标了「留空＝跳过」的两项（CHSRC / CORPUS_BASELINE）属于可选项，
+# 缺了只打印黄色的「−」，不算失败。
 
 # ── 需要的环境 ─────────────────────────────────────────────────────────
 # 1. 一份待替换的 docx 目录（回归里的"真实交付包"）
@@ -19,6 +21,7 @@
 #    文件名：<P_OLD 形态>-OQ-模板-*.docx、S-全坑样本.docx、T-选项矩阵.docx、
 #            A-URS.docx、B-点检表.docx、C-电气图档.docx
 # 4. 端到端用的规则文件 <RUN_DIR>/rules-<P_NEW>.txt
+# 5. （可选）第 4 组的夹具：一份 document.xml 里带 &#nnn; 字符引用的 docx
 
 SRC="D:/test/wrepl"          # 仓库根目录
 PY="python3"                 # 需要 openpyxl
@@ -30,7 +33,8 @@ RUN_DIR="./corpus/run"
 # 推的，而实际文件名常常不带年份前缀（如 rules-001CE.txt），推不出来。
 RULES_FILE="./corpus/run/rules-001CE.txt"
 SAMPLES="./samples"
-MATRIX="./run_option_matrix.py"
+MATRIX="./run_option_matrix.py"  # 已随仓库入库，一般不用改
+CHSRC=""                         # 第 4 组夹具：含 &#nnn; 的 docx；留空＝跳过该项
 
 SAMPLE_REAL="REAL-2025-001AUTc-OQ-模板-2026-06-22"
 

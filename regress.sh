@@ -30,7 +30,8 @@ CORPUS="${WREPL_CORPUS:-./corpus}"                # 待替换的 docx 目录
 CORPUS_BASELINE="${WREPL_CORPUS_BASELINE:-}"      # 历史基线产物目录（可留空＝跳过该项）
 RUN_DIR="${WREPL_RUN_DIR:-./corpus/run}"          # 端到端用的规则文件所在目录
 SAMPLES="${WREPL_SAMPLES:-./samples}"             # 单文件样本目录
-MATRIX="${WREPL_MATRIX:-./run_option_matrix.py}"  # 选项矩阵脚本
+MATRIX="${WREPL_MATRIX:-./run_option_matrix.py}"  # 选项矩阵脚本（已随仓库一起入库）
+CHSRC="${WREPL_CHSRC:-}"                          # 字符引用夹具：一份含 &#nnn; 的 docx；留空＝跳过第 4 组
 SAMPLE_REAL="${SAMPLE_REAL:-REAL-2025-005AUTc-OQ-模板-2026-06-22}"
 
 # 语料里的字面量（默认＝脱敏占位）
@@ -64,8 +65,12 @@ mkdir -p "$WORK"
 
 PASS=0
 FAIL=0
+SKIP=0
 ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
+# 夹具本机才有（真实语料 / 特制 docx）→ 缺了就「跳过」，算不得失败。
+# 这是给 clone 源码的人看的：没配夹具不该是一片红，而该是一排黄色的「−」。
+skip() { SKIP=$((SKIP+1)); printf '  \033[33m−\033[0m %s\n' "$1"; }
 head1() { printf '\n\033[36m══════ %s ══════\033[0m\n' "$1"; }
 
 sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
@@ -104,32 +109,40 @@ done
 
 # ───────────────────── 3. 选项矩阵 11 项 ─────────────────────
 head1 "3. 选项矩阵（外部脚本逐项对照期望命中数）"
-if [ -f "$MATRIX" ]; then
-  if "$PY" "$MATRIX" "$WREPL" > "$WORK/matrix.log" 2>&1 && grep -q "11/11 通过" "$WORK/matrix.log"; then
+if [ -f "$MATRIX" ] && [ -f "$SAMPLES/T-选项矩阵.docx" ]; then
+  # 第 2 个参数是 samples 目录 —— 脚本自己不会猜本机路径（原版按脚本同级找，
+  # 入库后同级是仓库根，而样本在 $SAMPLES，所以显式传进去）
+  if "$PY" "$MATRIX" "$WREPL" "$SAMPLES" > "$WORK/matrix.log" 2>&1 && grep -q "11/11 通过" "$WORK/matrix.log"; then
     ok "选项矩阵 11/11 通过"
   else
     bad "选项矩阵未全通过 —— 见 $WORK/matrix.log"
   fi
 else
-  bad "找不到 $MATRIX"
+  skip "选项矩阵：缺 $MATRIX 或 $SAMPLES/T-选项矩阵.docx（设 WREPL_MATRIX / WREPL_SAMPLES 指向自己的）"
 fi
 
 # ───────────────────── 4. 字符引用 &#nnn; ─────────────────────
 head1 "4. 字符引用 &#nnn;（quick-xml GeneralRef 坑）"
 CH=$WORK/ch; mkdir -p "$CH"
-CHSRC="D:/test/regress/CH-charref.docx"
-"$WREPL" apply "$CHSRC" --rule "设计情况=>已改造情况" --out "$CH" >/dev/null 2>&1
-if [ -f "$CH/CH-charref.docx" ]; then
-  before=$("$PY" -c "import zipfile,re,sys;print(len(re.findall(r'&#\d+;',zipfile.ZipFile(sys.argv[1]).read('word/document.xml').decode('utf-8','replace'))))" "$CHSRC")
-  after=$("$PY" -c "import zipfile,re,sys;print(len(re.findall(r'&#\d+;',zipfile.ZipFile(sys.argv[1]).read('word/document.xml').decode('utf-8','replace'))))" "$CH/CH-charref.docx")
-  hit=$("$PY" -c "import zipfile,sys;print(zipfile.ZipFile(sys.argv[1]).read('word/document.xml').decode('utf-8','replace').count('已改造情况'))" "$CH/CH-charref.docx")
-  if [ "$before" != "0" ] && [ "$after" = "0" ] && [ "$hit" = "1" ]; then
-    ok "字符引用 ${before} 处 → 0，替换落地 1 处"
+# 夹具由 WREPL_CHSRC 提供（一份 document.xml 里带 &#nnn; 字符引用的 docx）。
+# ⚠ 以前这里写死成 D:/test/regress/CH-charref.docx —— 全脚本唯一一处**不可覆盖**的
+# 绝对路径，外人配好语料也照红。现在跟别的输入一样走变量，缺了就是「跳过」。
+if [ -f "$CHSRC" ]; then
+  "$WREPL" apply "$CHSRC" --rule "设计情况=>已改造情况" --out "$CH" >/dev/null 2>&1
+  if [ -f "$CH/CH-charref.docx" ]; then
+    before=$("$PY" -c "import zipfile,re,sys;print(len(re.findall(r'&#\d+;',zipfile.ZipFile(sys.argv[1]).read('word/document.xml').decode('utf-8','replace'))))" "$CHSRC")
+    after=$("$PY" -c "import zipfile,re,sys;print(len(re.findall(r'&#\d+;',zipfile.ZipFile(sys.argv[1]).read('word/document.xml').decode('utf-8','replace'))))" "$CH/CH-charref.docx")
+    hit=$("$PY" -c "import zipfile,sys;print(zipfile.ZipFile(sys.argv[1]).read('word/document.xml').decode('utf-8','replace').count('已改造情况'))" "$CH/CH-charref.docx")
+    if [ "$before" != "0" ] && [ "$after" = "0" ] && [ "$hit" = "1" ]; then
+      ok "字符引用 ${before} 处 → 0，替换落地 1 处"
+    else
+      bad "字符引用处理异常（前 $before / 后 $after / 替换 $hit）"
+    fi
   else
-    bad "字符引用处理异常（前 $before / 后 $after / 替换 $hit）"
+    bad "字符引用测试未产出文件"
   fi
 else
-  bad "字符引用测试未产出文件"
+  skip "字符引用：未提供夹具（设 WREPL_CHSRC 指向一份含 &#nnn; 的 docx）"
 fi
 
 # ───────────────────── 5. 区间重叠必须报冲突 ─────────────────────
@@ -958,7 +971,12 @@ else
 fi
 
 # ───────────────────── 汇总 ─────────────────────
-printf '\n\033[1m══════════ 汇总：通过 %d ／ 失败 %d ══════════\033[0m\n' "$PASS" "$FAIL"
+if [ "$SKIP" -ne 0 ]; then
+  printf '\n\033[1m══════════ 汇总：通过 %d ／ 失败 %d ／ 跳过 %d ══════════\033[0m\n' "$PASS" "$FAIL" "$SKIP"
+  printf '\033[33m有跳过项：本机缺对应夹具（属正常，非失败）。\033[0m\n'
+else
+  printf '\n\033[1m══════════ 汇总：通过 %d ／ 失败 %d ══════════\033[0m\n' "$PASS" "$FAIL"
+fi
 if [ "$FAIL" -ne 0 ]; then
   printf '\033[31m有失败项，中间产物留在 %s 便于排查\033[0m\n' "$WORK"
   exit 1
