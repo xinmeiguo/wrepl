@@ -353,7 +353,7 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 
 | # | 项 |
 |---|---|
-| 5.1 | 仓库根混着 `regress-group19.py`(10 KB)、`run_regress.py` —— 过程脚本，宜归到 `bench/` 或 `.github/scripts/` |
+| 5.1 | ~~仓库根混着 `regress-group19.py`(10 KB)、`run_regress.py`~~ **已处理（2026-10-13）**：`run_regress.py` 是本机专用包装（写死 Git Bash 绝对路径与 `D:/test` 工作目录），已移出仓库到 `D:/test/wrepl-local/` 并加 `.gitignore`。`regress-group19.py` **保留在仓库根** —— 它被 `regress.sh` 按 `$SRC/regress-group19.py` 引用（`SRC` 默认值就是仓库根），移走会让第 19 组直接报红 |
 | 5.2 | **测试覆盖不均**：83 个 `#[test]` 集中在 `docx` / `hdr` / `naming` / `pipeline` / `probe` / `rules` / `verify` / `picker`；`app.rs`（3032 行）与 `wordtool/`（约 2100 行）**一个测试都没有** —— 恰恰是最近改动最多的地方 |
 | 5.3 | 版本语义：0.4.1 带进了 `src/hdr.rs`（2591 行）整套引擎，严格讲够 minor。**不回改**，但以后新增整套引擎时按 minor 走。★ 原注写的"tag 已发"是**错的** —— `v0.4.1` 当时只提交未推送，实际到 2026-10-13 才与 `v0.4.2` 同期补发（见 CHANGELOG 0.4.1 的「发版记录」） |
 
