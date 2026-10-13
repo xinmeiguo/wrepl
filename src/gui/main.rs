@@ -108,14 +108,93 @@ fn run_and_report(
 
     let Err(e) = &ran else { return ran };
 
+    // 先试着认出**已经能确证**的原因。认出来了，弹窗就不必再让人从三条
+    // "可能"里猜（对方机器上那位同事就是被并列的三条卡住，点了五次确定）。
+    let 已知 = 是缺_opengl(e).then_some(diag::已知原因::缺OpenGL);
+
     // 三路同时告知，哪条路通就走哪条：
     //   ① 日志（唯一一份完整的现场）
     //   ② stderr（从 cmd / PowerShell 启动时父控制台会继承，能直接看到）
     //   ③ 对话框（双击启动时**唯一**看得见的那条）
     let detail = format!("{e}");
     diag::log(format!("!!! 建窗失败 !!!\n  {detail}\n  {e:?}"));
+    if 已知.is_some() {
+        // 替读日志的人把结论写出来 —— 不写的话，得先知道 egui_glow 内部长什么样
+        // 才读得懂上面那句报错。顺带记下"该装驱动"，省一轮来回问。
+        diag::log(
+            "  ↑ 结论：这台机器的显卡驱动没有提供 OpenGL 2.0 以上（拿到的是 1.1）。\
+             请装显卡驱动；没驱动可装就用命令行版 wrepl.exe。",
+        );
+    }
     eprintln!("wrepl 图形界面没能打开窗口：{detail}");
     eprintln!("（同一个包里的 wrepl.exe 命令行版做的是同一件事，且不需要显卡）");
-    diag::startup_failure_box(&detail);
+    diag::startup_failure_box(&detail, 已知);
     ran
+}
+
+/// 这次建窗失败，是不是「驱动没提供 OpenGL 2.0+」。
+///
+/// 判据在 `egui_glow/src/painter.rs:161`：
+///
+/// ```ignore
+/// if gl.version().major < 2 {
+///     // this checks on desktop that we are not using opengl 1.1 microsoft sw rendering context.
+///     return Err(PainterError("egui_glow requires opengl 2.0+. ".to_owned()));
+/// }
+/// ```
+///
+/// 上游把注释直接写成「opengl 1.1 microsoft sw rendering context」—— 正是
+/// 「机器里插着显卡，但驱动没装 / 没生效，系统拿『Microsoft 基本显示适配器』
+/// 兜底」那一种。顺带：这道检查同时是**防 segfault** 的
+/// （`SHADING_LANGUAGE_VERSION` 是 GL 2.0 才有的枚举），所以我们拿到的是一条
+/// 干净的 `Err`，不是崩溃。
+///
+/// ★ **不能只看 `Error::OpenGL` 这个变体** —— 同一个变体也用来报「着色器编译
+/// 失败」之类的毛病，一律说成"没装显卡驱动"会把人带沟里。所以连消息一起认。
+/// （`PainterError` 的字段是私有的，只能走 `Display`；它的 `Display` 形如
+/// `"OpenGL: <消息>"`，因此直接找消息里的特征串。）
+fn 是缺_opengl(e: &eframe::Error) -> bool {
+    match e {
+        eframe::Error::OpenGL(p) => p.to_string().contains("requires opengl"),
+        _ => false,
+    }
+}
+
+// ─────────────────────────── 测试 ───────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一条**真实**的 egui_glow 建窗失败。
+    ///
+    /// 走 `eframe` 重导出的 `egui_glow`（`pub use {egui_glow, glow};`），
+    /// 用它的 `From<String>` 构造。比"自己拼个字符串然后当参数传"强的地方在于：
+    /// 万一上游改了变体的形状，这里**编译不过**，而不是悄悄退化成永远为假、
+    /// 让测试继续"绿着"却什么都没验。
+    fn 建窗失败(消息: &str) -> eframe::Error {
+        eframe::Error::OpenGL(eframe::egui_glow::PainterError::from(消息.to_string()))
+    }
+
+    #[test]
+    fn 缺opengl_认得出驱动只给_1_1_的那一条() {
+        // ★ 消息原文抄自同事机器（yuhongzhen04914）2026-10-13 的真实日志。
+        let e = 建窗失败("egui_glow requires opengl 2.0+. ");
+        assert!(是缺_opengl(&e), "这条必须认出来，否则弹窗又退回让人自己猜");
+    }
+
+    #[test]
+    fn 缺opengl_不把同变体的别的毛病算进去() {
+        // 着色器编译失败走的是**同一个** `Error::OpenGL` 变体，但那是另一回事 ——
+        // 说成「没装显卡驱动」会把人带到沟里去。这条测试盯的就是这个区分。
+        let e = 建窗失败("Failed to compile shader:\n0:1(10): error: syntax error");
+        assert!(!是缺_opengl(&e));
+    }
+
+    #[test]
+    fn 缺opengl_不认别的变体() {
+        // 拿一个跟图形无关的失败做对照，确认 `_ => false` 那条早退分支是对的。
+        let e = eframe::Error::AppCreation(Box::new(std::io::Error::other("boom")));
+        assert!(!是缺_opengl(&e), "非 OpenGL 变体不该被认成显卡问题");
+    }
 }

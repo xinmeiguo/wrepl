@@ -3524,6 +3524,7 @@ dependencies = [
  "egui_sauge",
  "globset",
  "hex",
+ "log",
  "quick-xml 0.42.0",
  "rfd",
  "sha2",

@@ -128,6 +128,82 @@ fn write_line(msg: &str) {
     }
 }
 
+// ───────────────────── 接管第三方库的日志（`log` 门面） ─────────────────────
+//
+// 图形子系统下没有 stderr，**库里打的日志默认全丢**。而「窗口建不出来」最要紧的
+// 现场恰恰在库里：`egui_glow` 的 `painter.rs:150-158` 会打出
+//
+//     opengl version: 1.1.0
+//     opengl renderer: GDI Generic
+//     opengl vendor: Microsoft Corporation
+//
+// （源码注释写着"这三样在 gl 1.1 上也拿得到"），紧接着 `painter.rs:161` 才因为
+// `gl.version().major < 2` 返回 `PainterError`。把这三行接进我们的日志文件，
+// 「建窗失败」就从一句干巴巴的报错，变成能直接看出**驱动到底给了什么**。
+//
+// 噪音控制：`Info` 及以上全收；`Debug` 只放行与图形上下文直接相关的模块，
+// 免得 egui/winit 的逐帧 debug 把这个小日志刷爆。想全看就设 `WREPL_LOG=debug`。
+
+/// 这条 `log` 记录要不要收。**纯函数**，便于测试。
+fn 放行(target: &str, level: log::Level, 全开: bool) -> bool {
+    // log 的级别序是 Error < Warn < Info < Debug < Trace，
+    // 所以 `<= Info` 就是「前三档全收」。
+    if level <= log::Level::Info {
+        return true;
+    }
+    if 全开 {
+        return true;
+    }
+    // 其余（Debug / Trace）只关心会说出「图形上下文是什么」的那几个模块。
+    const 关心的: [&str; 4] = ["egui_glow", "glutin", "glutin_winit", "eframe"];
+    关心的.iter().any(|m| target.starts_with(m))
+}
+
+/// 环境变量 `WREPL_LOG=debug` 时全开。**只读一次**，别每条记录都去问环境。
+fn 日志全开() -> bool {
+    static ONCE: OnceLock<bool> = OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var("WREPL_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"))
+    })
+}
+
+/// 把 `log` 门面接到本模块的日志文件上。**只生效一次**，重复调用无副作用。
+///
+/// 接不上（已经有别人装过 logger）就安静放弃 —— 日志是辅助，不该因为它出错。
+pub fn install_log_bridge() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        if log::set_boxed_logger(Box::new(日志桥)).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+    });
+}
+
+struct 日志桥;
+
+impl log::Log for 日志桥 {
+    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
+        放行(m.target(), m.level(), 日志全开())
+    }
+
+    fn log(&self, r: &log::Record<'_>) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        // 库里爱打多行（`egui_glow` 那三行就是**一条** `debug!`），逐行写、
+        // 续行缩进，免得跟我们自己的 `[时间戳]` 行混在一起分不清谁是谁。
+        for (i, line) in r.args().to_string().lines().enumerate() {
+            if i == 0 {
+                write_line(&format!("[{}] {line}", r.level()));
+            } else {
+                write_line(&format!("        {line}"));
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 /// 安装 panic 钩子，并写一条启动头。**只生效一次**。
 pub fn init(what: &str) {
     static ONCE: OnceLock<()> = OnceLock::new();
@@ -167,6 +243,9 @@ pub fn init(what: &str) {
             "参数: {:?}",
             std::env::args().skip(1).collect::<Vec<_>>()
         ));
+        // 最后一步：把 `log` 门面接上。之后库（egui_glow / glutin / winit）打的
+        // 日志都会落到同一个文件里 —— 建窗失败时那就是关键现场。
+        install_log_bridge();
     });
 }
 
@@ -192,19 +271,61 @@ fn crash_box(msg: &str) {
 ///
 /// 所以这里把话说全：出了什么事、为什么、日志在哪、
 /// 以及**接下来能干什么**（命令行版干的是同一件事，而且不需要显卡）。
+/// 已经能**确证**的失败原因。拿不准就传 `None`，弹窗退回「最常见原因」清单。
+///
+/// 加这个参数的动机很实在：日志上已经明明白白写着
+/// `egui_glow requires opengl 2.0+` 的时候，再并列"安全软件拦截""系统过旧"
+/// 只会稀释重点 —— 对方机器上那位同事就是被这三条并列的"可能"卡住，
+/// 连点五次确定都没看懂该干嘛（2026-10-13 的真实日志）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum 已知原因 {
+    /// 驱动没给出 OpenGL 2.0+（拿到的是微软软件渲染的 1.1）。
+    缺OpenGL,
+}
+
 #[cfg(windows)]
-pub fn startup_failure_box(detail: &str) {
-    let text = format!(
+pub fn startup_failure_box(detail: &str, 已知: Option<已知原因>) {
+    box_impl("wrepl —— 窗口没能打开", &失败文案(detail, 已知));
+}
+
+/// 拼「窗口没能打开」要说的那段话。
+///
+/// **纯字符串**，和弹窗机制分开：`box_impl` 一调用就阻塞等用户点确定，
+/// 没法在测试里跑；把文案抽出来，它自己就能被单元测试盯住 —— 尤其是
+/// 「确证原因之后不许再并列那三条可能」这件容易改坏的事。
+fn 失败文案(detail: &str, 已知: Option<已知原因>) -> String {
+    // 「确证」和「靠猜」两种情况分开写：确证时只给一条结论 + 该干什么，
+    // 拿不准才退回并列清单。
+    let 原因段 = match 已知 {
+        Some(已知原因::缺OpenGL) => {
+            "── 原因已经确认 ──\n\
+             这台机器的显卡驱动没有提供 OpenGL 2.0 以上，系统现在用的是微软自带的\n\
+             软件渲染（OpenGL 1.1）—— 设备管理器 →「显示适配器」里的那个\n\
+             「Microsoft 基本显示适配器」，就是它。\n\
+             \n\
+             注意：有显卡 ≠ 驱动在干活。显卡插着但驱动没装（或没生效）时，\n\
+             系统就拿这个基础适配器兜底，而它只给到 OpenGL 1.1。\n\
+             \n\
+             装一下显卡驱动，本程序就能打开：\n\
+             \x20 · 到显卡厂商官网按型号下载（Intel / NVIDIA / AMD）；\n\
+             \x20 · 或用整机厂官网给的驱动包。\n\
+             装好后「Microsoft 基本显示适配器」会从设备管理器里消失。\n"
+        }
+        None => {
+            "最常见的原因（按出现频率）：\n\
+             1. 这台机器的显卡驱动没有提供 OpenGL 2.0 以上 ——\n\
+             \x20  远程桌面、虚拟机、或只装了「Microsoft 基本显示适配器」时都是这样；\n\
+             2. 安全软件 / 公司管控套件拦住了本程序创建窗口；\n\
+             3. 系统过旧（本程序要求 64 位 Windows 10 及以上，且需 x64 CPU）。\n"
+        }
+    };
+    format!(
         "wrepl 图形界面没能打开窗口，程序即将退出。\n\
          \n\
-         最常见的原因（按出现频率）：\n\
-         1. 这台机器的显卡驱动没有提供 OpenGL 2.1 以上 ——\n\
-         \x20  远程桌面、虚拟机、或只装了「Microsoft 基本显示适配器」时都是这样；\n\
-         2. 安全软件 / 公司管控套件拦住了本程序创建窗口；\n\
-         3. 系统过旧（本程序要求 64 位 Windows 10 及以上，且需 x64 CPU）。\n\
+         {原因段}\
          \n\
          ── 不影响你干活 ──\n\
-         同一个压缩包里的 wrepl.exe（命令行版）做的是**完全一样的事**，\n\
+         同一个压缩包里的 wrepl.exe（命令行版）做的是「完全一样的事」，\n\
          而且不需要显卡、不需要窗口。用法：\n\
          \n\
          \x20   wrepl.exe apply \"要处理的文件夹\" --rules-file \"规则.txt\" --verify-after\n\
@@ -220,12 +341,11 @@ pub fn startup_failure_box(detail: &str) {
          {}",
         path_text(),
         detail
-    );
-    box_impl("wrepl —— 窗口没能打开", &text);
+    )
 }
 
 #[cfg(not(windows))]
-pub fn startup_failure_box(detail: &str) {
+pub fn startup_failure_box(detail: &str, _已知: Option<已知原因>) {
     eprintln!(
         "wrepl 图形界面没能打开窗口：{detail}\n\
          （命令行版 wrepl 做的是同一件事，且不需要显卡）\n日志：{}",
@@ -366,4 +486,83 @@ fn stamp() -> String {
 #[cfg(not(windows))]
 fn stamp() -> String {
     "---------- --:--:--.---".to_string()
+}
+
+// ─────────────────────────── 测试 ───────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── 日志桥的收词规则 ────────────────────────────────────────────────
+    //
+    // 这条规则的价值全在"两侧都不能错"：
+    //   收少了 → 建窗失败时看不到 `opengl version/renderer/vendor`，白接一趟；
+    //   收多了 → egui/winit 的逐帧 debug 把小日志刷爆，真正的现场被埋掉。
+
+    #[test]
+    fn 放行_info_及以上一律收() {
+        for lv in [log::Level::Error, log::Level::Warn, log::Level::Info] {
+            assert!(放行("egui::anything", lv, false), "{lv} 不该被挡");
+            assert!(放行("某个我不认识的库", lv, false), "{lv} 不该被挡");
+        }
+    }
+
+    #[test]
+    fn 放行_debug_只认图形上下文那几个模块() {
+        // 要的就是这一条：egui_glow 在 painter.rs:150-158 打的三行
+        assert!(放行("egui_glow::painter", log::Level::Debug, false));
+        assert!(放行("glutin::api::wgl", log::Level::Debug, false));
+        assert!(放行("eframe::native::run", log::Level::Debug, false));
+        // 别的模块的 debug 不进日志（egui 逐帧、winit 事件循环都在此列）
+        assert!(!放行("egui::context", log::Level::Debug, false));
+        assert!(!放行("winit::event_loop", log::Level::Debug, false));
+        assert!(!放行("egui_sauge", log::Level::Debug, false));
+    }
+
+    #[test]
+    fn 放行_全开时_debug_不再挑模块() {
+        assert!(放行("egui::context", log::Level::Debug, true));
+        assert!(放行("随便什么", log::Level::Trace, true));
+    }
+
+    #[test]
+    fn 放行_只看前缀不看包含() {
+        // `starts_with` 而不是 `contains`：免得某个叫 "my-egui_glow-wrapper"
+        // 的第三方模块顺带把 debug 全放进来。
+        assert!(!放行("my-egui_glow", log::Level::Debug, false));
+    }
+
+    // ── 建窗失败的文案 ──────────────────────────────────────────────────
+
+    #[test]
+    fn 文案_确证缺opengl时_只给一条结论不再并列可能() {
+        let t = 失败文案("egui_glow: OpenGL: egui_glow requires opengl 2.0+. ", Some(已知原因::缺OpenGL));
+        assert!(t.contains("原因已经确认"), "确证了就该直说");
+        assert!(t.contains("Microsoft 基本显示适配器"), "要指名道姓，对方才知道去哪看");
+        assert!(t.contains("装一下显卡驱动"), "得给出下一步干什么");
+        // ★ 这条是重点：已经确证还并列"安全软件拦截""系统过旧"只会稀释重点。
+        assert!(!t.contains("最常见的原因"), "确证后不该再退回并列清单");
+        assert!(!t.contains("安全软件"), "确证后不该再提别的可能");
+    }
+
+    #[test]
+    fn 文案_拿不准时_退回并列清单() {
+        let t = 失败文案("winit error: 别的什么毛病", None);
+        assert!(t.contains("最常见的原因"));
+        assert!(t.contains("安全软件"), "拿不准时三条可能都得留着");
+        assert!(!t.contains("原因已经确认"), "没确证就别把话说死");
+    }
+
+    #[test]
+    fn 文案_两种都带上原始报错和日志路径() {
+        for 已知 in [None, Some(已知原因::缺OpenGL)] {
+            let t = 失败文案("某某错误 42", 已知);
+            // 原始报错必须原样留着 —— 它是唯一没被我们二次解读的证据
+            assert!(t.contains("某某错误 42"), "原始报错被吞了：{已知:?}");
+            assert!(t.contains("wrepl-gui.log"), "日志路径得给出来：{已知:?}");
+            // 命令行版这条路两条都要有（很多人只有 GUI 打不开、CLI 完全能用）
+            assert!(t.contains("wrepl.exe apply"), "没给命令行版的用法：{已知:?}");
+        }
+    }
 }

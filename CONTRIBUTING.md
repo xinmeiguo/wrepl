@@ -236,7 +236,7 @@ cd /d/test/wrepl
 cargo check --features gui --offline
 
 # ② 单元测试
-cargo test --features gui --offline --bin wrepl-gui      # 期望 49 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui      # 期望 59 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
@@ -308,7 +308,7 @@ vX.Y.Z：一句话说清这版干了什么
 - 修复：…
 - 交互：…
 
-验证：cargo check/build 0 error 且自家代码零警告；cargo test 49 passed；
+验证：cargo check/build 0 error 且自家代码零警告；cargo test 59 passed；
 regress.sh 通过 78 / 失败 0，含 26/26 SHA256 与基线完全相同。
 ```
 
@@ -395,13 +395,21 @@ grep -rn "D:/test" src/ bench/ docs/ .github/ *.sh *.py *.md | grep -v "^target/
    | `src/gui/` | 界面（`app.rs` 外壳 / `ds.rs` 设计系统 / `picker.rs` 文件选择器 / `wordtool/` COM 部分） |
    | `src/main.rs` · `src/gui/main.rs` | 两个入口（CLI / GUI） |
 
-3. **加测试** —— 单元测试跟代码放一起（`src/gui/picker.rs` 与 `src/gui/app.rs`
-   末尾都有 `mod tests`），跑 `cargo test --features gui --bin wrepl-gui`。
+3. **加测试** —— 单元测试跟代码放一起（`src/gui/` 下的 `picker.rs` / `app.rs` /
+   `diag.rs` / `main.rs` 末尾都有 `mod tests`），跑
+   `cargo test --features gui --bin wrepl-gui`。
    **界面逻辑优先补"纯状态机"那部分**（拖放落点、输出模式、路径计算、日志裁剪…）
    —— 它们不需要窗口、几十毫秒就跑完；真正要图形栈的（布局、绘制、消息循环）
-   仍归 `--selftest`。写测试前留意两点：① 界面渲染**不能早于** `ds::install`
-   （否则 egui 在 `TextStyle::Name("h3")` 上直接 panic）；② `App::new()` 是纯内存
-   构造，测试里放心造。
+   仍归 `--selftest`。
+   **不好测的东西，先想办法把纯的部分抽出来**：`diag::失败文案(detail, 已知)`
+   就是这么来的 —— `box_impl` 一调用就阻塞等用户点确定，测试里跑不了；把**文案**
+   抽成纯函数之后，"确证原因后不许再并列那几条可能"这种事就有断言盯着了。
+   同理 `diag::放行`（日志收词规则）也刻意做成纯函数（把"是否全开"当参数传进来，
+   而不是在里面读环境变量）。构造不出真实对象时**别退回拼字符串**：
+   `main.rs` 的测试是拿 `eframe::egui_glow::PainterError::from(..)` 造**真**错误 ——
+   这样上游改了变体形状会**编译不过**，而不是悄悄退化成永远为假、测试绿着却什么都没验。
+   写测试前留意两点：① 界面渲染**不能早于** `ds::install`（否则 egui 在
+   `TextStyle::Name("h3")` 上直接 panic）；② `App::new()` 是纯内存构造，放心造。
 4. **界面/性能改动** —— 按 §2.4 留基线；要截图用 `D:/test/capture_page.py`
    （窗口内坐标；注意本机**合成鼠标输入是概率性被拦的**，拖拽类验证要重试）。
 5. **跑验证链**（§3.1），一条不能少。

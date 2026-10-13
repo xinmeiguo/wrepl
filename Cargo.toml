@@ -20,6 +20,7 @@ gui = [
     "dep:windows",
     "dep:egui_sauge",
     "dep:egui-phosphor",
+    "dep:log",
 ]
 
 [dependencies]
@@ -44,6 +45,24 @@ eframe = { version = "0.34", default-features = false, features = [
 ], optional = true }
 # 原生「选择目录 / 选择文件」对话框
 rfd = { version = "0.15.4", optional = true }
+
+# 日志门面。**不是给我们自己用的**（我们的日志走 diag 那套，见 src/gui/diag.rs），
+# 只为了一件事：把第三方库打的日志接住。
+#
+# 图形子系统（PE Subsystem = 2）下没有 stderr，库里打的日志默认**全丢**；而
+# "窗口建不出来"最要紧的现场恰恰在库里 —— egui_glow 的 painter.rs:150-158 会打
+#
+#     opengl version: 1.1.0
+#     opengl renderer: GDI Generic
+#     opengl vendor: Microsoft Corporation
+#
+# （源码注释写明"这三样在 gl 1.1 上也拿得到"），紧接着 painter.rs:161 才因为
+# `gl.version().major < 2` 返回 PainterError。接住这三行，"建窗失败"就从一句
+# 干巴巴的报错变成能直接看出**驱动到底给了什么**。
+#
+# 版本已经随 eframe 进树（Cargo.lock 里是唯一的 0.4.34），提升为直接依赖
+# 不会引入第二份。
+log = { version = "0.4", optional = true }
 
 # ── 设计系统（迁移第 2 步接入）───────────────────────────────────────────
 #
