@@ -21,6 +21,9 @@
 > **0.4.2 已发版（2026-10-13）**：上表 1–5 全部落地，正文见 [`CHANGELOG.md`](../CHANGELOG.md) 的 0.4.2 一节。
 > 同期**补发了 `v0.4.1`**（提交 `b428b78`）—— 它 2026-10-12 只提交、没推送，
 > 所以 `v0.4.0` 之后 Release 页上一直没有它；详见 CHANGELOG 0.4.1 的「发版记录」。
+>
+> **[未发布]** 仓库里已积了两批改动，都还没打 tag：`regress.sh` 的可移植性补完
+> （见 §5.4）与 `app.rs` 的单元测试（见 §5.2）。明细见 `CHANGELOG.md` 的 `[未发布]` 一节。
 
 **为什么 5 依赖 3、4**：快捷键要绑的是"起手动作"（`Ctrl+O` 选目录、`F5` 扫描、
 `Ctrl+Enter` 执行），而 3、4 改的正是"用户怎么把输入塞进来、下次从哪儿开始"。
@@ -354,7 +357,7 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 | # | 项 |
 |---|---|
 | 5.1 | ~~仓库根混着 `regress-group19.py`(10 KB)、`run_regress.py`~~ **已处理（2026-10-13）**：`run_regress.py` 是本机专用包装（写死 Git Bash 绝对路径与 `D:/test` 工作目录），已移出仓库到 `D:/test/wrepl-local/` 并加 `.gitignore`。`regress-group19.py` **保留在仓库根** —— 它被 `regress.sh` 按 `$SRC/regress-group19.py` 引用（`SRC` 默认值就是仓库根），移走会让第 19 组直接报红 |
-| 5.2 | **测试覆盖不均**：83 个 `#[test]` 集中在 `docx` / `hdr` / `naming` / `pipeline` / `probe` / `rules` / `verify` / `picker`；`app.rs`（3032 行）与 `wordtool/`（约 2100 行）**一个测试都没有** —— 恰恰是最近改动最多的地方 |
+| 5.2 | ~~测试覆盖不均~~ **部分处理（2026-10-13）**：`app.rs` 末尾已补 **28 条**单元测试 —— 拖放落点 / 输出模式 / 路径计算 / 日志裁剪 / 规则构建 / 预置模式，外加无窗口帧循环冒烟与 `Ctrl+O` 按页分发（合成按键）。`cargo test --features gui --offline --bin wrepl-gui` → **49 项全过**（新增 28 + 原有 21），0.6 秒；做过阴性对照（改坏两处被测逻辑，对应断言立刻转红）。**仍未覆盖**：`wordtool/`（约 2100 行，走 Word COM —— 本机没装 Word 跑不了）、`app.rs` 的执行链路（`start_run` / `run_blocking` / `write_report`，要真实语料）、界面布局细节（归 `--selftest`） |
 | 5.3 | 版本语义：0.4.1 带进了 `src/hdr.rs`（2591 行）整套引擎，严格讲够 minor。**不回改**，但以后新增整套引擎时按 minor 走。★ 原注写的"tag 已发"是**错的** —— `v0.4.1` 当时只提交未推送，实际到 2026-10-13 才与 `v0.4.2` 同期补发（见 CHANGELOG 0.4.1 的「发版记录」） |
 | 5.4 | ~~`regress.sh` 的可移植性是半成品~~ **已处理（2026-10-13）**：① 第 4 组的 `CHSRC` 曾**写死**成 `D:/test/regress/CH-charref.docx` —— 全脚本唯一一处不可覆盖的输入，外人配齐语料也照红；现提成 `${WREPL_CHSRC:-}`。② `run_option_matrix.py`（第 3 组）只活在某个 WorkBuddy 会话目录里、不在仓库 —— 它其实**完全通用**（无客户数据、无本机路径），已收进仓库根。③ 新增 `skip()` 语义：可选夹具（`CORPUS_BASELINE` / `MATRIX` / `CHSRC`）缺了打印黄色 `−`、计入「跳过」、**不算失败**，让 clone 后的人能分清"我缺数据"和"代码坏了"。分界原则写进 `CONTRIBUTING` §3.1：**逻辑入库、夹具自备** |
 

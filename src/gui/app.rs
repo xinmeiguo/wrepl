@@ -3595,3 +3595,749 @@ impl App {
         self.error.is_none()
     }
 }
+
+// ─────────────────────────── 单元测试 ───────────────────────────
+
+/// `app.rs` 的单元测试 —— 补这块长期存在的测试真空。
+///
+/// ## 为什么挑的是这几处
+///
+/// 在此之前，全仓 83 个 `#[test]` 全在 `docx` / `hdr` / `naming` / `pipeline` /
+/// `probe` / `rules` / `verify` / `picker` 八个模块里，而这个**改动最频繁**的文件
+/// 一条都没有。2026-10-13 那轮出的两个 bug（自检把 `out_to_subdir` 压成 false 后
+/// 忘还原、选择器位置每帧被重算）**恰恰都落在这片真空里** —— 是 `regress.sh` 兜住的，
+/// 而 `regress.sh` 要真实客户语料、**CI 跑不了**。也就是说：改这里以前只有
+/// "在本机手动跑一遍"这一道防线。
+///
+/// 所以下面补的是**最容易被改坏、坏起来后果最重**的纯逻辑：
+///
+/// - `options_for` —— 决定"到底动没动源文件"，出过 bug 的就是它；
+/// - `drop_into_input` / `drop_into_docs` / `is_word_doc` —— 0.4.2 新写的拖放落点；
+/// - `input_dir` / `product_dir` / `report_path` —— 报告与运行日志落在哪；
+/// - `trim_log` —— `run_log_from` 挪错就会切片越界 panic；
+/// - `build_rules` / `scope_of` —— 界面行变成内核规则的唯一出口。
+///
+/// 这些都是**纯状态机**，不需要窗口、不需要显卡。真正需要把图形栈跑起来的部分
+/// （布局、绘制、Windows 消息循环）仍然归 `wrepl-gui.exe --selftest` 管 ——
+/// 两者互补：这里跑得快、能定位到函数；自检那条路能覆盖真实的 egui 帧循环。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wordtool::PickDoc;
+
+    /// 造一个**唯一名字**的临时目录。
+    ///
+    /// 刻意不删：本机的删除拦截层（safe-delete）会让 `remove_dir_all` 要么挂起、
+    /// 要么静默失败，为测试留一堆要清理的目录不值当。名字里带进程号 + 纳秒时间戳，
+    /// 从根上撞不上上一轮的残留 —— 与 `regress.sh` 用 `$$` 是同一个思路。
+    fn 临时目录(标签: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("wrepl-app-{标签}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    /// 一个**保证不存在**的路径，用来测"路径在盘上不存在时会怎么解析"。
+    fn 不存在的路径() -> PathBuf {
+        let p = std::env::temp_dir()
+            .join("wrepl-app-这里肯定没有这个目录-7c1e")
+            .join("甲.docx");
+        assert!(!p.exists(), "这条前提不成立就没法测（真撞上了就换个名字）");
+        p
+    }
+
+    // ── 拖放：白名单 ────────────────────────────────────────────────
+
+    /// `.doc` / `.docx` 才收，且**不看大小写**。
+    ///
+    /// 它与「页眉替换 / 批量打印」那两页的选择器白名单是同一个来源，
+    /// 两条路必须给出同一批候选 —— 对不上就会出现"拖进来的和选进来的不一样"。
+    #[test]
+    fn 白名单_只认_doc_和_docx_且不看大小写() {
+        assert!(is_word_doc(Path::new("a.docx")));
+        assert!(is_word_doc(Path::new("a.doc")));
+        assert!(is_word_doc(Path::new("A.DOCX")));
+        assert!(is_word_doc(Path::new("混合.DoCx")));
+        assert!(is_word_doc(Path::new(r"E:\交付包\页眉 替换.docx")));
+    }
+
+    /// 反例：不是 Word 的一律挡掉。
+    #[test]
+    fn 白名单_挡掉非_word_与冒充的扩展名() {
+        assert!(!is_word_doc(Path::new("a.xlsx")));
+        // `.docx.bak` 的扩展名是 `bak` —— 就地替换留下的备份不该被当成文档收进来
+        assert!(!is_word_doc(Path::new("a.docx.bak")));
+        // 名字里带 .docx、扩展名却是别的（清单文件最容易这样）
+        assert!(!is_word_doc(Path::new("清单（列出 all.docx）.txt")));
+        // 老二进制格式与 WPS 一律明确拒绝，不做降级尝试
+        assert!(!is_word_doc(Path::new("a.wps")));
+        assert!(!is_word_doc(Path::new("没有扩展名")));
+        assert!(!is_word_doc(Path::new("")));
+        // 以点开头 = 隐藏文件，按 Rust 的规则**没有扩展名**
+        assert!(!is_word_doc(Path::new(".docx")));
+    }
+
+    // ── 拖放：落在「输入」栏（批量替换页） ──────────────────────────
+
+    /// 不按 Ctrl：整栏换掉（与资源管理器里"点选"的直觉一致）。
+    #[test]
+    fn 拖入输入栏_默认是整栏替换() {
+        let mut app = App::new();
+        app.input = "E:/旧的".into();
+        app.drop_into_input(vec![PathBuf::from("E:/新的一"), PathBuf::from("E:/新的二")], false);
+        assert_eq!(
+            app.input, "E:/新的一\nE:/新的二",
+            "不按 Ctrl 时原内容整个被换掉，多项之间一行一个"
+        );
+    }
+
+    /// 按住 Ctrl：追加到原内容后面，中间只留一个换行。
+    #[test]
+    fn 拖入输入栏_按住_ctrl_是追加() {
+        let mut app = App::new();
+        app.input = "E:/旧的\n".into(); // 故意带一个尾随换行
+        app.drop_into_input(vec![PathBuf::from("E:/新的")], true);
+        assert_eq!(
+            app.input, "E:/旧的\nE:/新的",
+            "追加前要 trim_end，否则中间会多出一个空行"
+        );
+    }
+
+    /// 栏里本来是空的 → 追加等于填进去，**前面不该多一个空行**。
+    ///
+    /// 这一条单拎出来是因为"空内容 + 追加"最容易写出前导换行，
+    /// 而前导换行在 `input_paths` 里会被当空片段跳过，肉眼很难发现。
+    #[test]
+    fn 拖入输入栏_栏里是空的时候_追加等同于替换() {
+        let mut app = App::new();
+        assert!(app.input.is_empty(), "新开的 App 输入栏应当是空的");
+        app.drop_into_input(vec![PathBuf::from("E:/新的")], true);
+        assert_eq!(app.input, "E:/新的");
+    }
+
+    // ── 拖放：落在「已选文档」（另两页） ────────────────────────────
+
+    /// 只收 Word 文档，其余跳过 —— 并说明跳过。
+    #[test]
+    fn 拖入文档栏_只收_word_其余跳过() {
+        let mut app = App::new();
+        let dir = 临时目录("docs-filter");
+        let 甲 = dir.join("甲.docx");
+        let 乙 = dir.join("乙.doc");
+        let 丙 = dir.join("丙.txt");
+        for p in [&甲, &乙, &丙] {
+            std::fs::write(p, b"x").expect("造测试文件");
+        }
+
+        app.drop_into_docs(vec![甲.clone(), 乙.clone(), 丙.clone()], false, PickDoc::Header);
+
+        let got = app.wt.docs_of(PickDoc::Header).to_vec();
+        assert_eq!(got.len(), 2, "只有 .doc / .docx 该留下");
+        assert!(got.contains(&甲.display().to_string()));
+        assert!(got.contains(&乙.display().to_string()));
+        assert!(
+            !got.iter().any(|s| s.ends_with("丙.txt")),
+            "txt 不该被收进「已选文档」"
+        );
+    }
+
+    /// 目录**只展开一层**，不递归。
+    ///
+    /// 递归展开会在拖进一个交付包目录时静默吞进几百个文件 —— 人没要求那个。
+    #[test]
+    fn 拖入文档栏_目录只展开一层不递归() {
+        let mut app = App::new();
+        let root = 临时目录("docs-one-level");
+        let sub = root.join("子目录");
+        std::fs::create_dir_all(&sub).expect("建子目录");
+        std::fs::write(root.join("顶层.docx"), b"x").expect("造顶层文件");
+        std::fs::write(sub.join("深层.docx"), b"x").expect("造深层文件");
+
+        app.drop_into_docs(vec![root.clone()], false, PickDoc::Header);
+
+        let got = app.wt.docs_of(PickDoc::Header).to_vec();
+        assert_eq!(got.len(), 1, "只展开一层：子目录里的不该被吞进来");
+        assert!(got[0].ends_with("顶层.docx"), "收进来的该是顶层那个：{got:?}");
+    }
+
+    /// 一项都没收下时**不能动原有清单**。
+    ///
+    /// 这是"拖错了"最常见的场景（拖了个 pdf / 图片进来）：如果这里走了
+    /// "先清空再填"的写法，人手一抖就把前面精挑细选的清单全清了。
+    #[test]
+    fn 拖入文档栏_一项都没收下时不动原有清单() {
+        let mut app = App::new();
+        app.wt
+            .set_docs(PickDoc::Print, vec!["E:/原先挑好的.docx".to_string()]);
+        let dir = 临时目录("docs-nothing-kept");
+        let 图 = dir.join("图.png");
+        std::fs::write(&图, b"x").expect("造测试文件");
+
+        app.drop_into_docs(vec![图], false, PickDoc::Print);
+
+        assert_eq!(
+            app.wt.docs_of(PickDoc::Print).to_vec(),
+            vec!["E:/原先挑好的.docx".to_string()],
+            "拖进来的不是 Word 文档时，原有清单要原封不动"
+        );
+    }
+
+    /// 按住 Ctrl：追加到清单末尾，顺序是"原有的在前"。
+    #[test]
+    fn 拖入文档栏_按住_ctrl_是追加到末尾() {
+        let mut app = App::new();
+        app.wt
+            .set_docs(PickDoc::Header, vec!["E:/先选的.docx".to_string()]);
+        let dir = 临时目录("docs-append");
+        let 再来 = dir.join("再来一个.docx");
+        std::fs::write(&再来, b"x").expect("造测试文件");
+
+        app.drop_into_docs(vec![再来.clone()], true, PickDoc::Header);
+
+        let got = app.wt.docs_of(PickDoc::Header).to_vec();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], "E:/先选的.docx", "原有的排在前面");
+        assert_eq!(got[1], 再来.display().to_string(), "新拖进来的接在后面");
+    }
+
+    /// 落点按页隔离：拖到「页眉替换」不该影响「批量打印」的清单。
+    #[test]
+    fn 拖入文档栏_两个页的清单互不串() {
+        let mut app = App::new();
+        let dir = 临时目录("docs-isolate");
+        let d = dir.join("甲.docx");
+        std::fs::write(&d, b"x").expect("造测试文件");
+
+        app.drop_into_docs(vec![d], false, PickDoc::Header);
+
+        assert_eq!(app.wt.docs_of(PickDoc::Header).len(), 1, "页眉页应当收到它");
+        assert!(
+            app.wt.docs_of(PickDoc::Print).is_empty(),
+            "打印页的清单不该被牵连"
+        );
+    }
+
+    // ── 输出模式：决定"到底动没动源文件" ────────────────────────────
+
+    /// 默认落盘方式就是**就地替换源文件** —— 这是全程序后果最重的默认值。
+    ///
+    /// 界面上没有任何东西提示"这一下会覆盖原文件"，所以这个默认值一旦被改，
+    /// 影响的是所有人第一次点「执行替换」的结果。钉死它。
+    #[test]
+    fn 输出模式_默认就是就地替换源文件() {
+        let app = App::new();
+        assert!(!app.out_to_subdir, "默认不勾「输出到子文件夹」");
+
+        let o = app.options_for(false);
+        assert!(o.in_place, "不勾就是就地覆盖源文件");
+        assert!(o.out_dir.is_none(), "就地替换没有输出目录");
+        assert!(!o.dry_run);
+    }
+
+    /// 勾了「输出到子文件夹」→ 写副本，源文件不动。
+    #[test]
+    fn 输出模式_勾了子文件夹就写副本() {
+        let mut app = App::new();
+        app.out_to_subdir = true;
+        app.output = "E:/产物".into();
+        app.mirror = true;
+        app.backup = true;
+
+        let o = app.options_for(false);
+        assert!(!o.in_place, "写副本绝不动源文件");
+        assert_eq!(o.out_dir, Some(PathBuf::from("E:/产物")));
+        assert!(o.mirror, "镜像只在写副本时才有意义");
+        assert!(!o.backup, "备份只跟就地替换有关，写副本时不该生效");
+    }
+
+    /// 预演：什么都不许落盘 —— 备份 / 镜像 / 改名 / 执行后验证一并失效。
+    ///
+    /// 这一条是 `F5`（扫描预演）的地基。任何一项漏掉，按 F5 就不再是"看一眼"。
+    #[test]
+    fn 输出模式_预演一律不落盘() {
+        let mut app = App::new();
+        app.out_to_subdir = true;
+        app.output = "E:/产物".into();
+        app.mirror = true;
+        app.backup = true;
+        app.rename_files = true;
+
+        let o = app.options_for(true);
+        assert!(o.dry_run);
+        assert!(!o.in_place, "预演不是就地——它压根不落盘");
+        assert!(o.out_dir.is_none(), "预演不许指定输出目录");
+        assert!(!o.backup, "预演不落盘，没有备份可言");
+        assert!(!o.mirror, "预演不落盘，谈不上镜像");
+        assert!(!o.rename_files, "预演不改名");
+        assert!(!o.verify_after, "预演没写文件，没什么可验证的");
+    }
+
+    /// 备份的三个条件缺一不可：勾了 + 非预演 + 就地。
+    #[test]
+    fn 输出模式_备份只在就地且非预演时生效() {
+        let mut app = App::new();
+        app.backup = true;
+        assert!(app.options_for(false).backup, "就地替换 + 执行 → 该留 .bak");
+
+        app.out_to_subdir = true;
+        app.output = "E:/产物".into();
+        assert!(
+            !app.options_for(false).backup,
+            "写副本本来就不动源文件，没有备份的概念"
+        );
+
+        app.out_to_subdir = false;
+        assert!(!app.options_for(true).backup, "预演不落盘");
+    }
+
+    /// 链式替换下不存在区间重叠，所以"最长匹配优先"自动失效。
+    ///
+    /// 这两个开关在界面上是互斥的（勾了链式会把另一个清掉），但内核侧
+    /// 必须**自己再判一次** —— 否则规则表来回倒腾时会出现"两个都开着"的状态。
+    #[test]
+    fn 输出模式_链式替换压制最长匹配() {
+        let mut app = App::new();
+        app.longest_first = true;
+        app.chain = false;
+        assert!(app.options_for(false).longest_first, "不链式时最长匹配生效");
+
+        app.chain = true;
+        assert!(
+            !app.options_for(false).longest_first,
+            "链式下规则先后作用、不存在重叠，裁决方式无从谈起"
+        );
+    }
+
+    /// 排除串认**四种**分隔符，且两头的空白要吃掉、空片段要丢掉。
+    #[test]
+    fn 输出模式_排除串认四种分隔符并去掉空白() {
+        let mut app = App::new();
+        app.exclude = " ~$*.docx ; 临时 ，备份,  ".into();
+
+        let o = app.options_for(false);
+        assert_eq!(
+            o.exclude,
+            vec![
+                "~$*.docx".to_string(),
+                "临时".to_string(),
+                "备份".to_string()
+            ],
+            "分号 / 中文分号 / 逗号 / 顿号都要认，两头的空白要 trim，空的不要"
+        );
+    }
+
+    /// 界面**不做**并行度选项：内核永远拿到 `0`（=按本机核数自动决定）。
+    #[test]
+    fn 输出模式_线程数交给内核自动决定() {
+        let app = App::new();
+        assert_eq!(
+            app.options_for(false).threads,
+            0,
+            "0 = 自动；界面上不该出现「开几个线程」这种要人猜的开关"
+        );
+    }
+
+    // ── 输入栏解析与落点计算 ───────────────────────────────────────
+
+    /// 输入栏的文本要能按多种分隔符拆开、去重、保序、trim。
+    #[test]
+    fn 输入栏_多种分隔符都会拆并去重保序() {
+        let mut app = App::new();
+        app.input = "E:/甲\nE:/乙;E:/丙；E:/甲\r\n  E:/丁  ".into();
+
+        // 保留粘贴顺序（报告里"输入"那一栏要保持原样），但重复的只留第一次。
+        let got: Vec<String> = app
+            .input_paths()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(got, vec!["E:/甲", "E:/乙", "E:/丙", "E:/丁"]);
+    }
+
+    /// 空输入 → 空列表（不是"一个空路径"）。
+    #[test]
+    fn 输入栏_空白输入不产生路径() {
+        let mut app = App::new();
+        app.input = "   \n  \n".into();
+        assert!(app.input_paths().is_empty(), "全是空白的输入不该被当成一个路径");
+    }
+
+    /// `input_dir` 取**第一个**输入的家：是文件就取它的父目录。
+    #[test]
+    fn 输入目录_文件取父目录() {
+        let mut app = App::new();
+        let ghost = 不存在的路径();
+        app.input = ghost.display().to_string();
+
+        let want = ghost.parent().expect("这个路径有父目录").to_path_buf();
+        assert_eq!(app.input_dir(), want);
+    }
+
+    /// 是目录就取它本身 —— 用系统临时目录当真目录，避免依赖本机别处的路径。
+    #[test]
+    fn 输入目录_目录取它本身() {
+        let mut app = App::new();
+        let real = std::env::temp_dir();
+        assert!(real.is_dir(), "系统临时目录应当是存在的");
+
+        app.input = real.display().to_string();
+        assert_eq!(app.input_dir(), PathBuf::from(real.display().to_string()));
+    }
+
+    /// 输入为空 → 空路径（后续据此回退，而不是拼出一个 `\替换报告.xlsx`）。
+    #[test]
+    fn 输入目录_空输入返回空路径() {
+        let app = App::new();
+        assert_eq!(app.input_dir(), PathBuf::new());
+    }
+
+    /// 产物与报告的落点跟着输出模式走，三种情形都要对。
+    #[test]
+    fn 落点_产物与报告跟着输出模式走() {
+        let mut app = App::new();
+        let ghost = 不存在的路径();
+        let 它家 = ghost.parent().expect("有父目录").to_path_buf();
+        app.input = ghost.display().to_string();
+
+        // ① 就地替换 → 落在输入目录（跟产物挨着，回头好找）
+        assert_eq!(app.product_dir(), 它家);
+        assert_eq!(app.report_path(), 它家.join("替换报告.xlsx"));
+
+        // ② 写副本 → 落在输出目录
+        app.out_to_subdir = true;
+        app.output = "E:/产物".into();
+        assert_eq!(app.product_dir(), PathBuf::from("E:/产物"));
+        assert_eq!(app.report_path(), PathBuf::from("E:/产物").join("替换报告.xlsx"));
+
+        // ③ 勾了写副本但输出栏是空白 → 退回输入目录，
+        //    **不能**把产物落到一个空路径上（那样报告就丢在当前工作目录了）
+        app.output = "   ".into();
+        assert_eq!(app.product_dir(), 它家, "输出栏空白时要退回输入目录");
+    }
+
+    /// 连输入都没有时，报告退回**裸文件名**（落在当前目录），不拼出 `\替换报告.xlsx`。
+    #[test]
+    fn 落点_什么都没有时报告退回裸文件名() {
+        let app = App::new();
+        assert_eq!(app.report_path(), PathBuf::from("替换报告.xlsx"));
+    }
+
+    // ── 日志容量 ───────────────────────────────────────────────────
+
+    /// 超上限丢最老的，同时把"本次执行起点"一起往前挪。
+    ///
+    /// 这一条要是漏了，`log[run_log_from..]` 就会切片越界 **panic** ——
+    /// 而它只在"日志攒满 400 行"这种长跑里才触发，手工点几下永远碰不到。
+    #[test]
+    fn 日志裁剪_超上限丢最老的行并同步前移起点() {
+        let mut app = App::new();
+        app.log = (0..10).map(|i| format!("第{i}行")).collect();
+        app.run_log_from = 8;
+
+        app.trim_log(5);
+
+        assert_eq!(app.log.len(), 5, "超上限就裁到只剩上限那么多");
+        assert_eq!(app.log[0], "第5行", "丢的是最老的那几行");
+        assert_eq!(app.run_log_from, 3, "本次执行的起点要同步往前挪 5 行");
+        assert!(
+            app.run_log_from <= app.log.len(),
+            "起点绝不能跑到日志长度之外，否则切片会 panic"
+        );
+    }
+
+    /// 起点比裁掉的还靠前 → 饱和到 0，不许下溢。
+    #[test]
+    fn 日志裁剪_起点比裁掉的还靠前时饱和到零() {
+        let mut app = App::new();
+        app.log = (0..10).map(|i| format!("第{i}行")).collect();
+        app.run_log_from = 1;
+
+        app.trim_log(2);
+
+        assert_eq!(app.run_log_from, 0, "减不动就停在 0，不能下溢成天文数字");
+        assert_eq!(app.log.len(), 2);
+    }
+
+    /// 没超上限时一动不动。
+    #[test]
+    fn 日志裁剪_没超上限时不动() {
+        let mut app = App::new();
+        app.log = vec!["只有一行".to_string()];
+        app.run_log_from = 0;
+
+        app.trim_log(400);
+
+        assert_eq!(app.log, vec!["只有一行".to_string()]);
+        assert_eq!(app.run_log_from, 0);
+    }
+
+    /// 追加日志时顺手裁剪，且空闲上限是 400 行。
+    #[test]
+    fn 追加日志_按空闲上限裁剪() {
+        let mut app = App::new();
+        app.log.clear();
+
+        app.extend_log((0..500).map(|i| format!("行{i}")).collect());
+
+        assert_eq!(app.log.len(), 400, "空闲时只留显示用的那 400 行");
+        assert_eq!(app.log[0], "行100", "丢的是最老的 100 行");
+    }
+
+    // ── 规则构建：界面行 → 内核规则 ────────────────────────────────
+
+    /// 没填「查找内容」的行不装进规则表。
+    #[test]
+    fn 规则_跳过没填查找内容的行() {
+        let mut app = App::new();
+        app.rows = vec![
+            Row::new("甲", "乙", "全部"),
+            Row::new("", "丙", "全部"), // 空查找内容：半截规则，不装
+            Row::new("丁", "戊", "全部"),
+        ];
+
+        let rules = app.build_rules().expect("应当构得出规则");
+        assert_eq!(rules.len(), 2, "没填查找内容的那行要跳过");
+        assert_eq!(rules[0].find, "甲");
+        assert_eq!(rules[1].find, "丁");
+        assert_eq!(rules[0].id, 1);
+        assert_eq!(
+            rules[1].id, 3,
+            "编号沿用界面行号（报告要能回溯到原处），跳过的行不重新编号"
+        );
+    }
+
+    /// 「同步替换文件名」没勾时，作用域只写了「文件名」的规则**没有可用作用域**。
+    ///
+    /// 必须报错而不是静默跳过：人写了这条规则就以为它会生效，
+    /// 悄悄不跑等于埋雷（这条错误信息还欠一次实际发生的验证）。
+    #[test]
+    fn 规则_没勾同步改名时纯文件名作用域要报错() {
+        let mut app = App::new();
+        app.rename_files = false;
+        app.rows = vec![Row::new("甲", "乙", "文件名")];
+
+        let err = app
+            .build_rules()
+            .expect_err("纯文件名作用域 + 没勾改名 = 没有可用作用域");
+        assert!(err.contains("没有可用作用域"), "错误要说清原因：{err}");
+        assert!(err.contains("第 1 条"), "错误要指出是第几条：{err}");
+
+        // 勾上改名之后同一个作用域就成立了
+        app.rename_files = true;
+        assert!(app.build_rules().is_ok(), "勾了「同步替换文件名」就该通过");
+    }
+
+    /// 作用域串写错时要报错，并指出是哪一条、错在哪。
+    #[test]
+    fn 规则_作用域写错要报错并指出行号() {
+        let mut app = App::new();
+        app.rows = vec![Row::new("甲", "乙", "正文,不存在的维度")];
+
+        let err = app.build_rules().expect_err("未知作用域应当报错");
+        assert!(err.contains("第 1 条"), "要指出是哪一条：{err}");
+        assert!(err.contains("不存在的维度"), "要把写错的那个词带出来：{err}");
+    }
+
+    /// 一条规则都没有 → 报错，不允许空跑。
+    #[test]
+    fn 规则_一条都没有时要报错() {
+        let mut app = App::new();
+        assert!(app.build_rules().is_err(), "空白规则表不该能开跑");
+
+        app.rows = vec![Row::new("", "", "全部")];
+        assert!(app.build_rules().is_err(), "全是空行也一样");
+    }
+
+    /// 「全部」要展开成所有维度，并且**文件名那一维由开关说了算**。
+    #[test]
+    fn 规则_全部作用域展开且文件名维度跟开关走() {
+        let mut app = App::new();
+        app.rows = vec![Row::new("甲", "乙", "全部")];
+        app.rename_files = true;
+
+        let rules = app.build_rules().expect("「全部」应当能解析");
+        let sc = rules[0].scope;
+        assert!(sc.body && sc.header_footer && sc.textbox && sc.footnote && sc.comment);
+        assert!(sc.filename, "勾了同步改名，文件名那一维应当打开");
+
+        app.rename_files = false;
+        let rules = app.build_rules().expect("关掉改名后「全部」仍然有效");
+        assert!(
+            !rules[0].scope.filename,
+            "没勾同步改名时，规则文件里写没写「文件名」都不该动文件名"
+        );
+        assert!(rules[0].scope.body, "其余维度不受影响");
+    }
+
+    // ── 预置模式（`--preset` / `--selftest` 共用） ──────────────────
+
+    /// 给了输出目录 → 自动走"写副本"。
+    ///
+    /// 这是 `--selftest` **永远不可能动到源语料**的根本原因：预置路径一律
+    /// 落在写副本上，跟"就地替换"那个默认值无关。
+    #[test]
+    fn 预置_给了输出目录就走写副本() {
+        let p = Preset {
+            input: "E:/输入".into(),
+            output: "E:/产物".into(),
+            ..Default::default()
+        };
+
+        let app = App::with_preset(&p);
+
+        assert!(app.out_to_subdir, "给了输出目录就该走写副本");
+        assert!(
+            !app.rename_files,
+            "预置模式默认**不改**文件名（与界面默认相反）——拿现成语料直接跑，改名会连语料名一起改掉"
+        );
+        assert_eq!(
+            app.options_for(false).out_dir,
+            Some(PathBuf::from("E:/产物"))
+        );
+    }
+
+    /// 不给输出目录 → 就地替换。
+    #[test]
+    fn 预置_没有输出目录时走就地替换() {
+        let p = Preset {
+            input: "E:/输入".into(),
+            ..Default::default()
+        };
+
+        let app = App::with_preset(&p);
+
+        assert!(!app.out_to_subdir);
+        assert!(app.options_for(false).in_place);
+    }
+
+    /// 显式 `--in-place` 优先于输出目录。
+    #[test]
+    fn 预置_显式就地优先于输出目录() {
+        let p = Preset {
+            input: "E:/输入".into(),
+            output: "E:/产物".into(),
+            in_place: true,
+            ..Default::default()
+        };
+
+        let app = App::with_preset(&p);
+
+        assert!(!app.out_to_subdir, "--in-place 要压过输出目录");
+        assert!(app.options_for(false).in_place);
+    }
+
+    // ── 对外的结论文案 ─────────────────────────────────────────────
+
+    /// 五档结论里最容易写错的两档：预演 vs 执行。
+    ///
+    /// 预演必须**明说没写任何文件** —— 否则人看完这句话没法判断磁盘动没动。
+    #[test]
+    fn 结论文案_预演要说清没写文件() {
+        let empty = RunResult::default();
+
+        let dry = verdict_text(&empty, true);
+        assert!(dry.starts_with("预演完成"), "预演有自己的一套说法：{dry}");
+        assert!(dry.contains("未写入任何文件"), "必须讲清磁盘没动：{dry}");
+
+        let real = verdict_text(&empty, false);
+        assert!(real.starts_with("合格"), "没有失败 / 验证不过 / 冲突就算合格：{real}");
+        assert!(real.contains("0/0"), "空结果的验证计数是 0/0：{real}");
+        assert!(
+            !real.contains("未写入"),
+            "真跑过的结论不该说「未写入」：{real}"
+        );
+    }
+
+    // ── 无窗口帧循环（冒烟） ───────────────────────────────────────
+
+    /// 一个**装好设计系统**的 `Context`。
+    ///
+    /// 渲染测试必须先装：界面代码用的是设计系统那套字号层级
+    /// （`TextStyle::Name("h3")` 之类），而 egui 默认样式表里只有
+    /// `Small` / `Body` / `Monospace` / `Button` / `Heading` 五档 ——
+    /// 不装就当场 panic：
+    ///
+    /// ```text
+    /// Failed to find Name("h3") in Style::text_styles.
+    /// ```
+    ///
+    /// 顺带钉住一条隐性约定：**界面渲染不能早于 `ds::install`**。
+    /// `main.rs` 里正是这个顺序，这里照做。
+    fn 装了设计系统的_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ds::install(&ctx);
+        ctx
+    }
+
+    /// 跑若干帧不 panic —— 这是 `app.rs` 第一次被真的渲染一遍。
+    ///
+    /// egui 的 `Context` 不需要 GPU（字体光栅 + 布局都是纯 CPU），
+    /// 所以这一条能在测试里跑；真正需要显卡与 OS 消息循环的部分仍归 `--selftest`。
+    /// 它不替代自检，只是把"改完顺手 `cargo test` 就能发现 panic"这条线补上。
+    #[test]
+    fn 无窗口跑若干帧不panic() {
+        let ctx = 装了设计系统的_ctx();
+        let mut app = App::new();
+        // 造点内容进去，免得只渲染一个空壳
+        app.input = "E:/不存在的输入目录-9f3a".into();
+        app.rows = vec![Row::new("设计情况", "已改造情况", "全部")];
+
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render(ui));
+        }
+    }
+
+    /// `Ctrl+O` 的落点跟着当前页走 —— 三种页各开各的选择器。
+    ///
+    /// 合成按键是**唯一**能自动验证这件事的办法：本机的合成鼠标事件进不了窗口
+    /// （见 `diag` 模块头），键盘同理，只能在测试里自己造一帧输入。
+    #[test]
+    fn 快捷键_ctrl_o_的落点跟着当前页走() {
+        // 造一帧"按下了 Ctrl+O"的输入。
+        let 按下_ctrl_o = |app: &mut App| {
+            let ctx = 装了设计系统的_ctx();
+            let mut input = egui::RawInput::default();
+            input.modifiers = egui::Modifiers::CTRL;
+            input.events.push(egui::Event::Key {
+                key: egui::Key::O,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            });
+            let _ = ctx.run_ui(input, |ui| app.render(ui));
+        };
+
+        let mut app = App::new();
+
+        app.page = Page::Replace;
+        app.picker_for = None;
+        按下_ctrl_o(&mut app);
+        assert!(
+            matches!(app.picker_for, Some(PickFor::InputDir)),
+            "批量替换页的起手动作是「选输入目录」"
+        );
+
+        app.page = Page::Header;
+        app.picker.close();
+        app.picker_for = None;
+        按下_ctrl_o(&mut app);
+        assert!(
+            matches!(app.picker_for, Some(PickFor::HeaderDocs)),
+            "页眉替换页没有「目录」这个概念，起手动作是「选文档」"
+        );
+
+        app.page = Page::Print;
+        app.picker.close();
+        app.picker_for = None;
+        按下_ctrl_o(&mut app);
+        assert!(
+            matches!(app.picker_for, Some(PickFor::PrintDocs)),
+            "批量打印页同理"
+        );
+    }
+}
