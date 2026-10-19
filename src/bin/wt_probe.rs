@@ -22,6 +22,7 @@
 //!                                            # 跑一遍导出 PDF（`-` = 各文档旁的 pdf/，
 //!                                            #   页码留空引号 `""` = 全部）
 //! wt_probe pdfa <输出目录|-> <页码范围> <docx>...   # 同上，但按 PDF/A 归档
+//! wt_probe perf <输出根目录> <docx>...       # 三档计时：现状 / 调优 / 调优+PDF/A
 //! ```
 
 // 探针把 `wordtool` 的六个子模块**整套** `#[path]` 搬进来（只为让探针与产品
@@ -44,7 +45,112 @@ mod wd;
 #[path = "../gui/wordtool/word_session.rs"]
 mod word_session;
 
-use com::{DispResult, res_disp, res_i32, var_bstr, var_i4};
+use com::{DispResult, res_disp, res_i32, var_bool, var_bstr, var_i4};
+
+/// 一次「打开 → 导出 → 关闭」的分段耗时（毫秒）。
+struct Row {
+    name: String,
+    open_ms: u128,
+    export_ms: u128,
+    close_ms: u128,
+}
+
+fn ms(t: std::time::Instant) -> u128 {
+    t.elapsed().as_millis()
+}
+
+/// 调优档要额外拨的几个开关。**只拨"不影响排版"的那几个**：
+/// 拼写 / 语法检查是纯后台开销，与分页、字体、图片尺寸都无关，
+/// 所以不可能改变 PDF 的任何一页；`DisplayRecentFiles` 只是不写 MRU。
+///
+/// 特意**不碰** `Options.Pagination` —— 关掉它 Word 就不再算分页，
+/// 页码与页数会直接错，那是"快得离谱但导出是错的"。
+unsafe fn tune(word: &com::Disp) -> DispResult<()> {
+    unsafe {
+        word.put("DisplayRecentFiles", var_bool(false))?;
+        let opts = res_disp(word.get("Options")?)?;
+        // 逐个 best-effort：老版本 Word 上某些成员可能不存在，不该因此中断测量
+        let _ = opts.put("CheckSpellingAsYouType", var_bool(false));
+        let _ = opts.put("CheckGrammarAsYouType", var_bool(false));
+        let _ = opts.put("CheckGrammarWithSpelling", var_bool(false));
+        Ok(())
+    }
+}
+
+/// 跑一整批，记每个文档的三段耗时。
+///
+/// `tuned=false` 用与产品**完全一致**的 `Documents.Open(路径)`（位置参数缺省）；
+/// `tuned=true` 只读打开、不写 MRU、不弹转换/编码对话框，并先 [`tune`] 一遍。
+unsafe fn perf_pass(
+    files: &[String],
+    dir: &std::path::Path,
+    tuned: bool,
+    pdf_a: bool,
+) -> DispResult<Vec<Row>> {
+    unsafe {
+        std::fs::create_dir_all(dir).ok();
+        let mut session = word_session::WordSession::create()?;
+        if tuned {
+            tune(&session.word)?;
+        }
+        let docs = res_disp(session.word.get("Documents")?)?;
+        let mut rows = Vec::new();
+        for f in files {
+            let name = f.rsplit(['\\', '/']).next().unwrap_or(f).to_string();
+            let t0 = std::time::Instant::now();
+            let opened = if tuned {
+                // Open(FileName, ConfirmConversions, ReadOnly, AddToRecentFiles)
+                docs.call(
+                    "Open",
+                    vec![var_bstr(f), var_bool(false), var_bool(true), var_bool(false)],
+                )
+            } else {
+                docs.call("Open", vec![var_bstr(f)])
+            };
+            let doc = match opened.and_then(|v| res_disp(v)) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("  !! 打开失败 {name}：{e}");
+                    continue;
+                }
+            };
+            let t1 = std::time::Instant::now();
+
+            // 与 services::export_one 同一组参数（探针只为计时，不复用那个私有函数）
+            let stem = std::path::Path::new(f)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "document".to_string());
+            let out = dir.join(format!("{stem}.pdf"));
+            let exported = doc.call_named(
+                "ExportAsFixedFormat",
+                vec![
+                    ("OutputFileName", var_bstr(&out.to_string_lossy())),
+                    ("ExportFormat", var_i4(wd::EXPORT_FORMAT_PDF)),
+                    ("OpenAfterExport", var_bool(false)),
+                    ("OptimizeFor", var_i4(wd::EXPORT_OPTIMIZE_FOR_PRINT)),
+                    ("UseISO19005_1", var_bool(pdf_a)),
+                ],
+            );
+            let t2 = std::time::Instant::now();
+            if let Err(e) = exported {
+                println!("  !! 导出失败 {name}：{e}");
+            }
+            let _ = doc.callv("Close", vec![var_bool(false)]);
+            let t3 = std::time::Instant::now();
+
+            rows.push(Row {
+                name,
+                open_ms: (t1 - t0).as_millis(),
+                export_ms: (t2 - t1).as_millis(),
+                close_ms: (t3 - t2).as_millis(),
+            });
+        }
+        session.cleanup();
+        Ok(rows)
+    }
+}
+
 
 /// COM 的布尔（VT_BOOL）读成 i32 后是 0 / -1。
 fn yn(v: i32) -> &'static str {
@@ -211,6 +317,86 @@ fn main() {
             println!("== 结果：成功 {ok} / 失败 {fail}");
             drop(init);
             return if fail == 0 && ok > 0 { 0 } else { 1 };
+        }
+
+        // ---------- 性能探针（2026-10-19 新增）----------
+        //
+        // 回答两个问题：① 换成只读打开 / 关拼写语法，到底能省多少？
+        // ② PDF/A 比普通 PDF 贵多少？三档跑同一批文档，各自重开 Word（含冷启动）。
+        if mode == "perf" {
+            let root = docs.first().cloned().unwrap_or_default();
+            let files: Vec<String> = docs.iter().skip(1).cloned().collect();
+            if files.is_empty() {
+                eprintln!("用法：wt_probe perf <输出根目录> <docx>...");
+                return 2;
+            }
+            let root = std::path::PathBuf::from(root);
+            let passes: [(&str, &str, bool, bool); 3] = [
+                ("A 现状（Open(路径) 全部缺省）", "a", false, false),
+                ("B 调优（只读 + 不记 MRU + 关拼写语法）", "b", true, false),
+                ("C 调优 + PDF/A", "c", true, true),
+            ];
+            let mut totals: Vec<(String, u128, u128)> = Vec::new();
+            for (label, sub, tuned, pdf_a) in passes {
+                println!("\n════ {label} ════");
+                let t_all = std::time::Instant::now();
+                let rows = match unsafe { perf_pass(&files, &root.join(sub), tuned, pdf_a) } {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("!! {label} 跑不动：{e}");
+                        continue;
+                    }
+                };
+                let mut open_sum = 0u128;
+                let mut export_sum = 0u128;
+                for r in &rows {
+                    println!(
+                        "  {:<44} 打开 {:>6} ms   导出 {:>7} ms   关闭 {:>4} ms",
+                        r.name, r.open_ms, r.export_ms, r.close_ms
+                    );
+                    open_sum += r.open_ms;
+                    export_sum += r.export_ms;
+                }
+                println!(
+                    "  ── 合计 {} 份：打开 {} ms｜导出 {} ms｜整档墙钟 {} ms",
+                    rows.len(),
+                    open_sum,
+                    export_sum,
+                    ms(t_all)
+                );
+                totals.push((label.to_string(), open_sum, export_sum));
+            }
+            if totals.len() >= 2 {
+                let (a_open, a_exp) = (totals[0].1, totals[0].2);
+                let (b_open, b_exp) = (totals[1].1, totals[1].2);
+                let pct = |a: u128, b: u128| {
+                    if a == 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{:+.0}%", (b as f64 - a as f64) * 100.0 / a as f64)
+                    }
+                };
+                println!(
+                    "\n== A → B：打开 {} → {} ms（{}）｜导出 {} → {} ms（{}）",
+                    a_open,
+                    b_open,
+                    pct(a_open, b_open),
+                    a_exp,
+                    b_exp,
+                    pct(a_exp, b_exp)
+                );
+                if totals.len() >= 3 {
+                    let c_exp = totals[2].2;
+                    println!(
+                        "== PDF/A 的代价（对比 B）：导出 {} → {} ms（{}）",
+                        b_exp,
+                        c_exp,
+                        pct(b_exp, c_exp)
+                    );
+                }
+            }
+            drop(init);
+            return 0;
         }
 
         let mut log = |s: String| println!("  {s}");
