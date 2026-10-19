@@ -3,7 +3,7 @@
 > **这个文件只记"还没做的"和"为什么先不做"。**
 > 做完的进 [`CHANGELOG.md`](../CHANGELOG.md)；过程、约束与验证链进 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。
 >
-> 最后更新：2026-10-19（0.4.2 已发版；「导出 PDF」已落地、待发版）
+> 最后更新：2026-10-19（0.5.0 已发版；增量导出已否决，见 §2.3）
 
 ## 0. 顺序不是按"重要性"排的，是按**依赖**排的
 
@@ -39,235 +39,19 @@
 
 ---
 
-## 1. 近期待办（做完就删）
+## 1. 近期待办
 
-### 1.1 清 7 条自家弃用警告
+**0.5.0 发完之后，没有「已确定要做」的近期项。** 剩下的按"卡在哪"分在下面几张表：
 
-**在哪**：`src/gui/app.rs` 的 4 处、7 条 ——
-
-| 行 | 告警 |
-|---|---|
-| 1227 | 弃用别名 `TopBottomPanel` + 弃用方法 `Panel::show` |
-| 1257 / 1260 | 弃用别名 `SidePanel` + 弃用方法 `Panel::show` |
-| 1291 | 弃用别名 `TopBottomPanel` + 弃用方法 `Panel::show` |
-| 1418 | 弃用方法 `CentralPanel::show` |
-
-**怎么改**：egui 0.34 起面板只有 `show_inside(ui, …)` 一条路。
-
-```rust
-egui::TopBottomPanel::top("title").show(ctx, |ui| { … })
-//   → egui::Panel::top("title").show_inside(ui, |ui| { … })
-
-egui::SidePanel::left("nav").exact_size(184.0).resizable(false).show(ctx, |ui| { … })
-//   → egui::Panel::left("nav").exact_size(184.0).resizable(false).show_inside(ui, |ui| { … })
-
-egui::TopBottomPanel::bottom("actions").show(ctx, |ui| { … })
-//   → egui::Panel::bottom("actions").show_inside(ui, |ui| { … })
-
-egui::CentralPanel::default().show(ctx, |ui| { … })
-//   → egui::CentralPanel::default().show_inside(ui, |ui| { … })
-```
-
-`show_inside` 要的是 **`Ui`**，所以渲染入口也得从 `update(ctx)` 搬到
-`ui(ui)`：`App::render` 的签名由 `&egui::Context` 改成 `&mut egui::Ui`，
-内部 `let ctx = ui.ctx().clone();` 供主题 / 重绘请求 / 两个浮层继续用
-（`Context` 内是 `Arc`，克隆很便宜）。**同时删掉 `update`** ——
-eframe 0.34 是 `logic → update → ui` 三条都调（`epi_integration.rs:294/299`），
-留着 `update` 就有两条非空通路，一帧画两遍。
-
-**注意**：`app.rs` 里有 6 处 selftest 调用 `app.render(ui.ctx())`，要一并改成
-`app.render(ui)`。`exact_size` **没有**被弃用（被弃用的是 `exact_width` /
-`exact_height`），不用改。
-
-**判据**：`wrepl-gui` 的警告汇总行**整条消失**（不是变少）。
-
-#### 1.1.1 执行记录（2026-10-12，已验收）
-
-| 项 | 实测 |
-|---|---|
-| 改动文件 | `src/gui/app.rs`（77 行）、`src/gui/ds.rs`（7 行），净 `+49 / -35` |
-| 四个面板 | `Panel::top("title")` / `Panel::left("nav")`（`.exact_size(184.0).resizable(false)`）/ `Panel::bottom("actions")` / `CentralPanel::default()`，全部走 `show_inside(ui, …)` |
-| 渲染入口 | `App::render` 签名 `&egui::Context` → `&mut egui::Ui`；`impl eframe::App` 里新增 `fn ui(&mut self, ui, _frame)` 转发到它，**`update` 已删除**（eframe 0.34 三条通路都调，留着会一帧画两遍） |
-| 内部取 ctx | `let ctx = ui.ctx().clone();`（`Context` 内是 `Arc`，克隆很便宜）供 `ds::apply` / `start_run` / `confirm_inplace_dialog` / `handle_picker` 用 |
-| 测试调用点 | 6 处 `app.render(ui.ctx())` → `app.render(ui)`（`replace_all`） |
-| `exact_size` | **没有**被弃用（弃用的是 `exact_width` / `exact_height`），保留原样 |
-| **判据达成** | `cargo check --features gui` 的 `wrepl-gui` 警告汇总行**整条消失**；`grep -c "wrepl.src.gui" <日志>` = **0**（自家代码零警告） |
-| 其余验收 | release 构建 `EXIT=0`（8m52s）；回归 43 项 ✓ + 第 19 组 17/17；与历史基线产物 **26/26 SHA256 相同**；GUI↔CLI 产物 **26/26 相同**；单元测试 73 passed；界面实拍与改动前一致（四个面板渲染无变化） |
-
-⚠ **egui_sauge 那 2 条 `os error 5` 不是代码警告** —— 是沙箱删除拦截层导致
-`error deleting lock file for incremental compilation` / `error copying object file`，
-与源码无关（见 `CONTRIBUTING.md` §2.1）。**统计警告数时要把这类行排除掉**，
-否则会误判成"egui_sauge 又出警告了"。
-
-#### 1.1.1 执行记录（2026-10-12，已验收）
-
-四处面板按上面那条 `show_inside(ui, …)` 改完，另外两处签名跟着走：
-
-| 项 | 实测 |
-|---|---|
-| 面板 | `Panel::top/left/bottom(...).show_inside(ui, …)` + `CentralPanel::default().show_inside(ui, …)`；`.exact_size(184.0).resizable(false)` **原样保留**（被弃用的是 `exact_width`/`exact_height`，不是 `exact_size`） |
-| 签名 | `App::render(&mut self, ui: &mut egui::Ui)`；内部要 `Context` 的地方用 `ui.ctx()` |
-| 生命周期 | `impl eframe::App` 里**删掉 `update`、换成 `ui`** —— eframe 0.34 的 `logic → update → ui` 三条通路都会调，留着 `update` 等于一帧画两遍 |
-| 自家警告 | **0 条**（`generated N warnings` 汇总行不再出现） |
-| 回归 | 43 项 ✓ + 第 19 组 **17/17**，0 失败 |
-| 基线产物 | 与 `E:/test/docx-009CE` **26/26 SHA256 相同**；GUI 产物 vs CLI 产物也 26/26 |
-| 实拍 | 四个面板渲染与改动前一致 |
-
-> 顺带修掉一处过时注释：`app.rs` 里引述旧版 egui 文档的 `SidePanel` /
-> `TopBottomPanel` 已改成当前 API 名，并注明"GUIDE 写的是 0.34 之前的名字"。
-
-### 1.2 拖放文件 / 文件夹
-
-现在把资源管理器里的文件拖进窗口**什么都不会发生** —— 全仓 `dropped_files`
-零命中。
-
-**落点**按当前页决定，并且**复用 `App::apply_picked` 这条唯一的漏斗**
-（拖放只是"又一种选路径的壳"，与自绘面板、系统对话框并列）：
-
-| 当前页 | 落点 | 收什么 |
+| 去哪看 | 是什么 | 卡在哪 |
 |---|---|---|
-| 批量替换 | 「输入」栏 | 目录与文件**混着收**（`input` 本来就支持，工具自己会遍历目录） |
-| 页眉替换 | 该页「已选文档」 | 只收 `.doc` / `.docx`（与那两个入口的选择器白名单一致），目录**展开一层**（不递归） |
-| 批量打印 | 同上 | 同上 |
+| §2.2 | 退役页眉那半 COM、界面「预演」入口 | **等你拍板** |
+| §2.3 | 增量导出 | **已否决**（2026-10-19） |
+| §4 | 五项品味遗留 + `PERFORMANCE.md` §4 三项 | 已决定先不动 |
+| §5 | 测试覆盖缺口、版本语义 | 不急，迟早要还 |
 
-按住 `Ctrl` 是**追加**到现有内容，否则替换 —— 与资源管理器多选的习惯一致，
-也与 `picker.rs` 里那枚框选橡皮筋一致。
-
-**还要有悬停提示**：「这个窗口能接拖放」在界面上没有任何静态线索，
-拖过来的当口得说一句。用 `egui::Area`（`Order::Foreground` + `interactable(false)`）
-而不是往页面里插一行 —— 拖拽中 `hovered_files` 每帧都变，插进页面会把内容顶得来回跳。
-
-**实现要点**：`dropped_files` / `hovered_files` 是**每帧**的输入
-（`RawInput` 里那两个字段），落到哪一帧就在那一帧取走，不能缓存。
-
-#### 1.2.1 执行记录（2026-10-12，已验收）
-
-| 项 | 实测 |
-|---|---|
-| 落点分派 | `handle_drop` 按 `self.page` 三分：批量替换 → `input` 栏（不过滤）；页眉 / 打印 → 各自那份「已选文档」（只收 `.doc`/`.docx`，目录**展开一层不递归**） |
-| 复用漏斗 | 「批量替换」这一支直接写 `input`（该栏本来就吃目录+文件混合列表，工具自己会遍历目录）；另两支走 `WordTool::set_docs`。**没另开一条路** |
-| 追加语义 | 按住 Ctrl（或 Cmd）= 追加，否则替换 —— 与资源管理器 Ctrl 多选、以及 `picker.rs` 那枚框选橡皮筋一致 |
-| 悬停提示 | `drop_overlay` 用 `egui::Area`（`Order::Foreground` + `interactable(false)`），盖住 `content_rect` 面板区 + 品牌绿描边 + 「松手即可加入清单」 |
-| 调用位置 | `render` 末尾，**排在 `handle_picker` 之后** —— 选择器 4a 版已改成 `egui::Window`（刻意无遮罩），但顺序仍按"最上层提示最后画"排 |
-| **判据达成** | release 构建 **0 warning**；`--selftest` 6 条拖放断言全过；回归 55 项 ✓ + 第 19 组 **17/17**，0 失败；基线产物 SHA256 26/26 相同（内核未动） |
-| 实拍 | 悬停遮罩 + 落地后「输入栏出现 `E:/test/docx`、执行按钮由灰变红」两张，见 `docs/` 外 `_shot-drop-*.png`（本机截图 artifact，不入库） |
-
-**新增 selftest 断言**（`--selftest` 里那 6 条，都是静默退化型，坏了不报错）：
-
-1. 拖拽悬停遮罩：布局 1 帧
-2. 拖放到「输入」（目录 + 文件混收）
-3. 第二次拖放（**无 Ctrl**）是**替换**而非追加
-4. 按住 Ctrl 拖放是**追加**
-5. 拖放到「页眉替换」—— `.txt` / `.xlsx` 被静默跳过，只留 `.docx`
-6. 拖放到「批量打印」—— 收到自己那份，且**没有**串到页眉那份
-
-**新增调试开关** `WREPL_DEBUG_DROP=hover|drop[;路径;路径]`（`src/gui/diag.rs`）——
-本机合成鼠标进不来窗口，拖放是"按住不放"才有的状态，真实操作构造不出来。
-`hover` 只画遮罩不落地；`drop;D:/a;D:/b` 直接走落地分派。
-
-> ⚠ **写这块时踩的一个坑，值得记住**：`hover` 那一版改用 `ctx.layer_painter`
-> 还是 `egui::Area`，屏幕上一个像素都没变，一度以为"绘制层被前面的浮层盖住了"，
-> 改了三轮调用顺序与 `Order`（`Foreground` / `Tooltip`）全都不奏效。
-> 后来逐像素比对才发现**遮罩一直是画出来的**（中心像素 `(165,165,165)` =
-> 半透明黑罩在白底上的结果）—— 误判来自**图片查看工具在复用同一张图的缓存**，
-> 每次改完重拍的文件名不同、但工具认的是像素内容。
-> ⇒ **判据**：截图"没变化"时先 `sha256` 比像素，别急着改代码。
-
-### 1.3 「最近使用」目录持久化
-
-**现状**：`picker.rs:263` 明写"只存内存，不落盘"。关掉程序再开，
-选择器忘了上次停在哪儿。
-
-**做法**：写 `%LOCALAPPDATA%\wrepl\`（与 `diag.rs` 的日志同目录，
-`diag.rs:36-45` 那个 `log_path()` 已经算好了基址）。存**一个**路径就够 ——
-选择器是常驻单实例，四个模式共用同一份"上次停留"。
-
-#### 1.3.1 执行记录（2026-10-12，已验收）
-
-| 项 | 实测 |
-|---|---|
-| 落盘位置 | `%LOCALAPPDATA%\wrepl\last-dir.txt`，**一行一个路径**（不存那 5 条「最近使用」—— 那是会话内的导航痕迹，跨会话只需要"停在哪儿"） |
-| 写盘时机 | **只在读目录成功时**（`push_recent`，由"读取完成"那条路径触发）。绘制路径上一行 IO 都没有 —— 这是模块头**约束 4** 的硬要求 |
-| 读回时机 | `Picker::new()` 里一次，读出来同时给 `cwd` 与 `last_dir`（面板关着时两者不会差） |
-| 存不进去 | `save_last_dir` 写失败**只记一行日志、不影响任何正事** —— 这是一份便利状态，不是配置 |
-| 读不出来 | `load_last_dir` 拿不到、或那个目录**已经不在了**（盘拔了 / 被删了）→ 当没有，退回 home。**绝不因此让程序起不来** |
-| 判据达成 | release 构建 0 warning；回归 50 项 ✓ + 第 19 组 **17/17**，0 失败；基线产物 SHA256 26/26 相同 |
-
-**端到端实测**（真起进程、跨重启）：
-
-1. 预置 `last-dir.txt` = `E:/test/docx` → 启动，选择器起点 `E:/test/docx` ✅
-2. 跑完后文件内容仍是 `E:/test/docx`（读成功就刷新）✅
-3. 改成一个**不存在的**盘符 `Z:/不存在的盘/某目录` → 启动**不崩**，
-   起点退回 `C:\Users\xinwei01307` ✅（`is_dir()` 那一关把它挡住了）
-
-⚠ **注意 `is_dir()` 那一关不是多余的**：`E:/test/regress` 在本机已不存在，
-写进去时看着"保存成功"，读回时必须被过滤掉 —— 否则选择器会停在一个
-点不回来的路径上，用户看到的是一个空列表且不知道为什么。
-
-> 顺带发现（**不是这一步引入的**，是既有顺序）：`WREPL_DEBUG_PICKER` 触发的
-> `open_picker` 跑在 `--preset` 应用**之前**，所以带 preset 启动时选择器起点
-> 仍是 home 而不是 preset 里那个目录。属于诊断开关的既有行为，没动。
-
----
-
-### 1.4 批量导出 PDF（2026-10-19，已落地，待发版）
-
-**为什么并进「打印与导出」页、而不是新开一页**：两条下游的输入**完全一样**（同一份文档清单、
-同一个「页码范围」字段），差别只在产物去哪；而交付里"先打一份纸质、再导一份 PDF 归档"
-是连着做的，分成两页等于让用户把同一批文档选两遍。
-
-| 项 | 落点 |
-|---|---|
-| COM 调用 | `Document.ExportAsFixedFormat`（`ExportFormat=17`、`OpenAfterExport=false`、`OptimizeFor=0`、`UseISO19005_1=…`），页码走 `Range=3 / From / To` |
-| 服务 | `services::export_pdf_run` ＋ `parse_pdf_pages` / `pdf_target_dir` / `unique_target` |
-| 界面 | `Sink::{Printer, Pdf}` 单选；`pdf_dir` / `pdf_a`；页码解析失败画 `InputField::error`（按钮同时置灰） |
-| 探针 | `wt_probe pdf\|pdfa <输出目录\|-> <页码范围> <docx>...` —— **与产品走同一份源码** |
-
-**判据**（本机装了 Microsoft 365）：真实交付件 2/2（33 页、23 页，`pdfinfo` 认出 Word 产、A4）；
-`1`→1 页；`3-5`→3 页；同名再导落 `… (2).pdf` 且旧件一字节未动；输出目录留空落 `<源目录>\pdf\`；
-PDF/A 的 XMP 为 `pdfaid:part=3 / conformance=B`。
-
-**三个必须记住的坑**：`OpenAfterExport` 默认 `True`，会把 PDF 拉起来开窗、批次卡死（窗口还不可见）；
-**Word 把路径里的空格写成 `%20`**（中文不受影响，所以只在带空格的文件名上露头）；
-`UseISO19005_1` 在 365 上产出的是 **PDF/A-3b**，不是 ISO 19005-1 的 1b —— 界面文案据此不写编号。
-
-**没做**：多段页码（`1-3,5`）。`ExportAsFixedFormat` 一次只收一组起止页，多段要合并 PDF，
-而那需要 PDF 库（本项目零新依赖）。界面上**明确拒绝**并写清"删掉逗号、分几次导"。
-
-**为什么不用「打印到虚拟打印机」或「WPS 出 PDF」**（2026-10-19 实测，同一份
-`2026-009CE-FAT-附录`，三条路各跑一遍）：
-
-| 路径 | 产物 | 耗时 | 结论 |
-|---|---|---|---|
-| `ExportAsFixedFormat`（本产品） | 435 KB｜23 页｜`Tagged: yes` | 打开 1.4 s ＋ 导出 8.3 s | ✅ 采用 |
-| `PrintOut` → Microsoft Print to PDF | **一个字节都没生成** | 打印调用 8.3 s ＋ 等 30 s | ❌ 落不了盘 |
-| `PrintOut` → 导出为WPS PDF | **0 字节空文件** | 打印调用 9.7 s ＋ 等 30 s | ❌ 同上 |
-| WPS COM `KWPS.Application` 的 `ExportAsFixedFormat` | 251 KB｜**22 页**｜`Tagged: no` | 打开 0.8 s ＋ 导出 **1.3 s** | ⚠ 快，但见下 |
-
-- **打印路径拿不到完成信号**：`PrintOut` 默认异步，进的是假脱机队列。探针等了 30 秒
-  （体积连续不动也算完成），产物仍是空的 —— 批量里这不是"慢"，是**不可用**：
-  `run_on_documents` 会立刻关文档，Word/驱动直接把任务丢掉。
-- **WPS 每份都正好少 1 页**：FAT 23→22、PQ 10→9、SAT 27→26（**3/3 复现**），
-  页脚 `Page 页码 N of 23` 跟着变成 `of 22`；表格里"批准日期："的换行位置也变了。
-  差在**排版引擎**，不在参数 —— 所以调参数救不回来，也没有「WPS 兼容模式」这种折中。
-- 顺带确认本机 `Word.Application` 的 CLSID 仍指向真正的
-  `C:\Program Files\Microsoft Office\Root\Office16\WINWORD.EXE`，没被 WPS 劫持。
-- 复现命令：`wt_probe printers`、`wt_probe viaprint <目录> "<打印机名>" <docx>...`、
-  `wt_probe wps <目录> <docx>...`。
-
-**没装 Word 的机器**：不静默降级 —— 判定引擎（`wordtool::engine`，查
-`Word.Application` 的 CLSID 落到哪个 exe，防 WPS 冒名）→ 只有 WPS 时页面顶部亮黄条、
-点「导出 PDF」再弹确认框（正文写的是"每份少 1 页、23→22"这些实测数字）→ 点过才用
-`KWPS.Application` 跑。**打印不降级**：WPS 的 `PrintOut` 没实测过，打错纸不可撤销。
-端到端验证用 `wt_probe pdfwps <目录> <页码范围> <docx>...`（走产品同一个
-`export_pdf_run`，只换引擎）。明细见 `CHANGELOG.md` 同名小节。
-
-
-**测试**：`wordtool/services.rs` 新增 7 条（页码解析 4 / 落点目录 1 / 扩展名替换 1 /
-撞名不覆盖 1），总数 59 → **66**。做过两轮阴性对照：同时改坏「逗号拒绝 / 写反不自动对调 /
-扩展名替换」→ 恰好 3 红、其余 62 全绿；把撞名循环改成 `2..2` → 撞名那条转红。
-
----
+0.4.2 / 0.5.0 那几项**已经做完**，执行记录（实测数字与踩到的坑）移到文末 **附录 A**，
+不再占据待办位置。
 
 ## 2. 拍板记录（做过决定，别再翻烧饼）
 
@@ -355,6 +139,24 @@ egui 之所以用 `impl Into<f32>`（`epaint-0.34.3/src/stroke.rs:24`）是有�
 
 > 「批量导出 PDF」2026-10-19 已从这张表里移出（落地见 §1.4）——它当时缓的理由是
 > "打印页那套骨架得先稳"，而骨架在 0.4.x 已经稳了。
+
+### 2.3 增量导出：**否决**（2026-10-19，用户拍板）
+
+**不做** —— 这个优化省的时间，在真实用法里不存在。
+
+导出 PDF 不是高频动作：实际流程是「改完 docx → 导一次 → 归档」，
+**很少出现"导出后又去改 docx、然后再导一次"**。增量导出（记源文件的 SHA256 + 参数，
+没变就复用旧 PDF）省的是**重复导出**的时间；没有重复导出，这套记账只剩成本：
+
+| 成本 | 说明 |
+|---|---|
+| 语义歧义 | 「没变就不导」到底是**跳过**还是**用新时间覆盖**？两种都说得通，选哪种都要在界面上解释 |
+| 与撞名规则打架 | 现在的口径是**绝不覆盖**（同名让路成 `… (2).pdf`）。一批里"有的复用、有的新导"会让产物目录没法解释 |
+| 记账自己要落盘 | SHA256 + 参数得持久化，否则跨会话失效；多一份状态就多一类"记录与实际不符"的故障 |
+
+**数字上也站不住**：「导出占整批 88%」（28.9 s 导出 vs 3.8 s 打开）只有在
+**同一批反复导**时才放大；一轮导一次，省下的是 0 秒。真要提单次速度，
+更值得做的是**默认不勾 PDF/A**（实测贵 28%）—— 而这一条已经是可选项了。
 
 ---
 
@@ -545,3 +347,228 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 | 上游发了新版 v2.1 我们要不要跟 | ⚠ **仍在**：这是主动决策问题，不是故障。真要跟时用 `docs/egui_sauge-fork.patch` 重放，或直接 rebase 后解决冲突 |
 | 没有第二个人 review | ⚠ **仍在**：属团队规模问题，跟依赖无关 |
 
+
+
+---
+
+## 附录 A：已完成项的执行记录（2026-10-12 ~ 2026-10-19）
+
+> 这里留的是**当时的实测数字与踩到的坑**，不是"要做什么" —— 正文只记还没做的
+> （见文件头那条规则）；同一块"做了什么"在 [`CHANGELOG.md`](../CHANGELOG.md)。
+>
+> ⚠ 小节编号**沿用旧 §1 的 1.1–1.4** —— 文档里其余地方写的「见 §1.2.1」之类都指向这里。
+
+
+### 1.1 清 7 条自家弃用警告
+
+**在哪**：`src/gui/app.rs` 的 4 处、7 条 ——
+
+| 行 | 告警 |
+|---|---|
+| 1227 | 弃用别名 `TopBottomPanel` + 弃用方法 `Panel::show` |
+| 1257 / 1260 | 弃用别名 `SidePanel` + 弃用方法 `Panel::show` |
+| 1291 | 弃用别名 `TopBottomPanel` + 弃用方法 `Panel::show` |
+| 1418 | 弃用方法 `CentralPanel::show` |
+
+**怎么改**：egui 0.34 起面板只有 `show_inside(ui, …)` 一条路。
+
+```rust
+egui::TopBottomPanel::top("title").show(ctx, |ui| { … })
+//   → egui::Panel::top("title").show_inside(ui, |ui| { … })
+
+egui::SidePanel::left("nav").exact_size(184.0).resizable(false).show(ctx, |ui| { … })
+//   → egui::Panel::left("nav").exact_size(184.0).resizable(false).show_inside(ui, |ui| { … })
+
+egui::TopBottomPanel::bottom("actions").show(ctx, |ui| { … })
+//   → egui::Panel::bottom("actions").show_inside(ui, |ui| { … })
+
+egui::CentralPanel::default().show(ctx, |ui| { … })
+//   → egui::CentralPanel::default().show_inside(ui, |ui| { … })
+```
+
+`show_inside` 要的是 **`Ui`**，所以渲染入口也得从 `update(ctx)` 搬到
+`ui(ui)`：`App::render` 的签名由 `&egui::Context` 改成 `&mut egui::Ui`，
+内部 `let ctx = ui.ctx().clone();` 供主题 / 重绘请求 / 两个浮层继续用
+（`Context` 内是 `Arc`，克隆很便宜）。**同时删掉 `update`** ——
+eframe 0.34 是 `logic → update → ui` 三条都调（`epi_integration.rs:294/299`），
+留着 `update` 就有两条非空通路，一帧画两遍。
+
+**注意**：`app.rs` 里有 6 处 selftest 调用 `app.render(ui.ctx())`，要一并改成
+`app.render(ui)`。`exact_size` **没有**被弃用（被弃用的是 `exact_width` /
+`exact_height`），不用改。
+
+**判据**：`wrepl-gui` 的警告汇总行**整条消失**（不是变少）。
+
+#### 1.1.1 执行记录（2026-10-12，已验收）
+
+| 项 | 实测 |
+|---|---|
+| 改动文件 | `src/gui/app.rs`（77 行）、`src/gui/ds.rs`（7 行），净 `+49 / -35` |
+| 四个面板 | `Panel::top("title")` / `Panel::left("nav")`（`.exact_size(184.0).resizable(false)`）/ `Panel::bottom("actions")` / `CentralPanel::default()`，全部走 `show_inside(ui, …)` |
+| 渲染入口 | `App::render` 签名 `&egui::Context` → `&mut egui::Ui`；`impl eframe::App` 里新增 `fn ui(&mut self, ui, _frame)` 转发到它，**`update` 已删除**（eframe 0.34 三条通路都调，留着会一帧画两遍） |
+| 内部取 ctx | `let ctx = ui.ctx().clone();`（`Context` 内是 `Arc`，克隆很便宜）供 `ds::apply` / `start_run` / `confirm_inplace_dialog` / `handle_picker` 用 |
+| 测试调用点 | 6 处 `app.render(ui.ctx())` → `app.render(ui)`（`replace_all`） |
+| `exact_size` | **没有**被弃用（弃用的是 `exact_width` / `exact_height`），保留原样 |
+| **判据达成** | `cargo check --features gui` 的 `wrepl-gui` 警告汇总行**整条消失**；`grep -c "wrepl.src.gui" <日志>` = **0**（自家代码零警告） |
+| 其余验收 | release 构建 `EXIT=0`（8m52s）；回归 43 项 ✓ + 第 19 组 17/17；与历史基线产物 **26/26 SHA256 相同**；GUI↔CLI 产物 **26/26 相同**；单元测试 73 passed；界面实拍与改动前一致（四个面板渲染无变化） |
+
+⚠ **egui_sauge 那 2 条 `os error 5` 不是代码警告** —— 是沙箱删除拦截层导致
+`error deleting lock file for incremental compilation` / `error copying object file`，
+与源码无关（见 `CONTRIBUTING.md` §2.1）。**统计警告数时要把这类行排除掉**，
+否则会误判成"egui_sauge 又出警告了"。
+
+
+> 顺带修掉一处过时注释：`app.rs` 里引述旧版 egui 文档的 `SidePanel` /
+
+### 1.2 拖放文件 / 文件夹
+
+现在把资源管理器里的文件拖进窗口**什么都不会发生** —— 全仓 `dropped_files`
+零命中。
+
+**落点**按当前页决定，并且**复用 `App::apply_picked` 这条唯一的漏斗**
+（拖放只是"又一种选路径的壳"，与自绘面板、系统对话框并列）：
+
+| 当前页 | 落点 | 收什么 |
+|---|---|---|
+| 批量替换 | 「输入」栏 | 目录与文件**混着收**（`input` 本来就支持，工具自己会遍历目录） |
+| 页眉替换 | 该页「已选文档」 | 只收 `.doc` / `.docx`（与那两个入口的选择器白名单一致），目录**展开一层**（不递归） |
+| 批量打印 | 同上 | 同上 |
+
+按住 `Ctrl` 是**追加**到现有内容，否则替换 —— 与资源管理器多选的习惯一致，
+也与 `picker.rs` 里那枚框选橡皮筋一致。
+
+**还要有悬停提示**：「这个窗口能接拖放」在界面上没有任何静态线索，
+拖过来的当口得说一句。用 `egui::Area`（`Order::Foreground` + `interactable(false)`）
+而不是往页面里插一行 —— 拖拽中 `hovered_files` 每帧都变，插进页面会把内容顶得来回跳。
+
+**实现要点**：`dropped_files` / `hovered_files` 是**每帧**的输入
+（`RawInput` 里那两个字段），落到哪一帧就在那一帧取走，不能缓存。
+
+#### 1.2.1 执行记录（2026-10-12，已验收）
+
+| 项 | 实测 |
+|---|---|
+| 落点分派 | `handle_drop` 按 `self.page` 三分：批量替换 → `input` 栏（不过滤）；页眉 / 打印 → 各自那份「已选文档」（只收 `.doc`/`.docx`，目录**展开一层不递归**） |
+| 复用漏斗 | 「批量替换」这一支直接写 `input`（该栏本来就吃目录+文件混合列表，工具自己会遍历目录）；另两支走 `WordTool::set_docs`。**没另开一条路** |
+| 追加语义 | 按住 Ctrl（或 Cmd）= 追加，否则替换 —— 与资源管理器 Ctrl 多选、以及 `picker.rs` 那枚框选橡皮筋一致 |
+| 悬停提示 | `drop_overlay` 用 `egui::Area`（`Order::Foreground` + `interactable(false)`），盖住 `content_rect` 面板区 + 品牌绿描边 + 「松手即可加入清单」 |
+| 调用位置 | `render` 末尾，**排在 `handle_picker` 之后** —— 选择器 4a 版已改成 `egui::Window`（刻意无遮罩），但顺序仍按"最上层提示最后画"排 |
+| **判据达成** | release 构建 **0 warning**；`--selftest` 6 条拖放断言全过；回归 55 项 ✓ + 第 19 组 **17/17**，0 失败；基线产物 SHA256 26/26 相同（内核未动） |
+| 实拍 | 悬停遮罩 + 落地后「输入栏出现 `E:/test/docx`、执行按钮由灰变红」两张，见 `docs/` 外 `_shot-drop-*.png`（本机截图 artifact，不入库） |
+
+**新增 selftest 断言**（`--selftest` 里那 6 条，都是静默退化型，坏了不报错）：
+
+1. 拖拽悬停遮罩：布局 1 帧
+2. 拖放到「输入」（目录 + 文件混收）
+3. 第二次拖放（**无 Ctrl**）是**替换**而非追加
+4. 按住 Ctrl 拖放是**追加**
+5. 拖放到「页眉替换」—— `.txt` / `.xlsx` 被静默跳过，只留 `.docx`
+6. 拖放到「批量打印」—— 收到自己那份，且**没有**串到页眉那份
+
+**新增调试开关** `WREPL_DEBUG_DROP=hover|drop[;路径;路径]`（`src/gui/diag.rs`）——
+本机合成鼠标进不来窗口，拖放是"按住不放"才有的状态，真实操作构造不出来。
+`hover` 只画遮罩不落地；`drop;D:/a;D:/b` 直接走落地分派。
+
+> ⚠ **写这块时踩的一个坑，值得记住**：`hover` 那一版改用 `ctx.layer_painter`
+> 还是 `egui::Area`，屏幕上一个像素都没变，一度以为"绘制层被前面的浮层盖住了"，
+> 改了三轮调用顺序与 `Order`（`Foreground` / `Tooltip`）全都不奏效。
+> 后来逐像素比对才发现**遮罩一直是画出来的**（中心像素 `(165,165,165)` =
+> 半透明黑罩在白底上的结果）—— 误判来自**图片查看工具在复用同一张图的缓存**，
+> 每次改完重拍的文件名不同、但工具认的是像素内容。
+> ⇒ **判据**：截图"没变化"时先 `sha256` 比像素，别急着改代码。
+
+### 1.3 「最近使用」目录持久化
+
+**现状**：`picker.rs:263` 明写"只存内存，不落盘"。关掉程序再开，
+选择器忘了上次停在哪儿。
+
+**做法**：写 `%LOCALAPPDATA%\wrepl\`（与 `diag.rs` 的日志同目录，
+`diag.rs:36-45` 那个 `log_path()` 已经算好了基址）。存**一个**路径就够 ——
+选择器是常驻单实例，四个模式共用同一份"上次停留"。
+
+#### 1.3.1 执行记录（2026-10-12，已验收）
+
+| 项 | 实测 |
+|---|---|
+| 落盘位置 | `%LOCALAPPDATA%\wrepl\last-dir.txt`，**一行一个路径**（不存那 5 条「最近使用」—— 那是会话内的导航痕迹，跨会话只需要"停在哪儿"） |
+| 写盘时机 | **只在读目录成功时**（`push_recent`，由"读取完成"那条路径触发）。绘制路径上一行 IO 都没有 —— 这是模块头**约束 4** 的硬要求 |
+| 读回时机 | `Picker::new()` 里一次，读出来同时给 `cwd` 与 `last_dir`（面板关着时两者不会差） |
+| 存不进去 | `save_last_dir` 写失败**只记一行日志、不影响任何正事** —— 这是一份便利状态，不是配置 |
+| 读不出来 | `load_last_dir` 拿不到、或那个目录**已经不在了**（盘拔了 / 被删了）→ 当没有，退回 home。**绝不因此让程序起不来** |
+| 判据达成 | release 构建 0 warning；回归 50 项 ✓ + 第 19 组 **17/17**，0 失败；基线产物 SHA256 26/26 相同 |
+
+**端到端实测**（真起进程、跨重启）：
+
+1. 预置 `last-dir.txt` = `E:/test/docx` → 启动，选择器起点 `E:/test/docx` ✅
+2. 跑完后文件内容仍是 `E:/test/docx`（读成功就刷新）✅
+3. 改成一个**不存在的**盘符 `Z:/不存在的盘/某目录` → 启动**不崩**，
+   起点退回 `C:\Users\xinwei01307` ✅（`is_dir()` 那一关把它挡住了）
+
+⚠ **注意 `is_dir()` 那一关不是多余的**：`E:/test/regress` 在本机已不存在，
+写进去时看着"保存成功"，读回时必须被过滤掉 —— 否则选择器会停在一个
+点不回来的路径上，用户看到的是一个空列表且不知道为什么。
+
+> 顺带发现（**不是这一步引入的**，是既有顺序）：`WREPL_DEBUG_PICKER` 触发的
+> `open_picker` 跑在 `--preset` 应用**之前**，所以带 preset 启动时选择器起点
+> 仍是 home 而不是 preset 里那个目录。属于诊断开关的既有行为，没动。
+
+---
+
+### 1.4 批量导出 PDF（2026-10-19，0.5.0 已发版）
+
+**为什么并进「打印与导出」页、而不是新开一页**：两条下游的输入**完全一样**（同一份文档清单、
+同一个「页码范围」字段），差别只在产物去哪；而交付里"先打一份纸质、再导一份 PDF 归档"
+是连着做的，分成两页等于让用户把同一批文档选两遍。
+
+| 项 | 落点 |
+|---|---|
+| COM 调用 | `Document.ExportAsFixedFormat`（`ExportFormat=17`、`OpenAfterExport=false`、`OptimizeFor=0`、`UseISO19005_1=…`），页码走 `Range=3 / From / To` |
+| 服务 | `services::export_pdf_run` ＋ `parse_pdf_pages` / `pdf_target_dir` / `unique_target` |
+| 界面 | `Sink::{Printer, Pdf}` 单选；`pdf_dir` / `pdf_a`；页码解析失败画 `InputField::error`（按钮同时置灰） |
+| 探针 | `wt_probe pdf\|pdfa <输出目录\|-> <页码范围> <docx>...` —— **与产品走同一份源码** |
+
+**判据**（本机装了 Microsoft 365）：真实交付件 2/2（33 页、23 页，`pdfinfo` 认出 Word 产、A4）；
+`1`→1 页；`3-5`→3 页；同名再导落 `… (2).pdf` 且旧件一字节未动；输出目录留空落 `<源目录>\pdf\`；
+PDF/A 的 XMP 为 `pdfaid:part=3 / conformance=B`。
+
+**三个必须记住的坑**：`OpenAfterExport` 默认 `True`，会把 PDF 拉起来开窗、批次卡死（窗口还不可见）；
+**Word 把路径里的空格写成 `%20`**（中文不受影响，所以只在带空格的文件名上露头）；
+`UseISO19005_1` 在 365 上产出的是 **PDF/A-3b**，不是 ISO 19005-1 的 1b —— 界面文案据此不写编号。
+
+**没做**：多段页码（`1-3,5`）。`ExportAsFixedFormat` 一次只收一组起止页，多段要合并 PDF，
+而那需要 PDF 库（本项目零新依赖）。界面上**明确拒绝**并写清"删掉逗号、分几次导"。
+
+另一个没做的是**增量导出**（记源文件 SHA256，没变就复用旧 PDF）—— 2026-10-19 用户拍板
+**否决**，理由见 §2.3：没有"导出后又改再重导"的场景，省不到时间。
+
+**为什么不用「打印到虚拟打印机」或「WPS 出 PDF」**（2026-10-19 实测，同一份
+`2026-009CE-FAT-附录`，三条路各跑一遍）：
+
+| 路径 | 产物 | 耗时 | 结论 |
+|---|---|---|---|
+| `ExportAsFixedFormat`（本产品） | 435 KB｜23 页｜`Tagged: yes` | 打开 1.4 s ＋ 导出 8.3 s | ✅ 采用 |
+| `PrintOut` → Microsoft Print to PDF | **一个字节都没生成** | 打印调用 8.3 s ＋ 等 30 s | ❌ 落不了盘 |
+| `PrintOut` → 导出为WPS PDF | **0 字节空文件** | 打印调用 9.7 s ＋ 等 30 s | ❌ 同上 |
+| WPS COM `KWPS.Application` 的 `ExportAsFixedFormat` | 251 KB｜**22 页**｜`Tagged: no` | 打开 0.8 s ＋ 导出 **1.3 s** | ⚠ 快，但见下 |
+
+- **打印路径拿不到完成信号**：`PrintOut` 默认异步，进的是假脱机队列。探针等了 30 秒
+  （体积连续不动也算完成），产物仍是空的 —— 批量里这不是"慢"，是**不可用**：
+  `run_on_documents` 会立刻关文档，Word/驱动直接把任务丢掉。
+- **WPS 每份都正好少 1 页**：FAT 23→22、PQ 10→9、SAT 27→26（**3/3 复现**），
+  页脚 `Page 页码 N of 23` 跟着变成 `of 22`；表格里"批准日期："的换行位置也变了。
+  差在**排版引擎**，不在参数 —— 所以调参数救不回来，也没有「WPS 兼容模式」这种折中。
+- 顺带确认本机 `Word.Application` 的 CLSID 仍指向真正的
+  `C:\Program Files\Microsoft Office\Root\Office16\WINWORD.EXE`，没被 WPS 劫持。
+- 复现命令：`wt_probe printers`、`wt_probe viaprint <目录> "<打印机名>" <docx>...`、
+  `wt_probe wps <目录> <docx>...`。
+
+**没装 Word 的机器**：不静默降级 —— 判定引擎（`wordtool::engine`，查
+`Word.Application` 的 CLSID 落到哪个 exe，防 WPS 冒名）→ 只有 WPS 时页面顶部亮黄条、
+点「导出 PDF」再弹确认框（正文写的是"每份少 1 页、23→22"这些实测数字）→ 点过才用
+`KWPS.Application` 跑。**打印不降级**：WPS 的 `PrintOut` 没实测过，打错纸不可撤销。
+端到端验证用 `wt_probe pdfwps <目录> <页码范围> <docx>...`（走产品同一个
+`export_pdf_run`，只换引擎）。明细见 `CHANGELOG.md` 同名小节。
+
+**测试**：`wordtool/services.rs` 新增 7 条（页码解析 4 / 落点目录 1 / 扩展名替换 1 /
+撞名不覆盖 1），总数 59 → **66**。做过两轮阴性对照：同时改坏「逗号拒绝 / 写反不自动对调 /
+扩展名替换」→ 恰好 3 红、其余 62 全绿；把撞名循环改成 `2..2` → 撞名那条转红。
