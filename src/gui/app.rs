@@ -63,7 +63,7 @@ use wrepl::rules::{self, Rule, Scope};
 use wrepl::report;
 
 use crate::picker::{Mode, Outcome, Picker};
-use crate::wordtool::{Engine, HeaderMode};
+use crate::wordtool::{Engine, HeaderMode, Sink};
 
 const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
 const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
@@ -92,7 +92,7 @@ enum PickFor {
     ExportXlsx,
     /// 「页眉替换」页的「选择文档（可多选）」
     HeaderDocs,
-    /// 「批量打印」页的「选择文档（可多选）」
+    /// 「打印与导出」页的「选择文档（可多选）」
     PrintDocs,
     /// 「页眉替换」页的「选择图片…」（**只选一张**）
     HeaderImage,
@@ -343,16 +343,16 @@ pub struct App {
     picker_for: Option<PickFor>,
 
     // ── 顶部三页切换（0.3.0 起）──
-    /// 当前页：批量替换（原有）/ 页眉替换 / 批量打印。
+    /// 当前页：批量替换（原有）/ 页眉替换 / 打印与导出。
     page: Page,
-    /// 页眉替换与批量打印的状态 + 任务（走 Word COM）。
+    /// 页眉替换与打印与导出的状态 + 任务（走 Word COM）。
     wt: crate::wordtool::WordTool,
 }
 
 /// 顶部的三个页。
 ///
 /// 「批量替换」是工具原本的能力，与另两页**没有共同依赖**——它纯 Rust 改 OOXML，
-/// 不需要 Word；「页眉替换 / 批量打印」走 Word COM，**需要目标机器装 Word**。
+/// 不需要 Word；「页眉替换 / 打印与导出」走 Word COM，**需要目标机器装 Word**。
 ///
 /// ★ 导航上的标签 2026-10-11 由「正文替换」改成「批量替换」（用户要求）。
 ///   `Page::Replace` 这个**内部名字没动** —— 它对应的是"在正文里做替换"这份能力，
@@ -363,7 +363,7 @@ enum Page {
     Replace,
     /// 页眉首单元格替换（文本 / 图片）
     Header,
-    /// 批量打印
+    /// 打印与导出
     Print,
 }
 
@@ -442,7 +442,7 @@ impl App {
             None => {}
         }
         // 同款诊断开关：`WREPL_DEBUG_PAGE=replace|header|header-image|print` 启动即落在那页。
-        // 加了「页眉替换 / 批量打印」两页之后，截图与演示都需要让窗口一开就停在
+        // 加了「页眉替换 / 打印与导出」两页之后，截图与演示都需要让窗口一开就停在
         // 指定页——合成鼠标事件进不来（同上），只能让程序自己切。不设则停在首页。
         match crate::diag::debug_page_mode().as_deref() {
             Some("replace") => app.page = Page::Replace,
@@ -1288,7 +1288,7 @@ impl App {
                 for (page, label, icon) in [
                     (Page::Replace, "批量替换", ds::Icon::FileText),
                     (Page::Header, "页眉替换", ds::Icon::Edit),
-                    (Page::Print, "批量打印", ds::Icon::Package),
+                    (Page::Print, "打印与导出", ds::Icon::Package),
                 ] {
                     if ui
                         .add(
@@ -1452,7 +1452,7 @@ impl App {
         // 就地覆盖确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
         self.confirm_inplace_dialog(&ctx);
 
-        // 「页眉替换 / 批量打印」两页的「选择文档」按钮**不自己弹对话框**：
+        // 「页眉替换 / 打印与导出」两页的「选择文档」按钮**不自己弹对话框**：
         // 选择器是常驻的、全程序只有一台，所以由这里统一收口 —— 界面上那些
         // 按钮只把意图抛出来（`WordTool::take_pick`），开还是这儿开。
         // 收在这里还有个好处：此刻已出了 `CentralPanel` 的借用期，够得着 `self.picker`。
@@ -2048,7 +2048,7 @@ impl App {
                     vec!["xlsx"],
                     "规则.xlsx".to_string(),
                 ),
-                // 页眉替换 / 批量打印共用同一个面板，只是标题不同
+                // 页眉替换 / 打印与导出共用同一个面板，只是标题不同
                 // （标题在面板左上角显示，用户一眼能看到这一趟是在替哪一页选）。
                 PickFor::HeaderDocs => (
                     Mode::Files,
@@ -2060,7 +2060,7 @@ impl App {
                 ),
                 PickFor::PrintDocs => (
                     Mode::Files,
-                    "选择文档 —— 批量打印",
+                    "选择文档 —— 打印与导出",
                     print_first,
                     vec!["doc", "docx"],
                     String::new(),
@@ -2315,7 +2315,7 @@ impl App {
         ));
     }
 
-    /// 拖到「页眉替换 / 批量打印」两页：只收 Word 文档，目录展开一层。
+    /// 拖到「页眉替换 / 打印与导出」两页：只收 Word 文档，目录展开一层。
     ///
     /// 白名单 `.doc` / `.docx` 与那两个按钮的选择器一致 —— 拖进来的和选进来
     /// 的必须是同一批东西，否则两条路会给出不同的候选集。
@@ -2370,7 +2370,7 @@ impl App {
             "拖入 {} 个 Word 文档到「{}」{}",
             kept.len(),
             match which {
-                crate::wordtool::PickDoc::Print => "批量打印",
+                crate::wordtool::PickDoc::Print => "打印与导出",
                 _ => "页眉替换",
             },
             if append { "（已追加）" } else { "" }
@@ -2453,7 +2453,7 @@ impl App {
             PickFor::HeaderDocs | PickFor::PrintDocs => rfd::FileDialog::new()
                 .set_title(match what {
                     PickFor::HeaderDocs => "选择文档 —— 页眉替换",
-                    _ => "选择文档 —— 批量打印",
+                    _ => "选择文档 —— 打印与导出",
                 })
                 .add_filter("Word 文档", &["doc", "docx"])
                 .pick_files(),
@@ -2767,7 +2767,7 @@ fn short_name(p: &Path) -> String {
 
 /// 是不是 Word 文档 —— `.doc` / `.docx`，**不看大小写**。
 ///
-/// 拖放的白名单与「页眉替换 / 批量打印」那两页的选择器白名单是同一个来源
+/// 拖放的白名单与「页眉替换 / 打印与导出」那两页的选择器白名单是同一个来源
 /// （`fallback_dialog` 里的 `add_filter("Word 文档", &["doc", "docx"])`），
 /// 所以拖进来的必须是同一批东西，否则两条路给出的候选集会不一样。
 ///
@@ -3259,7 +3259,7 @@ pub fn selftest(args: &[String]) -> i32 {
         }
         println!("  拖放到「页眉替换」（只收 .doc/.docx）：通过");
 
-        // 落点 ③：批量打印页 —— 走的是另一个列表，别串到页眉那份。
+        // 落点 ③：打印与导出页 —— 走的是另一个列表，别串到页眉那份。
         app.page = Page::Print;
         let mut d5 = raw.clone();
         d5.dropped_files = dropped(&["D:/wrepl-selftest/丙.doc"]);
@@ -3269,7 +3269,7 @@ pub fn selftest(args: &[String]) -> i32 {
             || !app.wt.docs_of(PickDoc::Print)[0].ends_with("丙.doc")
         {
             println!(
-                "  ✗ 批量打印页没收到拖进来的文档：{:?}",
+                "  ✗ 打印与导出页没收到拖进来的文档：{:?}",
                 app.wt.docs_of(PickDoc::Print)
             );
             return 3;
@@ -3278,7 +3278,7 @@ pub fn selftest(args: &[String]) -> i32 {
             println!("  ✗ 打印页的拖放串到了页眉那份列表里");
             return 3;
         }
-        println!("  拖放到「批量打印」（.doc 也收、落点独立）：通过");
+        println!("  拖放到「打印与导出」（.doc 也收、落点独立）：通过");
 
         // 复原：拖放这一段动了 `input`、`page` 与两个文档列表，
         // 后面 3.9 的预演还要用 `input` —— 留着改过的值会连累它。
@@ -3325,7 +3325,7 @@ pub fn selftest(args: &[String]) -> i32 {
         for (page, page_name, want) in [
             (Page::Replace, "批量替换", PickFor::InputDir),
             (Page::Header, "页眉替换", PickFor::HeaderDocs),
-            (Page::Print, "批量打印", PickFor::PrintDocs),
+            (Page::Print, "打印与导出", PickFor::PrintDocs),
         ] {
             app.page = page;
             let _ = ctx.run_ui(key(&raw, egui::Key::O, true), |ui| app.render(ui));
@@ -3380,7 +3380,7 @@ pub fn selftest(args: &[String]) -> i32 {
         app.wt.set_docs(PickDoc::Header, Vec::new());
     }
 
-    // 3.8) 新增的两页（页眉替换 / 批量打印）骨架，外加页眉替换的**四种执行方式状态**：
+    // 3.8) 新增的两页（页眉替换 / 打印与导出）骨架，外加页眉替换的**四种执行方式状态**：
     //      引擎（纯 Rust / Word COM）× 落盘（写副本 / 就地覆盖），以及就地覆盖那张
     //      确认框。**只是画，不触发任何动作**，所以无头环境、没装 Word 的机器上也能跑。
     //      为什么要枚举这四种：2026-10-11 页眉替换改成"两条路都留着"之后，
@@ -3418,6 +3418,37 @@ pub fn selftest(args: &[String]) -> i32 {
             }
         }
     }
+    // 3.8c) 「打印与导出」页的两种下游：送打印机 / 落 PDF。PDF 那档会多出
+    //      「输出目录」「用源文件目录」「PDF/A」三件，页码写错时还要走一条
+    //      `InputField::error` 的报错分支 —— 四种状态各画两帧。
+    //      理由与上一条相同：**只在某个选择之后才画得出来的控件，不主动摆出来
+    //      就永远没被渲染过**，排版里的 panic 会一路躲到用户手上。
+    let keep_sink = app.wt.sink;
+    let keep_range = app.wt.page_range.clone();
+    let keep_pdf_a = app.wt.pdf_a;
+    app.page = Page::Print;
+    app.wt.print_docs = (1..=2)
+        .map(|i| format!("D:/wrepl-selftest/Q{i}.docx"))
+        .collect();
+    for (sink, range, pdf_a) in [
+        (Sink::Printer, "", false),
+        (Sink::Pdf, "", false),
+        (Sink::Pdf, "3-7", true),
+        // 多段页码：导出这边解析必然失败 -> 输入框红字 +「导出 PDF」置灰
+        (Sink::Pdf, "1-3,5", false),
+    ] {
+        app.wt.sink = sink;
+        app.wt.page_range = range.to_string();
+        app.wt.pdf_a = pdf_a;
+        for _ in 0..2 {
+            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
+        }
+    }
+    app.wt.sink = keep_sink;
+    app.wt.page_range = keep_range;
+    app.wt.pdf_a = keep_pdf_a;
+    println!("  打印与导出（打印机 / PDF / PDF-A / 页码写错）：布局通过");
+
     app.page = keep_page;
     app.wt.hdr_mode = keep_hdr_mode;
     app.wt.hdr_engine = keep_engine;
@@ -3425,7 +3456,7 @@ pub fn selftest(args: &[String]) -> i32 {
     app.wt.hdr_confirm = keep_confirm;
     app.wt.hdr_docs.clear();
     app.wt.print_docs.clear();
-    println!("  页眉替换（文本 / 图片 × 两种引擎 × 两种落盘 + 确认框）+ 批量打印：布局通过");
+    println!("  页眉替换（文本 / 图片 × 两种引擎 × 两种落盘 + 确认框）+ 打印与导出：布局通过");
 
     // 3.8b) 自绘选择器里**只有浏览模式才有的**那套底部按钮：确定键是「打开」
     //       （选中文件才可按）、取消键是「关闭」（不是「取消」），而且**不摆**
@@ -3514,12 +3545,12 @@ pub fn selftest(args: &[String]) -> i32 {
 
     app.page = keep_page2;
 
-    // 3.9) 打印机枚举。批量打印页的「打印机」下拉全靠它，而它**不碰 COM**
+    // 3.9) 打印机枚举。打印与导出页的「打印机」下拉全靠它，而它**不碰 COM**
     //      （纯 Win32 `EnumPrintersW`），所以无头环境照样能验。
     //      这里只是"报出来"：一台都没装打印机是合法情形，不该判失败。
     app.wt.reload_printers();
     match &app.wt.printers_err {
-        Some(e) => println!("  · 打印机枚举失败：{e}（批量打印页会显示这条，仍可用默认打印机）"),
+        Some(e) => println!("  · 打印机枚举失败：{e}（打印与导出页会显示这条，仍可用默认打印机）"),
         None => {
             println!("  · 打印机枚举：{} 台", app.wt.printers.len());
             for p in app.wt.printers.iter().take(3) {
@@ -3654,7 +3685,7 @@ mod tests {
 
     /// `.doc` / `.docx` 才收，且**不看大小写**。
     ///
-    /// 它与「页眉替换 / 批量打印」那两页的选择器白名单是同一个来源，
+    /// 它与「页眉替换 / 打印与导出」那两页的选择器白名单是同一个来源，
     /// 两条路必须给出同一批候选 —— 对不上就会出现"拖进来的和选进来的不一样"。
     #[test]
     fn 白名单_只认_doc_和_docx_且不看大小写() {
@@ -3804,7 +3835,7 @@ mod tests {
         assert_eq!(got[1], 再来.display().to_string(), "新拖进来的接在后面");
     }
 
-    /// 落点按页隔离：拖到「页眉替换」不该影响「批量打印」的清单。
+    /// 落点按页隔离：拖到「页眉替换」不该影响「打印与导出」的清单。
     #[test]
     fn 拖入文档栏_两个页的清单互不串() {
         let mut app = App::new();
@@ -4337,7 +4368,7 @@ mod tests {
         按下_ctrl_o(&mut app);
         assert!(
             matches!(app.picker_for, Some(PickFor::PrintDocs)),
-            "批量打印页同理"
+            "打印与导出页同理"
         );
     }
 }

@@ -236,7 +236,7 @@ cd /d/test/wrepl
 cargo check --features gui --offline
 
 # ② 单元测试
-cargo test --features gui --offline --bin wrepl-gui      # 期望 59 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui      # 期望 66 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
@@ -308,7 +308,7 @@ vX.Y.Z：一句话说清这版干了什么
 - 修复：…
 - 交互：…
 
-验证：cargo check/build 0 error 且自家代码零警告；cargo test 59 passed；
+验证：cargo check/build 0 error 且自家代码零警告；cargo test 66 passed；
 regress.sh 通过 78 / 失败 0，含 26/26 SHA256 与基线完全相同。
 ```
 
@@ -396,7 +396,7 @@ grep -rn "D:/test" src/ bench/ docs/ .github/ *.sh *.py *.md | grep -v "^target/
    | `src/main.rs` · `src/gui/main.rs` | 两个入口（CLI / GUI） |
 
 3. **加测试** —— 单元测试跟代码放一起（`src/gui/` 下的 `picker.rs` / `app.rs` /
-   `diag.rs` / `main.rs` 末尾都有 `mod tests`），跑
+   `diag.rs` / `main.rs` / `wordtool/services.rs` 末尾都有 `mod tests`），跑
    `cargo test --features gui --bin wrepl-gui`。
    **界面逻辑优先补"纯状态机"那部分**（拖放落点、输出模式、路径计算、日志裁剪…）
    —— 它们不需要窗口、几十毫秒就跑完；真正要图形栈的（布局、绘制、消息循环）

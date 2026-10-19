@@ -37,4 +37,4 @@ pub mod ui;
 pub mod wd;
 pub mod word_session;
 
-pub use ui::{Engine, HeaderMode, PickDoc, WordTool};
+pub use ui::{Engine, HeaderMode, PickDoc, Sink, WordTool};

@@ -18,6 +18,10 @@
 //! ```text
 //! wt_probe <text|image> <docx>...            # 就地改（请指向副本！）
 //! wt_probe read  <docx>...                   # 只读：逐步打印定位链，不改文件
+//! wt_probe pdf  <输出目录|-> <页码范围> <docx>...
+//!                                            # 跑一遍导出 PDF（`-` = 各文档旁的 pdf/，
+//!                                            #   页码留空引号 `""` = 全部）
+//! wt_probe pdfa <输出目录|-> <页码范围> <docx>...   # 同上，但按 PDF/A 归档
 //! ```
 
 // 探针把 `wordtool` 的六个子模块**整套** `#[path]` 搬进来（只为让探针与产品
@@ -130,7 +134,7 @@ fn probe_read(path: &str) -> DispResult<()> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("用法：wt_probe <read|text|image> <docx>...");
+        eprintln!("用法：wt_probe <read|text|image|pdf|pdfa> <docx>...");
         std::process::exit(2);
     }
     let mode = args[0].clone();
@@ -155,6 +159,58 @@ fn main() {
                 }
             }
             return 0;
+        }
+
+        // ---------- 导出 PDF（2026-10-19 新增）----------
+        //
+        // 为什么探针要有这一档：「导出 PDF」整条链只有 Word COM 一条路，
+        // 而界面上点一下要走确认框、后台线程、channel 回传 —— 出问题时分不清是
+        // COM 参数不对、还是界面那条线断了。这里直接调同一个
+        // `services::export_pdf_run`，**走的是同一份源码**（`#[path]` 引入），
+        // 所以探针能跑通，界面上就一定跑得通；探针报什么错，界面里也是那个错。
+        if mode == "pdf" || mode == "pdfa" {
+            let out = docs.first().cloned().unwrap_or_default();
+            let range = docs.get(1).cloned().unwrap_or_default();
+            let files: Vec<String> = docs.iter().skip(2).cloned().collect();
+            if files.is_empty() {
+                eprintln!("用法：wt_probe pdf <输出目录|-> <页码范围> <docx>...");
+                return 2;
+            }
+            let dir = if out.is_empty() || out == "-" {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&out))
+            };
+            let pages = match services::parse_pdf_pages(&range) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("!! 页码范围读不出：{e}");
+                    return 2;
+                }
+            };
+            println!(
+                "== 导出 {}｜{} 个文档｜{}｜{}",
+                if mode == "pdfa" { "PDF/A" } else { "PDF" },
+                files.len(),
+                pages.describe(),
+                match &dir {
+                    Some(d) => d.display().to_string(),
+                    None => "每份文档旁的 pdf/".to_string(),
+                }
+            );
+            let mut log = |s: String| println!("  {s}");
+            let mut prog = |cur: usize, total: usize| println!("[进度 {cur}/{total}]");
+            let (ok, fail) = services::export_pdf_run(
+                &files,
+                dir.as_deref(),
+                pages,
+                mode == "pdfa",
+                &mut log,
+                &mut prog,
+            );
+            println!("== 结果：成功 {ok} / 失败 {fail}");
+            drop(init);
+            return if fail == 0 && ok > 0 { 0 } else { 1 };
         }
 
         let mut log = |s: String| println!("  {s}");

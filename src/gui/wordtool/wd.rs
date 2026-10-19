@@ -10,3 +10,7 @@ pub const PREFERRED_WIDTH_POINTS: i32 = 1; // wdPreferredWidthPoints
 pub const ALIGN_PARAGRAPH_CENTER: i32 = 1; // wdAlignParagraphCenter
 pub const CELL_ALIGN_VERTICAL_CENTER: i32 = 1; // wdCellAlignVerticalCenter
 pub const AUTOMATION_SECURITY_FORCE_DISABLE: i32 = 3; // msoAutomationSecurityForceDisable
+pub const EXPORT_FORMAT_PDF: i32 = 17; // wdExportFormatPDF
+pub const EXPORT_OPTIMIZE_FOR_PRINT: i32 = 0; // wdExportOptimizeForPrint
+pub const EXPORT_RANGE_FROM_TO: i32 = 3; // wdExportFromTo
+

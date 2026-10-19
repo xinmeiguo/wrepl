@@ -1,4 +1,4 @@
-//! 页眉替换（文本 / 图片）与批量打印两页 —— 界面 + 任务调度。
+//! 页眉替换（文本 / 图片）与「打印与导出」两页 —— 界面 + 任务调度。
 //!
 //! ## 线程模型
 //!
@@ -10,7 +10,7 @@
 //! ## 与来源的差异
 //!
 //! 取自 `word_header_tool_rust/src/app.rs`（v0.2.0）。原来是三个标签页
-//! （图片替换 / 文本替换 / 批量打印），这里把前两页**并成「页眉替换」一页**、
+//! （图片替换 / 文本替换 / 打印与导出），这里把前两页**并成「页眉替换」一页**、
 //! 用单选切换 —— 它们的流程完全一样（选输入 → 选文档 → 执行），
 //! 差别只在"往单元格里放什么"，分成两页纯属重复。
 //!
@@ -41,7 +41,7 @@ use super::services;
 pub enum PickDoc {
     /// 页眉替换页的「选择文档」
     Header,
-    /// 批量打印页的「选择文档」
+    /// 打印与导出页的「选择文档」
     Print,
     /// 页眉替换页的「选择图片…」（**只选一张**）。
     ///
@@ -88,6 +88,23 @@ pub enum HeaderMode {
 pub enum Engine {
     Rust,
     Com,
+}
+
+/// 「打印与导出」页的下游：送打印机，还是落成 PDF 文件。
+///
+/// 两条路的输入完全一样（同一份文档清单、同一个「页码范围」字段），
+/// 差别只在**产物去哪**。所以它们是同一页上的一个单选，而不是两页 ——
+/// 分成两页等于让用户把同一批文档选两遍，而实际交付里"先打一份纸质、
+/// 再导一份 PDF 归档"是连着做的。
+///
+/// 页码语义两边**不完全一样**（这是它们唯一的实质差异）：
+/// 打印按 `"1-3,5,7-9"` 原样交给 Word，多段随便写；
+/// 导出走 `ExportAsFixedFormat`，一次只认**一段连续**页码 —— 见
+/// [`super::services::parse_pdf_pages`]。
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Sink {
+    Printer,
+    Pdf,
 }
 
 /// 纯 Rust 引擎的落盘位置 —— 就一个勾选框，所以界面侧用 `bool` 就够
@@ -148,9 +165,18 @@ pub struct WordTool {
     pub text_cn: String,
     pub img_path: String,
     pub img_scale: bool,
-    // ---------- 批量打印 ----------
+    // ---------- 打印与导出 ----------
     pub print_docs: Vec<String>,
+    /// 页码范围。**两种下游共用这一个字段**（打印原样交给 Word，导出先解析，见 [`Sink`]）。
     pub page_range: String,
+    /// 这一页的下游：送打印机，还是落 PDF。
+    pub sink: Sink,
+    /// 导出 PDF 的输出目录。**留空 = 每份文档旁的 `pdf/` 子目录**。
+    pub pdf_dir: String,
+    /// 勾了就按 PDF/A 归档格式导出 —— 走 Word 的 `UseISO19005_1` 开关。
+    /// **实测（Microsoft 365 / 2026-10-19）产出 PDF/A-3b**，不是 1b；
+    /// 界面文案因此不写 ISO 编号，改在悬停说明里讲清楚。
+    pub pdf_a: bool,
     /// 本机打印机（进入打印页时枚举一次并缓存）。
     pub printers: Vec<Printer>,
     /// 下拉框选择：`0` = 用系统默认；`n>0` = `printers[n-1]`。
@@ -188,6 +214,9 @@ impl WordTool {
             img_scale: true,
             print_docs: Vec::new(),
             page_range: String::new(),
+            sink: Sink::Printer,
+            pdf_dir: String::new(),
+            pdf_a: false,
             printers: Vec::new(),
             printer_pick: 0,
             printers_err: None,
@@ -673,7 +702,7 @@ impl WordTool {
         }
     }
 
-    // ==================== 渲染：批量打印 ====================
+    // ==================== 渲染：打印与导出 ====================
 
     pub fn ui_print(&mut self, ui: &mut egui::Ui) {
         // 打印机只枚举一次并缓存 —— 见 `reload_printers`。
@@ -713,107 +742,230 @@ impl WordTool {
 
         ui.add_space(ds::SPACING.s4);
 
-        // ---- 卡片 2：打印机与页码范围 ----
+        // ---- 卡片 2：输出设置（打印机 / PDF）----
         card(ui, |ui| {
-            card_title(ui, "打印设置");
-
-            // GUIDE §6：标签放字段正上方，下拉换 `SelectField`。
-            // 它和 `InputField` 一样是 `.show(ui, …)`、**不是 `Widget`**。
-            let cur_label = self.printer_label();
-            // 先把选项文案算成 owned 的 `Vec<String>`：`SelectField::show` 要
-            // `&str` 选项，而「系统默认」那档得现拼一段字符串。落成 owned 之后再
-            // 借成 `Vec<(usize, &str)>`，进 `show` 时就只借 `self.printer_pick`
-            // （可变）与这份局部数据，不碰 `self.printers`，少一处借用冲突。
-            let labels: Vec<String> = std::iter::once("（用默认打印机）".to_string())
-                .chain(self.printers.iter().map(|p| {
-                    if p.is_default {
-                        format!("{}（系统默认）", p.name)
-                    } else {
-                        p.name.clone()
-                    }
-                }))
-                .collect();
-            let opts: Vec<(usize, &str)> = labels
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (i, s.as_str()))
-                .collect();
-            ds::SelectField::new("wt_printer")
-                .label("打印机")
-                .width(420.0)
-                .show(ui, &mut self.printer_pick, &cur_label, opts);
-            ui.add_space(ds::SPACING.s2);
-
-            if ui
-                .add(
-                    ds::Button::secondary("重新扫描")
-                        .leading(ds::Icon::Refresh)
-                        .disabled(busy),
-                )
-                .on_hover_text("重新枚举本机打印机（刚装了打印机 / 刚映射了共享打印机时用）")
-                .clicked()
-            {
-                self.reload_printers();
-            }
+            card_title(ui, "输出设置");
+            // 两种下游的输入完全一样，只有产物去处不同 —— 所以是同一页上的
+            // 一个单选，不是两页（见 [`Sink`] 的说明）。
+            ds::RadioGroup::new(&mut self.sink)
+                .horizontal()
+                .option(ds::RadioOption::new(Sink::Printer, "打印机"))
+                .option(ds::RadioOption::new(Sink::Pdf, "导出 PDF"))
+                .show(ui);
             ui.add_space(ds::SPACING.s3);
 
-            ds::InputField::new(&mut self.page_range)
+            let sink = self.sink;
+            match sink {
+                Sink::Printer => {
+                    // GUIDE §6：标签放字段正上方，下拉换 `SelectField`。
+                    // 它和 `InputField` 一样是 `.show(ui, …)`、**不是 `Widget`**。
+                    let cur_label = self.printer_label();
+                    // 先把选项文案算成 owned 的 `Vec<String>`：`SelectField::show` 要
+                    // `&str` 选项，而「系统默认」那档得现拼一段字符串。落成 owned 之后再
+                    // 借成 `Vec<(usize, &str)>`，进 `show` 时就只借 `self.printer_pick`
+                    // （可变）与这份局部数据，不碰 `self.printers`，少一处借用冲突。
+                    let labels: Vec<String> = std::iter::once("（用默认打印机）".to_string())
+                        .chain(self.printers.iter().map(|p| {
+                            if p.is_default {
+                                format!("{}（系统默认）", p.name)
+                            } else {
+                                p.name.clone()
+                            }
+                        }))
+                        .collect();
+                    let opts: Vec<(usize, &str)> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i, s.as_str()))
+                        .collect();
+                    ds::SelectField::new("wt_printer")
+                        .label("打印机")
+                        .width(420.0)
+                        .show(ui, &mut self.printer_pick, &cur_label, opts);
+                    ui.add_space(ds::SPACING.s2);
+
+                    if ui
+                        .add(
+                            ds::Button::secondary("重新扫描")
+                                .leading(ds::Icon::Refresh)
+                                .disabled(busy),
+                        )
+                        .on_hover_text(
+                            "重新枚举本机打印机（刚装了打印机 / 刚映射了共享打印机时用）",
+                        )
+                        .clicked()
+                    {
+                        self.reload_printers();
+                    }
+                }
+                // 导出 PDF 不碰打印机：**一个系统窗口都不建**，也就没有
+                // "选打印机"这一步。目录留空时落到各文档旁的 `pdf/`。
+                Sink::Pdf => {
+                    ds::InputField::new(&mut self.pdf_dir)
+                        .label("输出目录")
+                        .placeholder("留空 = 每份文档旁的 pdf 子目录")
+                        .desired_width(420.0)
+                        .show(ui);
+                    ui.add_space(ds::SPACING.s2);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                ds::Button::secondary("用源文件目录")
+                                    .leading(ds::Icon::FolderOpen)
+                                    .disabled(busy),
+                            )
+                            .on_hover_text("把输出目录填成第一份文档所在的那个目录")
+                            .clicked()
+                        {
+                            if let Some(p) = self.print_docs.first() {
+                                if let Some(parent) = std::path::Path::new(p).parent() {
+                                    self.pdf_dir = parent.to_string_lossy().to_string();
+                                }
+                            }
+                        }
+                        ui.add_space(ds::SPACING.s4);
+                        ui.add(ds::Checkbox::with_label(&mut self.pdf_a, "PDF/A 归档格式"))
+                            .on_hover_text(
+                                "走 Word 的「PDF/A 兼容」开关（UseISO19005_1）。\
+                                 实测 Microsoft 365 输出的是 PDF/A-3b，\
+                                 长期归档、投标准入都认这个；日常传阅不必勾。",
+                            );
+                    });
+                }
+            }
+
+            ui.add_space(ds::SPACING.s3);
+
+            // 页码：两档共用同一个字段。导出那档先解析 —— 解析不了就把原因画在
+            // 输入框下面，**绝不弹窗、也不静默按"全部"跑**。
+            let pages_err = match sink {
+                Sink::Printer => None,
+                Sink::Pdf => services::parse_pdf_pages(&self.page_range).err(),
+            };
+            let hint_txt = match sink {
+                Sink::Printer => "留空 = 全部；也可写 1-3,5,7-9",
+                Sink::Pdf => "留空 = 全部；也可写 3 或 3-7",
+            };
+            let mut pages_field = ds::InputField::new(&mut self.page_range)
                 .label("页码范围")
-                .desired_width(180.0)
-                .show(ui);
+                .placeholder(hint_txt)
+                .desired_width(180.0);
+            if let Some(e) = pages_err.as_deref() {
+                pages_field = pages_field.error(e);
+            }
+            pages_field.show(ui);
 
             // 说明性文案一律不摆 —— 下拉框本身就能看出有几台、选的是哪台。
             // 只有"枚举失败"必须说出来，否则下拉框空着没人知道为什么。
-            if let Some(e) = &self.printers_err {
-                let pal = ds::palette_of(ui.ctx());
-                ui.add_space(ds::SPACING.s3);
-                ui.label(
-                    RichText::new(format!("× 读取打印机列表失败：{e}"))
-                        .text_style(egui::TextStyle::Small)
-                        .color(pal.error),
-                );
+            if sink == Sink::Printer {
+                if let Some(e) = &self.printers_err {
+                    let pal = ds::palette_of(ui.ctx());
+                    ui.add_space(ds::SPACING.s3);
+                    ui.label(
+                        RichText::new(format!("× 读取打印机列表失败：{e}"))
+                            .text_style(egui::TextStyle::Small)
+                            .color(pal.error),
+                    );
+                }
             }
         });
 
         ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 3：执行 ----
-        let can = !busy && !self.print_docs.is_empty();
+        let pages_ok = match self.sink {
+            Sink::Printer => true,
+            Sink::Pdf => services::parse_pdf_pages(&self.page_range).is_ok(),
+        };
+        let can = !busy && !self.print_docs.is_empty() && pages_ok;
         card(ui, |ui| {
             ui.horizontal(|ui| {
+                // 一屏仍然只有一个 primary —— 换下游只换措辞与图标。
+                let (action_label, action_icon) = match self.sink {
+                    Sink::Printer => ("开始打印", egui_phosphor::regular::PRINTER),
+                    Sink::Pdf => ("导出 PDF", egui_phosphor::regular::FILE_PDF),
+                };
                 let clicked = ui
                     .add(
-                        ds::Button::primary("开始打印")
+                        ds::Button::primary(action_label)
                             .size(ds::ButtonSize::Lg)
-                            // 打印机图标走 Phosphor 的 `PRINTER`：DS 的 `Icon`
-                            // 枚举里没有打印机语义（原先借的是 `Package` —— 一个
-                            // 包裹/箱子，与"打印"没关系）。`Icon::Glyph` 是
-                            // egui_sauge 特意留的逃生口，直接塞 Phosphor 码点即可，
-                            // 不用去动 ds.rs 的公共 API（GUIDE §12 也是这么说的）。
-                            .leading(ds::Icon::Glyph(egui_phosphor::regular::PRINTER))
+                            // 图标走 Phosphor：DS 的 `Icon` 枚举里没有打印机 / PDF
+                            // 语义（原先借的是 `Package` —— 一个包裹/箱子，与"打印"
+                            // 没关系）。`Icon::Glyph` 是 egui_sauge 特意留的逃生口，
+                            // 直接塞 Phosphor 码点即可，不用去动 ds.rs 的公共 API
+                            // （GUIDE §12 也是这么说的）。
+                            .leading(ds::Icon::Glyph(action_icon))
                             .disabled(!can),
                     )
                     .clicked();
                 if clicked {
                     let docs = self.print_docs.clone();
-                    let range = self.page_range.trim().to_string();
-                    // 打印机字符串在这里定下来（"名称 on 端口"）——
-                    // 线程里不再碰 UI 状态。
-                    let printer = self
-                        .selected_printer()
-                        .map(|p| p.active_string())
-                        .filter(|s| !s.is_empty());
-                    self.log(format!(
-                        "开始打印：{} 个文档（{}）",
-                        docs.len(),
-                        match &printer {
-                            Some(p) => format!("打印机 {p}"),
-                            None => "默认打印机".to_string(),
+                    match self.sink {
+                        Sink::Printer => {
+                            let range = self.page_range.trim().to_string();
+                            // 打印机字符串在这里定下来（"名称 on 端口"）——
+                            // 线程里不再碰 UI 状态。
+                            let printer = self
+                                .selected_printer()
+                                .map(|p| p.active_string())
+                                .filter(|s| !s.is_empty());
+                            self.log(format!(
+                                "开始打印：{} 个文档（{}）",
+                                docs.len(),
+                                match &printer {
+                                    Some(p) => format!("打印机 {p}"),
+                                    None => "默认打印机".to_string(),
+                                }
+                            ));
+                            self.start("打印", true, move |log, prog| {
+                                services::print_run(&docs, &range, printer.as_deref(), log, prog)
+                            });
                         }
-                    ));
-                    self.start("打印", true, move |log, prog| {
-                        services::print_run(&docs, &range, printer.as_deref(), log, prog)
-                    });
+                        Sink::Pdf => {
+                            // 按钮在解析失败时本来就是灰的，这里再守一道：
+                            // 界面状态与点击之间隔着若干帧，别指望它一定同步。
+                            let pages = match services::parse_pdf_pages(&self.page_range) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    self.log(format!("页码范围不能用，已停止：{e}"));
+                                    return;
+                                }
+                            };
+                            let dir = self.pdf_dir.trim().to_string();
+                            let out = if dir.is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(&dir))
+                            };
+                            let where_txt = if dir.is_empty() {
+                                "每份文档旁的 pdf 子目录".to_string()
+                            } else {
+                                dir.clone()
+                            };
+                            self.log(format!(
+                                "开始导出 PDF：{} 个文档（{}；输出到 {}；{}）",
+                                docs.len(),
+                                pages.describe(),
+                                where_txt,
+                                if self.pdf_a {
+                                    "PDF/A 归档格式"
+                                } else {
+                                    "标准 PDF"
+                                }
+                            ));
+                            let pdf_a = self.pdf_a;
+                            self.start("导出 PDF", true, move |log, prog| {
+                                services::export_pdf_run(
+                                    &docs,
+                                    out.as_deref(),
+                                    pages,
+                                    pdf_a,
+                                    log,
+                                    prog,
+                                )
+                            });
+                        }
+                    }
                 }
                 ui.add_space(ds::SPACING.s4);
                 self.status_rows(ui);

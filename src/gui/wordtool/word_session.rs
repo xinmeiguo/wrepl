@@ -44,6 +44,14 @@ fn file_name(p: &str) -> &str {
 /// 通用批处理骨架：对每个文档执行 action，自动完成 打开 → 处理 → (可选)保存 → 关闭 → 释放 → 日志。
 /// 单个文档失败不影响后续文档；无论成败，结束后都彻底清理 Word 进程。
 /// `progress(current, total)` 在每个文档开始处理时回传（current 从 1 开始）。
+///
+/// ## action 的两个参数与返回值
+///
+/// * `&Disp` —— 已打开的文档；`&str` —— **它的源路径**（导出 PDF 这类
+///   "产物名由源文件名派生"的动作需要它，否则只能退回把路径塞进闭包的捕获里，
+///   变成"每个文档都算同一个目标"）。
+/// * 返回 `Ok(Some(备注))` 时，备注会接在 `"{done_verb}：文件名"` 后面一起写进日志
+///   （导出 PDF 用它报产物落到哪、有没有因为撞名改存）。普通动作返回 `Ok(None)`。
 pub fn run_on_documents<F>(
     doc_paths: &[String],
     action: F,
@@ -53,7 +61,7 @@ pub fn run_on_documents<F>(
     done_verb: &str,
 ) -> (i32, i32)
 where
-    F: Fn(&Disp) -> DispResult<()>,
+    F: Fn(&Disp, &str) -> DispResult<Option<String>>,
 {
     let mut session = match WordSession::create() {
         Ok(s) => s,
@@ -95,7 +103,7 @@ pub fn run_on_documents_printing<F>(
     printer: Option<&str>,
 ) -> (i32, i32)
 where
-    F: Fn(&Disp) -> DispResult<()>,
+    F: Fn(&Disp, &str) -> DispResult<Option<String>>,
 {
     let mut session = match WordSession::create() {
         Ok(s) => s,
@@ -177,7 +185,7 @@ fn batch_loop<F>(
     done_verb: &str,
 ) -> (i32, i32)
 where
-    F: Fn(&Disp) -> DispResult<()>,
+    F: Fn(&Disp, &str) -> DispResult<Option<String>>,
 {
     let total = doc_paths.len();
     let (mut ok, mut fail) = (0i32, 0i32);
@@ -195,11 +203,16 @@ where
                 }
                 Ok(doc) => {
                     let mut failure: Option<String> = None;
-                    if let Err(e) = action(&doc) {
-                        failure = Some(e);
-                    } else if save_after {
-                        if let Err(e) = doc.callv("Save", vec![]) {
-                            failure = Some(e);
+                    let mut note: Option<String> = None;
+                    match action(&doc, path) {
+                        Err(e) => failure = Some(e),
+                        Ok(n) => {
+                            note = n;
+                            if save_after {
+                                if let Err(e) = doc.callv("Save", vec![]) {
+                                    failure = Some(e);
+                                }
+                            }
                         }
                     }
                     match failure {
@@ -209,7 +222,10 @@ where
                         }
                         None => {
                             ok += 1;
-                            log(format!("{done_verb}：{}", file_name(path)));
+                            // `note` 由动作自己给（导出 PDF 用它报产物落点）；
+                            // 普通动作是 `None`，日志与改动前一字不差。
+                            let tail = note.unwrap_or_default();
+                            log(format!("{done_verb}：{}{tail}", file_name(path)));
                         }
                     }
                     let _ = doc.callv("Close", vec![var_bool(false)]);
