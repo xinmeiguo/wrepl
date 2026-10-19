@@ -248,15 +248,6 @@ pub fn var_i4(v: i32) -> VARIANT {
     x
 }
 
-pub fn var_r4(v: f32) -> VARIANT {
-    let mut x = unsafe { VariantInit() };
-    unsafe {
-        (*inner_mut(&mut x)).vt = VT_R4;
-        (*inner_mut(&mut x)).Anonymous.fltVal = v;
-    }
-    x
-}
-
 pub fn var_bool(v: bool) -> VARIANT {
     let mut x = unsafe { VariantInit() };
     unsafe {
@@ -292,6 +283,10 @@ pub fn var_disp(d: &Disp) -> VARIANT {
 
 // ==================== VARIANT 读取（消费值并清理） ====================
 
+/// 读整数。产品 bin 里已无调用（页眉 COM 退役后只剩 `wt_probe` 的诊断用），
+/// 保留它是为了让这套助手层保持完整 —— 将来加新动作（读回页数 / 段落数）
+/// 不必再回头补。
+#[allow(dead_code)]
 pub unsafe fn res_i32(mut v: VARIANT) -> DispResult<i32> {
     unsafe {
         let r = match (*inner(&v)).vt {
@@ -309,23 +304,6 @@ pub unsafe fn res_i32(mut v: VARIANT) -> DispResult<i32> {
             other => {
                 let _ = VariantClear(&mut v);
                 return Err(format!("预期整数，实际 VT={}", other.0));
-            }
-        };
-        let _ = VariantClear(&mut v);
-        Ok(r)
-    }
-}
-
-pub unsafe fn res_f32(mut v: VARIANT) -> DispResult<f32> {
-    unsafe {
-        let r = match (*inner(&v)).vt {
-            VT_R4 => (*inner(&v)).Anonymous.fltVal,
-            VT_R8 => (*inner(&v)).Anonymous.dblVal as f32,
-            VT_I4 => (*inner(&v)).Anonymous.lVal as f32,
-            VT_I2 => (*inner(&v)).Anonymous.iVal as f32,
-            other => {
-                let _ = VariantClear(&mut v);
-                return Err(format!("预期数值，实际 VT={}", other.0));
             }
         };
         let _ = VariantClear(&mut v);

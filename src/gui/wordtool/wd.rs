@@ -1,16 +1,13 @@
 //! Word COM 枚举常量（与 C# 版 Core/Wd.cs 一一对应，数值来自 Word 对象模型）。
+//!
+//! 2026-10-19：页眉 COM 引擎退役后，只服务于它的一组常量（页眉部件号、
+//! 下划线 / 行高 / 列宽 / 段落对齐 / 单元格垂直对齐）一并删除 —— 留着只会
+//! 以 `never used` 的形式把编译输出弄脏。
 
-pub const HEADER_FOOTER_PRIMARY: i32 = 1; // wdHeaderFooterPrimary
 pub const ALERTS_NONE: i32 = 0; // wdAlertsNone
 pub const PRINT_RANGE_OF_PAGES: i32 = 4; // wdPrintRangeOfPages
-pub const UNDERLINE_NONE: i32 = 0; // wdUnderlineNone
 pub const DO_NOT_SAVE_CHANGES: i32 = 0; // wdDoNotSaveChanges
-pub const ROW_HEIGHT_EXACTLY: i32 = 1; // wdRowHeightExactly
-pub const PREFERRED_WIDTH_POINTS: i32 = 1; // wdPreferredWidthPoints
-pub const ALIGN_PARAGRAPH_CENTER: i32 = 1; // wdAlignParagraphCenter
-pub const CELL_ALIGN_VERTICAL_CENTER: i32 = 1; // wdCellAlignVerticalCenter
 pub const AUTOMATION_SECURITY_FORCE_DISABLE: i32 = 3; // msoAutomationSecurityForceDisable
 pub const EXPORT_FORMAT_PDF: i32 = 17; // wdExportFormatPDF
 pub const EXPORT_OPTIMIZE_FOR_PRINT: i32 = 0; // wdExportOptimizeForPrint
 pub const EXPORT_RANGE_FROM_TO: i32 = 3; // wdExportFromTo
-

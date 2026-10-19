@@ -2,22 +2,22 @@
 //!
 //! ## 为什么要有它
 //!
-//! 「页眉替换」页的 COM 路在界面上表现为"点了执行、报成功、文件却没变"。
-//! 界面只把日志留在自己的 `self.log` 里，关窗即失，查不到 COM 那层到底报了什么。
-//! 这个探针把同一批子模块（`com` / `wd` / `locator` / `services` / `word_session`）
-//! 直接搬进一个**没有 egui 依赖**的 bin 里跑，于是：
-//!   · 每一步 COM 调用的返回值都能打到 stdout；
-//!   · 可以逐步复刻 `locator::for_each_first_cell` 的取法，看它断在哪一层；
-//!   · 再真跑一次 `services::*_run`，看整条链的 (ok, fail) 与日志。
+//! 「打印与导出」全靠 Word COM，而界面只把日志留在进程内的 `self.log` 里，
+//! 关窗即失。这个探针把同一批子模块（`com` / `wd` / `services` /
+//! `word_session`）直接搬进一个**没有 egui 依赖**的 bin 里跑，
+//! 每一步 COM 调用的返回值都能打到 stdout。
 //!
 //! `#[path]` 直接 include 源码，不复制一份 —— 探针与产品走的是**同一份代码**，
 //! 探针里能复现的，界面上必然同样发生。
 //!
+//! ★ 2026-10-19：页眉替换的 COM 引擎退役，`text` / `image` / `read` 三档
+//! （当初就是为它做的逐步复刻诊断）一并删除。页眉替换现在不经过 COM，
+//! 要验它请跑 `wrepl-gui --selftest` 或直接跑产品。
+//!
 //! ## 用法
 //!
 //! ```text
-//! wt_probe <text|image> <docx>...            # 就地改（请指向副本！）
-//! wt_probe read  <docx>...                   # 只读：逐步打印定位链，不改文件
+//! wt_probe engine                            # 判定本机：Word / 只有 WPS / 都没装
 //! wt_probe pdf  <输出目录|-> <页码范围> <docx>...
 //!                                            # 跑一遍导出 PDF（`-` = 各文档旁的 pdf/，
 //!                                            #   页码留空引号 `""` = 全部）
@@ -33,19 +33,17 @@
 //!                                            #   export_pdf_run，引擎换成 WPS
 //! ```
 
-// 探针把 `wordtool` 的六个子模块**整套** `#[path]` 搬进来（只为让探针与产品
+// 探针把 `wordtool` 的子模块**整套** `#[path]` 搬进来（只为让探针与产品
 // 走同一份代码），但每次只走其中一两条路径 —— 剩下的函数 / 结构"没被用到"
 // 是**设计如此**，不是死代码。产品 bin（`wrepl-gui`）里这些代码都在用，所以
-// 不会报；不声明这一行，探针 bin 会独占 8 条 `never used` 警告，
-// 把整个构建输出弄脏（`cargo build --features gui` 的警告数从 7 变 15）。
+// 不会报；不声明这一行，探针 bin 会独占一批 `never used` 警告，
+// 把整个构建输出弄脏。
 #![allow(dead_code)]
 
 #[path = "../gui/wordtool/com.rs"]
 mod com;
 #[path = "../gui/wordtool/engine.rs"]
 mod engine;
-#[path = "../gui/wordtool/locator.rs"]
-mod locator;
 #[path = "../gui/wordtool/printers.rs"]
 mod printers;
 #[path = "../gui/wordtool/services.rs"]
@@ -55,7 +53,7 @@ mod wd;
 #[path = "../gui/wordtool/word_session.rs"]
 mod word_session;
 
-use com::{DispResult, res_disp, res_i32, var_bool, var_bstr, var_i4};
+use com::{DispResult, res_disp, var_bool, var_bstr, var_i4};
 
 /// 一次「打开 → 导出 → 关闭」的分段耗时（毫秒）。
 struct Row {
@@ -161,91 +159,6 @@ unsafe fn perf_pass(
     }
 }
 
-
-/// COM 的布尔（VT_BOOL）读成 i32 后是 0 / -1。
-fn yn(v: i32) -> &'static str {
-    if v == 0 { "否" } else { "是" }
-}
-
-/// 逐步复刻 `locator::for_each_first_cell` 的取法，每一步都打印真实结果。
-///
-/// 只读：打开后不保存、直接关。
-fn probe_read(path: &str) -> DispResult<()> {
-    unsafe {
-        println!("---- 逐步探针：{path}");
-        let mut session = word_session::WordSession::create()?;
-        println!("[1] WordSession::create            OK");
-
-        let docs = res_disp(session.word.get("Documents")?)?;
-        println!("[2] word.Documents                 OK");
-
-        let doc = res_disp(docs.call("Open", vec![var_bstr(path)])?)?;
-        println!("[3] Documents.Open                 OK");
-
-        let sections = res_disp(doc.get("Sections")?)?;
-        let n = res_i32(sections.get("Count")?)?;
-        println!("[4] doc.Sections / Count           OK  Count={n}");
-
-        // 两个开关决定"页面实际显示哪个页眉"。
-        // 都关着 = 首页、奇数页、偶数页统统显示"主页眉"。
-        // 这和"页眉部件里有没有东西"是两回事，混起来就会得出
-        // "COM 只改主页眉 ⇒ 首页不变"这种听起来对、实际误导的结论。
-        {
-            let ps = res_disp(doc.get("PageSetup")?)?;
-            let dfp = res_i32(ps.get("DifferentFirstPageHeaderFooter")?)?;
-            let oae = res_i32(ps.get("OddAndEvenPagesHeaderFooter")?)?;
-            println!(
-                "[5] PageSetup: 首页不同={} 奇偶页不同={}   =>{}",
-                yn(dfp),
-                yn(oae),
-                if dfp == 0 && oae == 0 {
-                    "所有页面都显示【主页眉】"
-                } else {
-                    "首页/偶数页会各自取自己的页眉"
-                }
-            );
-        }
-
-        for i in 1..=n {
-            let section = res_disp(sections.call("Item", vec![var_i4(i)])?)?;
-            let headers = res_disp(section.get("Headers")?)?;
-            println!("  -- 第 {i} 节 --");
-
-            for k in 1..=3 {
-                let header = res_disp(headers.call("Item", vec![var_i4(k)])?)?;
-                let range = res_disp(header.get("Range")?)?;
-                let tables = res_disp(range.get("Tables")?)?;
-                let cnt = res_i32(tables.get("Count")?)?;
-                let htext = com::res_string(range.get("Text")?)?;
-                let one = htext.split_whitespace().collect::<Vec<_>>().join(" ");
-                println!("     Headers({k}) 表格={cnt}  文本={one:?}");
-                if cnt == 0 {
-                    continue;
-                }
-                let tbl = res_disp(tables.call("Item", vec![var_i4(1)])?)?;
-                let rows = res_disp(tbl.get("Rows")?)?;
-                let cols = res_disp(tbl.get("Columns")?)?;
-                let nr = res_i32(rows.get("Count")?)?;
-                let nc = res_i32(cols.get("Count")?)?;
-                println!("     Tables(1).Rows.Count={nr} Columns.Count={nc}");
-                if nr < 1 || nc < 1 {
-                    println!("     !! 行或列为空，locator 会 continue");
-                    continue;
-                }
-                let cell = res_disp(tbl.call("Cell", vec![var_i4(1), var_i4(1)])?)?;
-                let crange = res_disp(cell.get("Range")?)?;
-                let ctext = com::res_string(crange.get("Text")?)?;
-                let one = ctext.split_whitespace().collect::<Vec<_>>().join(" ");
-                println!("     Cell(1,1) = {one:?}");
-            }
-        }
-
-        let _ = doc.callv("Close", vec![com::var_bool(false)]);
-        session.cleanup();
-        drop(session);
-        Ok(())
-    }
-}
 
 /// 等打印任务真正落地。
 ///
@@ -415,7 +328,9 @@ unsafe fn wps_pass(files: &[String], dir: &std::path::Path) -> Result<(), String
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("用法：wt_probe <read|text|image|pdf|pdfa|perf|printers|viaprint> <docx>...");
+        eprintln!(
+            "用法：wt_probe <engine|printers|pdf|pdfa|pdfwps|perf|viaprint|wps> <docx>..."
+        );
         std::process::exit(2);
     }
     let mode = args[0].clone();
@@ -432,15 +347,6 @@ fn main() {
             }
         };
         println!("[0] ComInit::sta()                 OK");
-
-        if mode == "read" {
-            for d in &docs {
-                if let Err(e) = probe_read(d) {
-                    eprintln!("!! 探针出错 {d}：{e}");
-                }
-            }
-            return 0;
-        }
 
         // 引擎判定：与界面进「打印与导出」页时调的是同一个函数。
         // 特意做成一档，是因为它读的是**真注册表** —— 单元测试只能喂假数据，
@@ -664,18 +570,14 @@ fn main() {
             return 0;
         }
 
-        let mut log = |s: String| println!("  {s}");
-        let mut prog = |cur: usize, total: usize| println!("[进度 {cur}/{total}]");
-        let (ok, fail) = if mode == "image" {
-            let img = docs.last().cloned().unwrap_or_default();
-            let list: Vec<String> = docs[..docs.len() - 1].to_vec();
-            services::image_replace_run(&list, &img, true, &mut log, &mut prog)
-        } else {
-            services::text_replace_run(&docs, "PROBE EN", "探针中文", &mut log, &mut prog)
-        };
-        println!("== 结果：成功 {ok} / 失败 {fail}");
+        // 2026-10-19：`text` / `image` / `read` 三档随页眉 COM 引擎一起退役
+        // （页眉替换现在只有纯 Rust 一条路，见 `src/hdr.rs`）。
+        eprintln!(
+            "!! 未知档位 {mode}。可用：engine | printers | viaprint | wps | \
+             pdf | pdfa | pdfwps | perf"
+        );
         drop(init);
-        0
+        2
     });
 
     let code = handle.join().unwrap_or(3);

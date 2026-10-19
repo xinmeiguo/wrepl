@@ -63,7 +63,7 @@ use wrepl::rules::{self, Rule, Scope};
 use wrepl::report;
 
 use crate::picker::{Mode, Outcome, Picker};
-use crate::wordtool::{Engine, HeaderMode, Sink};
+use crate::wordtool::{HeaderMode, Sink};
 
 const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
 const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
@@ -345,14 +345,15 @@ pub struct App {
     // ── 顶部三页切换（0.3.0 起）──
     /// 当前页：批量替换（原有）/ 页眉替换 / 打印与导出。
     page: Page,
-    /// 页眉替换与打印与导出的状态 + 任务（走 Word COM）。
+    /// 页眉替换与打印与导出的状态 + 任务（页眉替换纯 Rust，打印 / 导出走 Word COM）。
     wt: crate::wordtool::WordTool,
 }
 
 /// 顶部的三个页。
 ///
 /// 「批量替换」是工具原本的能力，与另两页**没有共同依赖**——它纯 Rust 改 OOXML，
-/// 不需要 Word；「页眉替换 / 打印与导出」走 Word COM，**需要目标机器装 Word**。
+/// 不需要 Word；「页眉替换」2026-10-19 起也是纯 Rust（COM 引擎已退役），
+/// 只有「打印与导出」需要目标机器装 Word（没有 Word 时导出可降级到 WPS）。
 ///
 /// ★ 导航上的标签 2026-10-11 由「正文替换」改成「批量替换」（用户要求）。
 ///   `Page::Replace` 这个**内部名字没动** —— 它对应的是"在正文里做替换"这份能力，
@@ -3380,17 +3381,16 @@ pub fn selftest(args: &[String]) -> i32 {
         app.wt.set_docs(PickDoc::Header, Vec::new());
     }
 
-    // 3.8) 新增的两页（页眉替换 / 打印与导出）骨架，外加页眉替换的**四种执行方式状态**：
-    //      引擎（纯 Rust / Word COM）× 落盘（写副本 / 就地覆盖），以及就地覆盖那张
-    //      确认框。**只是画，不触发任何动作**，所以无头环境、没装 Word 的机器上也能跑。
-    //      为什么要枚举这四种：2026-10-11 页眉替换改成"两条路都留着"之后，
-    //      每一条分支挂的控件不同（勾选框只在纯 Rust 下出现），而本机的合成鼠标
+    // 3.8) 新增的两页（页眉替换 / 打印与导出）骨架，外加页眉替换的**两种落盘状态**
+    //      （写副本 / 就地覆盖），以及就地覆盖那张确认框。**只是画，不触发任何动作**，
+    //      所以无头环境、没装 Word 的机器上也能跑。
+    //      为什么两种都要摆出来：就地覆盖那一档会多画一个确认框，而本机的合成鼠标
     //      事件进不到窗口（见 `diag` 模块头）—— 不在这里主动摆出每种组合、各画一帧，
     //      那些分支就永远没被渲染过，排版里的 panic 也就一路躲到用户手上才爆。
+    //      （引擎单选 2026-10-19 已随 COM 退役删除，这里不再遍历两套引擎。）
     //      塞几行假路径是为了让「已选文档」列表与计数这两种状态也画出来。
     let keep_page = app.page;
     let keep_hdr_mode = app.wt.hdr_mode;
-    let keep_engine = app.wt.hdr_engine;
     let keep_in_place = app.wt.hdr_in_place;
     let keep_confirm = app.wt.hdr_confirm;
     for (page, mode) in [
@@ -3406,15 +3406,12 @@ pub fn selftest(args: &[String]) -> i32 {
         app.wt.print_docs = (1..=3)
             .map(|i| format!("D:/wrepl-selftest/P{i}.docx"))
             .collect();
-        for engine in [Engine::Rust, Engine::Com] {
-            for in_place in [false, true] {
-                app.wt.hdr_engine = engine;
-                app.wt.hdr_in_place = in_place;
-                // 确认框只在"纯 Rust + 就地覆盖"这条路上出现
-                app.wt.hdr_confirm = in_place && engine == Engine::Rust;
-                for _ in 0..2 {
-                    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
-                }
+        for in_place in [false, true] {
+            app.wt.hdr_in_place = in_place;
+            // 确认框只在"就地覆盖"这条路上出现
+            app.wt.hdr_confirm = in_place;
+            for _ in 0..2 {
+                let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
             }
         }
     }
@@ -3483,12 +3480,11 @@ pub fn selftest(args: &[String]) -> i32 {
 
     app.page = keep_page;
     app.wt.hdr_mode = keep_hdr_mode;
-    app.wt.hdr_engine = keep_engine;
     app.wt.hdr_in_place = keep_in_place;
     app.wt.hdr_confirm = keep_confirm;
     app.wt.hdr_docs.clear();
     app.wt.print_docs.clear();
-    println!("  页眉替换（文本 / 图片 × 两种引擎 × 两种落盘 + 确认框）+ 打印与导出：布局通过");
+    println!("  页眉替换（文本 / 图片 × 两种落盘 + 确认框）+ 打印与导出：布局通过");
 
     // 3.8b) 自绘选择器里**只有浏览模式才有的**那套底部按钮：确定键是「打开」
     //       （选中文件才可按）、取消键是「关闭」（不是「取消」），而且**不摆**

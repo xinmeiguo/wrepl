@@ -59,38 +59,6 @@ pub enum HeaderMode {
     Image,
 }
 
-/// 页眉替换用哪套引擎。**两套都留着**（2026-10-11 定）：哪条路出问题就切另一条。
-///
-/// * 纯 Rust（[`crate::hdr`]）—— 与「批量替换」同一原理，不要求装 Word；
-///   按 `default` / `first` / `even` **三种页眉部件逐个**处理。
-/// * Word COM（[`super::services`]）—— 老路子，要求装 Microsoft Word，
-///   只写 **default（主页眉）这一个部件**。
-///
-/// ## ★ 容易读错的一句：\"只写主页眉部件\" ≠ \"首页不变\"
-///
-/// 两者是**两件事**，2026-10-11 xin 亲自试出来并纠正过我：
-///
-/// * **部件层面**：COM 只写 `headerReference type="default"` 指向的那个部件；
-///   `first` / `even` 两个部件它不碰。
-/// * **显示层面**：页面到底显示哪个部件，由 `w:titlePg`（首页不同）与
-///   `settings.xml` 的 `evenAndOddHeaders`（奇偶页不同）两个开关决定。
-///   **两个开关都没开时（这批模板的常态：实测 5 份 LYO 全是"否/否"），
-///   首页、奇数页、偶数页统统显示主页眉** —— 所以首页和偶数页上看到的
-///   就是替换后的新内容。
-///
-/// 只有"开关开着 **且** 对应部件里真有表格"时，两套引擎的结果才会不同；
-/// 而这批模板里 `first` / `even` 部件恰恰是空的（表格数 0），
-/// 纯 Rust 那套也是按"页眉里没有表格，未处理"跳过。
-///
-/// 为什么两套都留而不是二选一：COM 那套在报告"页眉替换没生效"时**看不到真实报错**
-/// （界面日志没落盘，见 [`WordTool::log`] 里新加的镜像），在没查清根因之前
-/// 把纯 Rust 定成唯一路径，等于把"能不能修好"押在我一个人身上。
-#[derive(PartialEq, Clone, Copy, Debug)]
-pub enum Engine {
-    Rust,
-    Com,
-}
-
 /// 「打印与导出」页的下游：送打印机，还是落成 PDF 文件。
 ///
 /// 两条路的输入完全一样（同一份文档清单、同一个「页码范围」字段），
@@ -151,7 +119,7 @@ struct PendingExport {
     pdf_a: bool,
 }
 
-/// 纯 Rust 引擎的落盘位置 —— 就一个勾选框，所以界面侧用 `bool` 就够
+/// 页眉替换的落盘位置 —— 就一个勾选框，所以界面侧用 `bool` 就够
 /// （见 [`WordTool::hdr_in_place`]），拼活的时候再翻成 [`hdr::Out`]。
 ///
 /// 为什么不直接存 `hdr::Out`：勾选框要的是 `&mut bool`，为它绕一层 enum
@@ -162,11 +130,11 @@ struct PendingExport {
 /// 为什么不是直接存闭包：闭包只能跑一次，而"就地覆盖"要先弹确认框、
 /// 用户点了确认才真跑 —— 中间隔着若干帧。所以这里存的是**参数**，
 /// 真要跑的时候现拼闭包（见 [`WordTool::spawn_job`]）。
-enum HeaderJob {
-    /// 纯 Rust：改什么 + 落哪
-    Rust(hdr::Action, hdr::Out),
-    /// Word COM：只需要知道是文本还是图片（落盘只有"就地"一种）
-    Com(HeaderMode),
+struct HeaderJob {
+    /// 改什么（文本 / 图片）
+    action: hdr::Action,
+    /// 落哪（就地覆盖 / 写到副本）
+    out: hdr::Out,
 }
 
 /// 后台线程回传的消息。
@@ -186,9 +154,7 @@ struct Task {
 pub struct WordTool {
     // ---------- 页眉替换 ----------
     pub hdr_mode: HeaderMode,
-    /// 用哪套引擎跑（纯 Rust / Word COM）。
-    pub hdr_engine: Engine,
-    /// 纯 Rust 引擎：直接改写源文件？（默认 **false = 写到源文件旁的 out 子目录**）
+    /// 直接改写源文件？（默认 **false = 写到源文件旁的 out 子目录**）
     ///
     /// 界面侧用 `bool` 而不是 `hdr::Out`：勾选框要的就是 `&mut bool`，
     /// 绕一层 enum 只会多出"两个真相"（勾选框与 enum 谁说了算）。
@@ -257,7 +223,6 @@ impl WordTool {
     pub fn new() -> Self {
         Self {
             hdr_mode: HeaderMode::Text,
-            hdr_engine: Engine::Rust,
             hdr_in_place: false,
             hdr_confirm: false,
             hdr_pending: None,
@@ -577,33 +542,20 @@ impl WordTool {
 
         ui.add_space(ds::SPACING.s4);
 
-        // ---- 卡片 3：执行方式（引擎 + 落盘）----
+        // ---- 卡片 3：落盘方式 ----
         //
         // 为什么把"改什么"和"怎么改"分开成两张卡：上面那张卡是内容（文本 / 图片），
-        // 这张是**手段**（哪个引擎跑、产物落哪）。两件事的"要不要动"彼此无关，
-        // 混在一张卡里会让人以为换引擎要重填内容。
+        // 这张是**手段**（产物落哪）。两件事的"要不要动"彼此无关，
+        // 混在一张卡里会让人以为换个落点要重填内容。
+        //
+        // 2026-10-19：引擎单选已删（Word COM 那条路退役，见 CHANGELOG），
+        // 这张卡只剩落盘一个勾选框。
         card(ui, |ui| {
-            card_title(ui, "执行方式");
-            ds::RadioGroup::new(&mut self.hdr_engine)
-                .horizontal()
-                .option(ds::RadioOption::new(Engine::Rust, "纯 Rust（不用装 Word）"))
-                .option(ds::RadioOption::new(Engine::Com, "Word COM（需装 Word）"))
-                .show(ui);
-            ui.add_space(ds::SPACING.s3);
-
-            // 两个档位各自的说明文字**一律不摆**（2026-10-11 xin 要求）：
-            // 「执行方式」只留选择项本身 —— 勾选框的标签已经把后果写在上面了。
-            match self.hdr_engine {
-                Engine::Rust => {
-                    ui.add(ds::Checkbox::with_label(
-                        &mut self.hdr_in_place,
-                        "直接改写源文件（不勾 = 写到源文件旁的 out 子目录）",
-                    ));
-                }
-                // COM 这一档**只有就地改写一种落盘**，没有可勾的选项，
-                // 所以这里什么都不画（引擎自身在本机装没装 Word，选了就知道）。
-                Engine::Com => {}
-            }
+            card_title(ui, "落盘方式");
+            ui.add(ds::Checkbox::with_label(
+                &mut self.hdr_in_place,
+                "直接改写源文件（不勾 = 写到源文件旁的 out 子目录）",
+            ));
         });
 
         ui.add_space(ds::SPACING.s4);
@@ -631,9 +583,9 @@ impl WordTool {
                 if clicked {
                     let job = self.build_job();
                     // 就地覆盖 = 唯一"可能弄坏源文件"的路径，先确认一次再跑。
-                    // 纯 Rust 那一档另外还有 self_check 兜底（写回原字节），
-                    // 但那是**出错时**的保护；确认框管的是"我确实要这个动作"。
-                    self.hdr_confirm = matches!(&job, HeaderJob::Rust(_, hdr::Out::InPlace));
+                    // 引擎内部还有 self_check 兜底（写回原字节），但那是**出错时**
+                    // 的保护；确认框管的是"我确实要这个动作"。
+                    self.hdr_confirm = matches!(job.out, hdr::Out::InPlace);
                     self.hdr_pending = Some(job);
                     if !self.hdr_confirm {
                         self.spawn_job();
@@ -655,79 +607,45 @@ impl WordTool {
     /// 动 `hdr_pending`：`build_job` 之后紧跟着就是"要不要先确认"的判断，
     /// 顺手把活存进去、又顺手跑掉，就会变成"确认框还没点、文件已经改了"。
     fn build_job(&self) -> HeaderJob {
-        match self.hdr_engine {
-            Engine::Rust => {
-                let action = match self.hdr_mode {
-                    HeaderMode::Text => hdr::Action::Text {
-                        en: self.text_en.clone(),
-                        cn: self.text_cn.clone(),
-                    },
-                    HeaderMode::Image => hdr::Action::Image {
-                        path: std::path::PathBuf::from(&self.img_path),
-                        scale_to_table: self.img_scale,
-                    },
-                };
-                let out = if self.hdr_in_place {
-                    hdr::Out::InPlace
-                } else {
-                    hdr::Out::SiblingOut
-                };
-                HeaderJob::Rust(action, out)
-            }
-            Engine::Com => HeaderJob::Com(self.hdr_mode),
-        }
+        let action = match self.hdr_mode {
+            HeaderMode::Text => hdr::Action::Text {
+                en: self.text_en.clone(),
+                cn: self.text_cn.clone(),
+            },
+            HeaderMode::Image => hdr::Action::Image {
+                path: std::path::PathBuf::from(&self.img_path),
+                scale_to_table: self.img_scale,
+            },
+        };
+        let out = if self.hdr_in_place {
+            hdr::Out::InPlace
+        } else {
+            hdr::Out::SiblingOut
+        };
+        HeaderJob { action, out }
     }
 
     /// 把 [`WordTool::hdr_pending`] 里那道活开跑。没有活就什么也不做。
     fn spawn_job(&mut self) {
-        let Some(job) = self.hdr_pending.take() else {
+        let Some(HeaderJob { action, out }) = self.hdr_pending.take() else {
             return;
         };
         let docs = self.hdr_docs.clone();
-        match job {
-            HeaderJob::Rust(action, out) => {
-                let kind = mode_cn(self.hdr_mode);
-                let verb = format!("页眉{kind}替换（纯 Rust）");
-                self.log(format!(
-                    "开始{verb}：{} 个文档；落盘：{}",
-                    docs.len(),
-                    match out {
-                        hdr::Out::InPlace => "就地覆盖源文件",
-                        hdr::Out::SiblingOut => "写到各源文件旁的 out 子目录（源文件不动）",
-                    }
-                ));
-                // ★ need_com = false：纯 Rust 不需要 Word，也不该因为
-                //   `CoInitializeEx` 失败而整趟不做。
-                self.start(&verb, false, move |log, prog| {
-                    hdr::run(&docs, &action, out, log, prog)
-                });
+        let kind = mode_cn(self.hdr_mode);
+        let verb = format!("页眉{kind}替换");
+        self.log(format!(
+            "开始{verb}：{} 个文档；落盘：{}",
+            docs.len(),
+            match out {
+                hdr::Out::InPlace => "就地覆盖源文件",
+                hdr::Out::SiblingOut => "写到各源文件旁的 out 子目录（源文件不动）",
             }
-            HeaderJob::Com(mode) => match mode {
-                HeaderMode::Text => {
-                    let (en, cn) = (self.text_en.clone(), self.text_cn.clone());
-                    self.log(format!(
-                        "开始页眉文本替换（Word COM）：{} 个文档；只写「主页眉」部件，\
-                         就地改写源文件（文档未启用首页不同/奇偶页不同时，\
-                         首页与偶数页显示的也是主页眉）",
-                        docs.len()
-                    ));
-                    self.start("页眉文本替换", true, move |log, prog| {
-                        services::text_replace_run(&docs, &en, &cn, log, prog)
-                    });
-                }
-                HeaderMode::Image => {
-                    let (img, scale) = (self.img_path.clone(), self.img_scale);
-                    self.log(format!(
-                        "开始页眉图片替换（Word COM）：{} 个文档；只写「主页眉」部件，\
-                         就地改写源文件",
-                        docs.len()
-                    ));
-                    self.start("页眉图片替换", true, move |log, prog| {
-                        services::image_replace_run(&docs, &img, scale, log, prog)
-                    });
-                }
-            },
-        }
+        ));
+        // ★ need_com = false：页眉替换不需要 Word，也不该因为
+        //   `CoInitializeEx` 失败而整趟不做。
+        self.start(&verb, false, move |log, prog| {
+            hdr::run(&docs, &action, out, log, prog)
+        });
     }
 
     /// 「就地覆盖」确认框。只做一件事：在真的动源文件之前停一下。
