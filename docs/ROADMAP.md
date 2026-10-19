@@ -232,6 +232,28 @@ PDF/A 的 XMP 为 `pdfaid:part=3 / conformance=B`。
 **没做**：多段页码（`1-3,5`）。`ExportAsFixedFormat` 一次只收一组起止页，多段要合并 PDF，
 而那需要 PDF 库（本项目零新依赖）。界面上**明确拒绝**并写清"删掉逗号、分几次导"。
 
+**为什么不用「打印到虚拟打印机」或「WPS 出 PDF」**（2026-10-19 实测，同一份
+`2026-009CE-FAT-附录`，三条路各跑一遍）：
+
+| 路径 | 产物 | 耗时 | 结论 |
+|---|---|---|---|
+| `ExportAsFixedFormat`（本产品） | 435 KB｜23 页｜`Tagged: yes` | 打开 1.4 s ＋ 导出 8.3 s | ✅ 采用 |
+| `PrintOut` → Microsoft Print to PDF | **一个字节都没生成** | 打印调用 8.3 s ＋ 等 30 s | ❌ 落不了盘 |
+| `PrintOut` → 导出为WPS PDF | **0 字节空文件** | 打印调用 9.7 s ＋ 等 30 s | ❌ 同上 |
+| WPS COM `KWPS.Application` 的 `ExportAsFixedFormat` | 251 KB｜**22 页**｜`Tagged: no` | 打开 0.8 s ＋ 导出 **1.3 s** | ⚠ 快，但见下 |
+
+- **打印路径拿不到完成信号**：`PrintOut` 默认异步，进的是假脱机队列。探针等了 30 秒
+  （体积连续不动也算完成），产物仍是空的 —— 批量里这不是"慢"，是**不可用**：
+  `run_on_documents` 会立刻关文档，Word/驱动直接把任务丢掉。
+- **WPS 每份都正好少 1 页**：FAT 23→22、PQ 10→9、SAT 27→26（**3/3 复现**），
+  页脚 `Page 页码 N of 23` 跟着变成 `of 22`；表格里"批准日期："的换行位置也变了。
+  差在**排版引擎**，不在参数 —— 所以调参数救不回来，也没有「WPS 兼容模式」这种折中。
+- 顺带确认本机 `Word.Application` 的 CLSID 仍指向真正的
+  `C:\Program Files\Microsoft Office\Root\Office16\WINWORD.EXE`，没被 WPS 劫持。
+- 复现命令：`wt_probe printers`、`wt_probe viaprint <目录> "<打印机名>" <docx>...`、
+  `wt_probe wps <目录> <docx>...`。
+
+
 **测试**：`wordtool/services.rs` 新增 7 条（页码解析 4 / 落点目录 1 / 扩展名替换 1 /
 撞名不覆盖 1），总数 59 → **66**。做过两轮阴性对照：同时改坏「逗号拒绝 / 写反不自动对调 /
 扩展名替换」→ 恰好 3 红、其余 62 全绿；把撞名循环改成 `2..2` → 撞名那条转红。

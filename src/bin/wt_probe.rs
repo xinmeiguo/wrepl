@@ -23,6 +23,11 @@
 //!                                            #   页码留空引号 `""` = 全部）
 //! wt_probe pdfa <输出目录|-> <页码范围> <docx>...   # 同上，但按 PDF/A 归档
 //! wt_probe perf <输出根目录> <docx>...       # 三档计时：现状 / 调优 / 调优+PDF/A
+//! wt_probe printers                          # 列出本机打印机（名 / 端口 / 默认）
+//! wt_probe viaprint <输出目录> <打印机名> <docx>...
+//!                                            # 走「打印到虚拟打印机」出 PDF，
+//!                                            # 用来和 ExportAsFixedFormat 对比
+//! wt_probe wps <输出目录> <docx>...          # 用 WPS 的 KWPS.Application 导，同上对比
 //! ```
 
 // 探针把 `wordtool` 的六个子模块**整套** `#[path]` 搬进来（只为让探针与产品
@@ -237,10 +242,175 @@ fn probe_read(path: &str) -> DispResult<()> {
     }
 }
 
+/// 等打印任务真正落地。
+///
+/// `PrintOut` 默认是**异步**的：调用立刻返回，文件此刻还不存在。拿不到完成信号
+/// 是打印路径最要命的一点 —— 批量里若不等就关文档，Word 直接把任务取消掉，
+/// 产物是 0 字节或者干脆没有。这里用「体积连续不动 + 后台队列清空」兜。
+unsafe fn wait_print_done(word: &com::Disp, out: &std::path::Path, limit_ms: u128) -> bool {
+    unsafe {
+        let t0 = std::time::Instant::now();
+        let mut last_size = u64::MAX;
+        let mut stable = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            if size > 0 && size == last_size {
+                stable += 1;
+                if stable >= 3 {
+                    return true; // 连续 600 ms 体积不动 = 写完了
+                }
+            } else {
+                stable = 0;
+            }
+            last_size = size;
+            if size > 0 {
+                if let Ok(v) = word.get("BackgroundPrintingStatus") {
+                    if let Ok(n) = com::res_i32(v) {
+                        if n == 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if t0.elapsed().as_millis() > limit_ms {
+                return false;
+            }
+        }
+    }
+}
+
+/// 走「打印到虚拟打印机」出 PDF。
+///
+/// 与 `ExportAsFixedFormat` 是两条完全不同的路：那条是 Word 自己的**发布**管线，
+/// 直接写 PDF；这条是把页面画成打印指令交给**打印机驱动**，由驱动落成 PDF。
+unsafe fn viaprint_pass(files: &[String], dir: &std::path::Path, printer: &str) -> DispResult<()> {
+    unsafe {
+        std::fs::create_dir_all(dir).ok();
+        // Word 的 ActivePrinter 收的是「名称 on 端口」，光给名字会被拒
+        let active = {
+            let list = printers::list().unwrap_or_default();
+            match list.iter().find(|p| p.name.eq_ignore_ascii_case(printer)) {
+                Some(p) => p.active_string(),
+                None => printer.to_string(),
+            }
+        };
+        println!("ActivePrinter = {active:?}");
+        let mut session = word_session::WordSession::create()?;
+        session.word.put("ActivePrinter", var_bstr(&active))?;
+        let docs = res_disp(session.word.get("Documents")?)?;
+        for f in files {
+            let name = f.rsplit(['\\', '/']).next().unwrap_or(f).to_string();
+            let stem = std::path::Path::new(f)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "document".to_string());
+            let out = dir.join(format!("{stem}.pdf"));
+            let t0 = std::time::Instant::now();
+            let doc = match docs
+                .call(
+                    "Open",
+                    vec![var_bstr(f), var_bool(false), var_bool(true), var_bool(false)],
+                )
+                .and_then(|v| res_disp(v))
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("  !! 打开失败 {name}：{e}");
+                    continue;
+                }
+            };
+            let t1 = std::time::Instant::now();
+            let printed = doc.call_named(
+                "PrintOut",
+                vec![
+                    ("Background", var_bool(false)),
+                    ("PrintToFile", var_bool(true)),
+                    ("OutputFileName", var_bstr(&out.to_string_lossy())),
+                ],
+            );
+            let t2 = std::time::Instant::now();
+            match printed {
+                Err(e) => println!("  !! PrintOut 失败 {name}：{e}"),
+                Ok(_) => {
+                    let done = wait_print_done(&session.word, &out, 30_000);
+                    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                    println!(
+                        "  {name}  打开 {} ms  打印 {} ms  落盘 {} 字节  完成={done}",
+                        (t1 - t0).as_millis(),
+                        (t2 - t1).as_millis(),
+                        size
+                    );
+                }
+            }
+            let _ = doc.callv("Close", vec![var_bool(false)]);
+        }
+        session.cleanup();
+        Ok(())
+    }
+}
+
+/// 用 WPS 的 COM（`KWPS.Application`）导一次 PDF。
+///
+/// 与 Word 是**两个不同的组件**：ProgID 不同、CLSID 不同、排版引擎也不同。
+/// 客户机器上常常只装 WPS，所以"能不能拿它顶替 Word"值得实测一次 ——
+/// 注意这里只验 `ExportAsFixedFormat` 这一个成员，不推广到别的 Word 成员。
+unsafe fn wps_pass(files: &[String], dir: &std::path::Path) -> Result<(), String> {
+    unsafe {
+        std::fs::create_dir_all(dir).ok();
+        let app = com::Disp::from_progid(windows::core::w!("KWPS.Application"))
+            .map_err(|e| format!("创建 KWPS.Application 失败：{e}"))?;
+        println!("KWPS.Application 已创建");
+        let _ = app.put("Visible", var_bool(false));
+        let _ = app.put("DisplayAlerts", var_i4(0));
+        let docs = res_disp(app.get("Documents").map_err(|e| format!("取 Documents 失败：{e}"))?)?;
+        for f in files {
+            let name = f.rsplit(['\\', '/']).next().unwrap_or(f).to_string();
+            let stem = std::path::Path::new(f)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "document".to_string());
+            let out = dir.join(format!("{stem}.pdf"));
+            let t0 = std::time::Instant::now();
+            let doc = match docs.call("Open", vec![var_bstr(f)]).and_then(|v| res_disp(v)) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("  !! 打开失败 {name}：{e}");
+                    continue;
+                }
+            };
+            let t1 = std::time::Instant::now();
+            let r = doc.call_named(
+                "ExportAsFixedFormat",
+                vec![
+                    ("OutputFileName", var_bstr(&out.to_string_lossy())),
+                    ("ExportFormat", var_i4(wd::EXPORT_FORMAT_PDF)),
+                    ("OpenAfterExport", var_bool(false)),
+                    ("OptimizeFor", var_i4(wd::EXPORT_OPTIMIZE_FOR_PRINT)),
+                ],
+            );
+            let t2 = std::time::Instant::now();
+            let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            match r {
+                Ok(_) => println!(
+                    "  {name}  打开 {} ms  导出 {} ms  产物 {} 字节",
+                    (t1 - t0).as_millis(),
+                    (t2 - t1).as_millis(),
+                    size
+                ),
+                Err(e) => println!("  !! WPS 导出失败 {name}：{e}"),
+            }
+            let _ = doc.callv("Close", vec![var_bool(false)]);
+        }
+        let _ = app.call_named("Quit", vec![("SaveChanges", var_i4(0))]);
+        Ok(())
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() < 2 {
-        eprintln!("用法：wt_probe <read|text|image|pdf|pdfa> <docx>...");
+    if args.is_empty() {
+        eprintln!("用法：wt_probe <read|text|image|pdf|pdfa|perf|printers|viaprint> <docx>...");
         std::process::exit(2);
     }
     let mode = args[0].clone();
@@ -264,6 +434,66 @@ fn main() {
                     eprintln!("!! 探针出错 {d}：{e}");
                 }
             }
+            return 0;
+        }
+
+        // 列本机打印机：打印路径能不能用，先看有没有驱动可打
+        if mode == "printers" {
+            match printers::list() {
+                Ok(list) if list.is_empty() => println!("（本机没有任何打印机）"),
+                Ok(list) => {
+                    for p in list {
+                        println!(
+                            "{}  {}{}",
+                            if p.is_default { "*" } else { " " },
+                            p.name,
+                            if p.port.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  on {}", p.port)
+                            }
+                        );
+                    }
+                }
+                Err(e) => eprintln!("!! 枚举失败：{e}"),
+            }
+            drop(init);
+            return 0;
+        }
+
+        // WPS 的 COM 导 PDF（对比用）
+        if mode == "wps" {
+            let out = docs.first().cloned().unwrap_or_default();
+            let files: Vec<String> = docs.iter().skip(1).cloned().collect();
+            if files.is_empty() {
+                eprintln!("用法：wt_probe wps <输出目录> <docx>...");
+                return 2;
+            }
+            let r = unsafe { wps_pass(&files, std::path::Path::new(&out)) };
+            if let Err(e) = r {
+                eprintln!("!! {e}");
+                drop(init);
+                return 1;
+            }
+            drop(init);
+            return 0;
+        }
+
+        // 打印到虚拟打印机（对比用）
+        if mode == "viaprint" {
+            let out = docs.first().cloned().unwrap_or_default();
+            let printer = docs.get(1).cloned().unwrap_or_default();
+            let files: Vec<String> = docs.iter().skip(2).cloned().collect();
+            if files.is_empty() {
+                eprintln!("用法：wt_probe viaprint <输出目录> <打印机名> <docx>...");
+                return 2;
+            }
+            if let Err(e) = unsafe { viaprint_pass(&files, std::path::Path::new(&out), &printer) } {
+                eprintln!("!! 打印失败：{e}");
+                drop(init);
+                return 1;
+            }
+            drop(init);
             return 0;
         }
 
