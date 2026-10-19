@@ -30,6 +30,7 @@
 //! 页眉替换加了引擎开关与落盘开关，并把界面日志镜像进诊断日志。
 
 pub mod com;
+pub mod engine;
 pub mod locator;
 pub mod printers;
 pub mod services;

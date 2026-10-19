@@ -2,6 +2,7 @@
 //! 晚期绑定（ProgID + IDispatch），不依赖任何类型库，适用于所有 Office 版本。
 
 use super::com::{Disp, DispResult, var_bool, var_bstr, var_i4};
+use super::engine::WordKind;
 use super::wd;
 use windows::core::w;
 
@@ -12,7 +13,18 @@ pub struct WordSession {
 impl WordSession {
     /// 创建独立、不可见、禁宏、关屏刷的 Word 实例。
     pub fn create() -> DispResult<Self> {
-        let w = Disp::from_progid(w!("Word.Application"))?;
+        Self::create_as(WordKind::Word)
+    }
+
+    /// 同上，但按 [`WordKind`] 选组件：真 Word 走 `Word.Application`，
+    /// WPS 走 `KWPS.Application`。**其余设置完全一致** —— 两条路都会给
+    /// `Visible=false` / `DisplayAlerts=none` / `AutomationSecurity=禁宏`。
+    pub fn create_as(kind: WordKind) -> DispResult<Self> {
+        let progid = match kind {
+            WordKind::Word => w!("Word.Application"),
+            WordKind::Wps => w!("KWPS.Application"),
+        };
+        let w = Disp::from_progid(progid)?;
         unsafe {
             w.put("Visible", var_bool(false))?;
             w.put("DisplayAlerts", var_i4(wd::ALERTS_NONE))?;
@@ -53,6 +65,7 @@ fn file_name(p: &str) -> &str {
 /// * 返回 `Ok(Some(备注))` 时，备注会接在 `"{done_verb}：文件名"` 后面一起写进日志
 ///   （导出 PDF 用它报产物落到哪、有没有因为撞名改存）。普通动作返回 `Ok(None)`。
 pub fn run_on_documents<F>(
+    kind: WordKind,
     doc_paths: &[String],
     action: F,
     log: &mut dyn FnMut(String),
@@ -63,10 +76,10 @@ pub fn run_on_documents<F>(
 where
     F: Fn(&Disp, &str) -> DispResult<Option<String>>,
 {
-    let mut session = match WordSession::create() {
+    let mut session = match WordSession::create_as(kind) {
         Ok(s) => s,
         Err(e) => {
-            log(format!("启动 Word 失败：{e}"));
+            log(format!("启动 {} 失败：{e}", kind.label_cn()));
             return (0, doc_paths.len() as i32);
         }
     };
@@ -84,6 +97,11 @@ where
 }
 
 /// 与 [`run_on_documents`] 相同，但整批跑在**指定打印机**上。
+///
+/// 这一条**始终用 Microsoft Word**（[`WordKind::Word`]）：WPS 的 `PrintOut`
+/// 没有实测过，而"打到纸上"是不可撤销的动作，不能拿没验过的路径去赌。
+/// 只有 WPS 的机器上，界面会把「打印机」这一档直接拦下来并提示改走导出，见
+/// [`super::engine::PRINT_NEEDS_WORD`]。
 ///
 /// `printer` 是 `None` 就等价于 `run_on_documents`（用系统默认那台）。
 /// 给了就先把 Word 的 `ActivePrinter` 切过去，**整批跑完再恢复原样** ——

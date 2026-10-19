@@ -253,6 +253,13 @@ PDF/A 的 XMP 为 `pdfaid:part=3 / conformance=B`。
 - 复现命令：`wt_probe printers`、`wt_probe viaprint <目录> "<打印机名>" <docx>...`、
   `wt_probe wps <目录> <docx>...`。
 
+**没装 Word 的机器**：不静默降级 —— 判定引擎（`wordtool::engine`，查
+`Word.Application` 的 CLSID 落到哪个 exe，防 WPS 冒名）→ 只有 WPS 时页面顶部亮黄条、
+点「导出 PDF」再弹确认框（正文写的是"每份少 1 页、23→22"这些实测数字）→ 点过才用
+`KWPS.Application` 跑。**打印不降级**：WPS 的 `PrintOut` 没实测过，打错纸不可撤销。
+端到端验证用 `wt_probe pdfwps <目录> <页码范围> <docx>...`（走产品同一个
+`export_pdf_run`，只换引擎）。明细见 `CHANGELOG.md` 同名小节。
+
 
 **测试**：`wordtool/services.rs` 新增 7 条（页码解析 4 / 落点目录 1 / 扩展名替换 1 /
 撞名不覆盖 1），总数 59 → **66**。做过两轮阴性对照：同时改坏「逗号拒绝 / 写反不自动对调 /
@@ -413,7 +420,7 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 | # | 项 |
 |---|---|
 | 5.1 | ~~仓库根混着 `regress-group19.py`(10 KB)、`run_regress.py`~~ **已处理（2026-10-13）**：`run_regress.py` 是本机专用包装（写死 Git Bash 绝对路径与 `D:/test` 工作目录），已移出仓库到 `D:/test/wrepl-local/` 并加 `.gitignore`。`regress-group19.py` **保留在仓库根** —— 它被 `regress.sh` 按 `$SRC/regress-group19.py` 引用（`SRC` 默认值就是仓库根），移走会让第 19 组直接报红 |
-| 5.2 | ~~测试覆盖不均~~ **部分处理（2026-10-13）**：`app.rs` 末尾已补 **39 条**单元测试 —— 拖放落点 / 输出模式 / 路径计算 / 日志裁剪 / 规则构建 / 预置模式，外加无窗口帧循环冒烟与 `Ctrl+O` 按页分发（合成按键）。同日晚些时候又给诊断路径补了 10 条（`diag.rs` 7：日志收词规则 `放行` 三分支、"确证原因后不再并列可能"的弹窗文案；`main.rs` 3：`是缺_opengl` 的认与不认）。`cargo test --features gui --offline --bin wrepl-gui` → **59 项全过**（app.rs 39 + picker.rs 10 + diag.rs 7 + main.rs 3），0.6 秒；做过阴性对照（改坏被测逻辑，对应断言立刻转红）。2026-10-19 导出 PDF 又补 7 条（`wordtool/services.rs`：页码解析 4 / 落点目录 1 / 扩展名替换 1 / 撞名不覆盖 1），总数 **66**。**仍未覆盖**：`wordtool/` 的 COM 部分（走 Word，本机没装 Word 跑不了）、`app.rs` 的执行链路（`start_run` / `run_blocking` / `write_report`，要真实语料）、界面布局细节（归 `--selftest`） |
+| 5.2 | ~~测试覆盖不均~~ **部分处理（2026-10-13）**：`app.rs` 末尾已补 **39 条**单元测试 —— 拖放落点 / 输出模式 / 路径计算 / 日志裁剪 / 规则构建 / 预置模式，外加无窗口帧循环冒烟与 `Ctrl+O` 按页分发（合成按键）。同日晚些时候又给诊断路径补了 10 条（`diag.rs` 7：日志收词规则 `放行` 三分支、"确证原因后不再并列可能"的弹窗文案；`main.rs` 3：`是缺_opengl` 的认与不认）。`cargo test --features gui --offline --bin wrepl-gui` → **59 项全过**（app.rs 39 + picker.rs 10 + diag.rs 7 + main.rs 3），0.6 秒；做过阴性对照（改坏被测逻辑，对应断言立刻转红）。2026-10-19 导出 PDF 又补 7 条（`wordtool/services.rs`：页码解析 4 / 落点目录 1 / 扩展名替换 1 / 撞名不覆盖 1）；同日 WPS 降级再补 11 条（`wordtool/engine.rs` 6：三种判定 + WPS 冒充 Word + 命令行解析 + 确认框文案；`wordtool/ui.rs` 5：`plan_click` 的四条分支 + 有 Word 时不许打扰），总数 **77**。**仍未覆盖**：`wordtool/` 的 COM 部分（走 Word，本机没装 Word 跑不了）、`app.rs` 的执行链路（`start_run` / `run_blocking` / `write_report`，要真实语料）、界面布局细节（归 `--selftest`） |
 | 5.3 | 版本语义：0.4.1 带进了 `src/hdr.rs`（2591 行）整套引擎，严格讲够 minor。**不回改**，但以后新增整套引擎时按 minor 走。★ 原注写的"tag 已发"是**错的** —— `v0.4.1` 当时只提交未推送，实际到 2026-10-13 才与 `v0.4.2` 同期补发（见 CHANGELOG 0.4.1 的「发版记录」） |
 | 5.4 | ~~`regress.sh` 的可移植性是半成品~~ **已处理（2026-10-13）**：① 第 4 组的 `CHSRC` 曾**写死**成 `D:/test/regress/CH-charref.docx` —— 全脚本唯一一处不可覆盖的输入，外人配齐语料也照红；现提成 `${WREPL_CHSRC:-}`。② `run_option_matrix.py`（第 3 组）只活在某个 WorkBuddy 会话目录里、不在仓库 —— 它其实**完全通用**（无客户数据、无本机路径），已收进仓库根。③ 新增 `skip()` 语义：可选夹具（`CORPUS_BASELINE` / `MATRIX` / `CHSRC`）缺了打印黄色 `−`、计入「跳过」、**不算失败**，让 clone 后的人能分清"我缺数据"和"代码坏了"。分界原则写进 `CONTRIBUTING` §3.1：**逻辑入库、夹具自备** |
 

@@ -3449,6 +3449,38 @@ pub fn selftest(args: &[String]) -> i32 {
     app.wt.pdf_a = keep_pdf_a;
     println!("  打印与导出（打印机 / PDF / PDF-A / 页码写错）：布局通过");
 
+    // 3.8d) 引擎不是真 Word 的那两种状态：① 只有 WPS —— 页面顶部多一条常驻
+    //       黄色横幅、执行卡片里多一行拒绝理由（打印那档）、点导出会弹确认框；
+    //       ② 两样都没装 —— 红色横幅 + 两条下游都灰。
+    //       `wps_confirm` 是 `pub` 就是为了这里：合成鼠标事件进不到窗口
+    //       （见 `diag` 模块头的说明），不主动置上，弹窗那一帧永远渲染不到。
+    let keep_probe = app.wt.engine;
+    let keep_wps_confirm = app.wt.wps_confirm;
+    for probe in [
+        crate::wordtool::engine::EngineProbe::WpsOnly,
+        crate::wordtool::engine::EngineProbe::None,
+    ] {
+        app.wt.engine = Some(probe);
+        for sink in [Sink::Printer, Sink::Pdf] {
+            app.wt.sink = sink;
+            app.wt.page_range = String::new();
+            for _ in 0..2 {
+                let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
+            }
+        }
+        // 只有 WPS 时还会弹确认框 —— 单独照一帧
+        app.wt.sink = Sink::Pdf;
+        app.wt.wps_confirm = probe == crate::wordtool::engine::EngineProbe::WpsOnly;
+        for _ in 0..2 {
+            let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
+        }
+        app.wt.wps_confirm = false;
+    }
+    app.wt.engine = keep_probe;
+    app.wt.wps_confirm = keep_wps_confirm;
+    app.wt.sink = keep_sink;
+    println!("  打印与导出（只有 WPS / 什么都没装 / WPS 确认框）：布局通过");
+
     app.page = keep_page;
     app.wt.hdr_mode = keep_hdr_mode;
     app.wt.hdr_engine = keep_engine;

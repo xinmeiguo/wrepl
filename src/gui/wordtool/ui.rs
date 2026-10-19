@@ -30,6 +30,7 @@ use crate::ds;
 use wrepl::hdr;
 
 use super::com::ComInit;
+use super::engine::{self, EngineProbe, WordKind};
 use super::printers::{self, Printer};
 use super::services;
 
@@ -105,6 +106,49 @@ pub enum Engine {
 pub enum Sink {
     Printer,
     Pdf,
+}
+
+/// 点「执行」这一刻该怎么走。**纯判断，不碰 Word、不碰界面状态** ——
+/// 所以能直接对着假数据测，不需要开窗（见本文件末尾的测试）。
+///
+/// 这个枚举存在的理由：引擎探测（[`engine`]）与界面动作之间必须有一道
+/// **显式**的分叉。"偷偷降级"正是要防的东西，把它写成一个类型，
+/// 就没有地方能"顺手"绕过去。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClickPlan {
+    /// 照常跑，用这个引擎。
+    Run(WordKind),
+    /// 只有 WPS：**先弹确认框**，使用者点过才跑。
+    ConfirmWps,
+    /// 这条下游干不了，附一句人话说明。
+    Blocked(&'static str),
+}
+
+/// 决策：这一档下游 + 本机引擎状况 → 该怎么走。
+///
+/// 打印**不接受** WPS 降级：WPS 的 `PrintOut` 没实测过，而"打到纸上"不可撤销。
+/// 导出接受，但必须先确认（分页会变，见 [`engine::WPS_CONFIRM_BODY`]）。
+pub fn plan_click(sink: Sink, probe: EngineProbe) -> ClickPlan {
+    match (sink, probe) {
+        // 有真 Word：一切照旧，一个字都不提示
+        (_, EngineProbe::Word) => ClickPlan::Run(WordKind::Word),
+        // 只有 WPS：导出问一声，打印直接拦
+        (Sink::Pdf, EngineProbe::WpsOnly) => ClickPlan::ConfirmWps,
+        (Sink::Printer, EngineProbe::WpsOnly) => ClickPlan::Blocked(engine::PRINT_NEEDS_WORD),
+        // 什么都没有
+        (_, EngineProbe::None) => ClickPlan::Blocked(engine::NO_ENGINE),
+    }
+}
+
+/// 确认框点「继续」之后要跑的那一趟。
+///
+/// 为什么把参数**先落定**再弹框：确认框和点击之间隔着若干帧，这期间用户
+/// 可能切了页码、改了输出目录。若等确认后再从界面读，跑的就是"另一趟活"了。
+struct PendingExport {
+    docs: Vec<String>,
+    out: Option<std::path::PathBuf>,
+    pages: services::PdfPages,
+    pdf_a: bool,
 }
 
 /// 纯 Rust 引擎的落盘位置 —— 就一个勾选框，所以界面侧用 `bool` 就够
@@ -184,6 +228,16 @@ pub struct WordTool {
     /// 枚举打印机失败的原因（显示在页面上，而不是让下拉框空着让人猜）。
     pub printers_err: Option<String>,
     printers_loaded: bool,
+    /// 本机能用哪套 Word 兼容引擎。**进本页时探一次**（只读注册表，几微秒），
+    /// `None` = 还没探过。装了 Office 之后可以用「重新检测」刷新。
+    pub engine: Option<EngineProbe>,
+    /// 「改用 WPS 导出」的确认框是否打开。
+    ///
+    /// `pub` 是为了让无头自检能把这一帧照下来 —— 本机的合成鼠标事件进不到
+    /// 窗口，不主动置上就永远渲染不到这个弹窗。
+    pub wps_confirm: bool,
+    /// 确认后要跑的那一趟（点「继续」时取走）。见 [`PendingExport`]。
+    wps_pending: Option<PendingExport>,
     // ---------- 共享 ----------
     pub log: Vec<String>,
     /// 「选择文档」的待办，由 `App` 每帧取走（见 [`PickDoc`]）。
@@ -221,6 +275,9 @@ impl WordTool {
             printer_pick: 0,
             printers_err: None,
             printers_loaded: false,
+            engine: None,
+            wps_confirm: false,
+            wps_pending: None,
             log: Vec::new(),
             want_pick: None,
             task: None,
@@ -709,6 +766,12 @@ impl WordTool {
         if !self.printers_loaded {
             self.reload_printers();
         }
+        // 引擎同样只探一次：**只读注册表**，不启动 Word / WPS，几微秒返回。
+        // 装了 Office 之后由卡片上那个「重新检测」刷新。
+        if self.engine.is_none() {
+            self.engine = Some(engine_override().unwrap_or_else(EngineProbe::detect));
+        }
+        let probe = self.engine.unwrap_or(EngineProbe::None);
         let busy = self.busy();
 
         // ---- 卡片 1：文档 ----
@@ -739,6 +802,40 @@ impl WordTool {
             ui.add_space(ds::SPACING.s3);
             doc_list(ui, "wt_doc_scroll_p", &self.print_docs);
         });
+
+        // ---- 引擎状况：只在"不是真 Word"时出现 ----
+        //
+        // 有 Word 的机器上**一个字都不多写** —— 提示只该出现在真需要判断的地方。
+        if probe != EngineProbe::Word {
+            ui.add_space(ds::SPACING.s4);
+            card(ui, |ui| {
+                let (level, body) = match probe {
+                    EngineProbe::WpsOnly => (ds::Level::Warning, engine::WPS_ONLY_BANNER),
+                    _ => (ds::Level::Error, engine::NO_ENGINE),
+                };
+                ui.add(ds::Alert::new(level, body));
+                ui.add_space(ds::SPACING.s2);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            ds::Button::ghost("重新检测")
+                                .leading(ds::Icon::Refresh)
+                                .disabled(busy),
+                        )
+                        .on_hover_text("刚装完 Office / WPS 时点一下，不必重启程序")
+                        .clicked()
+                    {
+                        self.engine = Some(EngineProbe::detect());
+                    }
+                    let pal = ds::palette_of(ui.ctx());
+                    ui.label(
+                        RichText::new(format!("当前判定：{}", probe.label_cn()))
+                            .text_style(egui::TextStyle::Small)
+                            .color(pal.text_secondary),
+                    );
+                });
+            });
+        }
 
         ui.add_space(ds::SPACING.s4);
 
@@ -877,8 +974,22 @@ impl WordTool {
             Sink::Printer => true,
             Sink::Pdf => services::parse_pdf_pages(&self.page_range).is_ok(),
         };
-        let can = !busy && !self.print_docs.is_empty() && pages_ok;
+        let plan = plan_click(self.sink, probe);
+        // 引擎干不了这一档（只有 WPS 却要打印 / 两样都没装）时，按钮也要灰掉 ——
+        // 让它可点、点完只写一行日志，比直接灰掉更让人困惑。
+        let can = !busy && !self.print_docs.is_empty() && pages_ok
+            && !matches!(plan, ClickPlan::Blocked(_));
         card(ui, |ui| {
+            // 灰着的按钮不说话最招人烦：把原因先摆在按钮上面。
+            if let ClickPlan::Blocked(why) = plan {
+                let pal = ds::palette_of(ui.ctx());
+                ui.label(
+                    RichText::new(format!("× {why}"))
+                        .text_style(egui::TextStyle::Small)
+                        .color(pal.error),
+                );
+                ui.add_space(ds::SPACING.s2);
+            }
             ui.horizontal(|ui| {
                 // 一屏仍然只有一个 primary —— 换下游只换措辞与图标。
                 let (action_label, action_icon) = match self.sink {
@@ -899,72 +1010,21 @@ impl WordTool {
                     )
                     .clicked();
                 if clicked {
-                    let docs = self.print_docs.clone();
-                    match self.sink {
-                        Sink::Printer => {
-                            let range = self.page_range.trim().to_string();
-                            // 打印机字符串在这里定下来（"名称 on 端口"）——
-                            // 线程里不再碰 UI 状态。
-                            let printer = self
-                                .selected_printer()
-                                .map(|p| p.active_string())
-                                .filter(|s| !s.is_empty());
-                            self.log(format!(
-                                "开始打印：{} 个文档（{}）",
-                                docs.len(),
-                                match &printer {
-                                    Some(p) => format!("打印机 {p}"),
-                                    None => "默认打印机".to_string(),
-                                }
-                            ));
-                            self.start("打印", true, move |log, prog| {
-                                services::print_run(&docs, &range, printer.as_deref(), log, prog)
-                            });
+                    // 引擎分叉**只有这一处**：有 Word 就照旧，只有 WPS 就先问，
+                    // 什么都没有就明说。判断逻辑在 `plan_click` 里，能单测。
+                    match plan_click(self.sink, probe) {
+                        ClickPlan::Blocked(why) => {
+                            self.log(format!("没有执行：{why}"));
                         }
-                        Sink::Pdf => {
-                            // 按钮在解析失败时本来就是灰的，这里再守一道：
-                            // 界面状态与点击之间隔着若干帧，别指望它一定同步。
-                            let pages = match services::parse_pdf_pages(&self.page_range) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    self.log(format!("页码范围不能用，已停止：{e}"));
-                                    return;
-                                }
-                            };
-                            let dir = self.pdf_dir.trim().to_string();
-                            let out = if dir.is_empty() {
-                                None
-                            } else {
-                                Some(std::path::PathBuf::from(&dir))
-                            };
-                            let where_txt = if dir.is_empty() {
-                                "每份文档旁的 pdf 子目录".to_string()
-                            } else {
-                                dir.clone()
-                            };
-                            self.log(format!(
-                                "开始导出 PDF：{} 个文档（{}；输出到 {}；{}）",
-                                docs.len(),
-                                pages.describe(),
-                                where_txt,
-                                if self.pdf_a {
-                                    "PDF/A 归档格式"
-                                } else {
-                                    "标准 PDF"
-                                }
-                            ));
-                            let pdf_a = self.pdf_a;
-                            self.start("导出 PDF", true, move |log, prog| {
-                                services::export_pdf_run(
-                                    &docs,
-                                    out.as_deref(),
-                                    pages,
-                                    pdf_a,
-                                    log,
-                                    prog,
-                                )
-                            });
+                        ClickPlan::ConfirmWps => {
+                            // 走到这里一定是「导出 PDF + 只有 WPS」——
+                            // 打印那一档已被 `plan_click` 拦在外面。
+                            self.stage_wps_export();
                         }
+                        ClickPlan::Run(kind) => match self.sink {
+                            Sink::Printer => self.launch_print(),
+                            Sink::Pdf => self.launch_export(kind),
+                        },
                     }
                 }
                 ui.add_space(ds::SPACING.s4);
@@ -974,6 +1034,142 @@ impl WordTool {
 
         ui.add_space(ds::SPACING.s4);
         self.log_section(ui);
+
+        // 确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
+        self.wps_confirm_dialog(ui.ctx());
+    }
+
+    // ---------- 打印与导出：三条出口 ----------
+
+    /// 「打印机」这一档开跑。只有真 Word 会走到这里（见 [`plan_click`]）——
+    /// WPS 的 `PrintOut` 没实测过，而"打到纸上"不可撤销，不赌。
+    fn launch_print(&mut self) {
+        let docs = self.print_docs.clone();
+        let range = self.page_range.trim().to_string();
+        // 打印机字符串在这里定下来（"名称 on 端口"）—— 线程里不再碰 UI 状态。
+        let printer = self
+            .selected_printer()
+            .map(|p| p.active_string())
+            .filter(|s| !s.is_empty());
+        self.log(format!(
+            "开始打印：{} 个文档（{}）",
+            docs.len(),
+            match &printer {
+                Some(p) => format!("打印机 {p}"),
+                None => "默认打印机".to_string(),
+            }
+        ));
+        self.start("打印", true, move |log, prog| {
+            services::print_run(&docs, &range, printer.as_deref(), log, prog)
+        });
+    }
+
+    /// 「导出 PDF」这一档开跑（真 Word，或使用者已经在确认框里点过"继续"）。
+    fn launch_export(&mut self, kind: WordKind) {
+        // 按钮在解析失败时本来就是灰的，这里再守一道：
+        // 界面状态与点击之间隔着若干帧，别指望它一定同步。
+        let pages = match services::parse_pdf_pages(&self.page_range) {
+            Ok(p) => p,
+            Err(e) => {
+                self.log(format!("页码范围不能用，已停止：{e}"));
+                return;
+            }
+        };
+        let job = self.pending_from_ui(pages);
+        self.log(format!(
+            "开始导出 PDF：{} 个文档（{}；输出到 {}；{}；{}）",
+            job.docs.len(),
+            job.pages.describe(),
+            where_text(&job.out),
+            if job.pdf_a {
+                "PDF/A 归档格式"
+            } else {
+                "标准 PDF"
+            },
+            kind.label_cn(),
+        ));
+        self.run_export(job, kind);
+    }
+
+    /// 只有 WPS 时：把这一趟的参数**定住**、打开确认框 —— **不跑**。
+    ///
+    /// 为什么不在确认后再从界面读参数：确认框与点击之间隔着若干帧，
+    /// 这期间用户可能改了页码或输出目录，那样跑的就是"另一趟活"了。
+    fn stage_wps_export(&mut self) {
+        let pages = match services::parse_pdf_pages(&self.page_range) {
+            Ok(p) => p,
+            Err(e) => {
+                self.log(format!("页码范围不能用，已停止：{e}"));
+                return;
+            }
+        };
+        let job = self.pending_from_ui(pages);
+        self.log(format!(
+            "已暂停：本机没有 Microsoft Word，等待确认是否改用 WPS 导出\
+             （{} 个文档；{}；输出到 {}）",
+            job.docs.len(),
+            job.pages.describe(),
+            where_text(&job.out),
+        ));
+        self.wps_pending = Some(job);
+        self.wps_confirm = true;
+    }
+
+    /// 从界面当前状态摘出这一趟的参数（不启动任何任务）。
+    fn pending_from_ui(&self, pages: services::PdfPages) -> PendingExport {
+        let dir = self.pdf_dir.trim().to_string();
+        PendingExport {
+            docs: self.print_docs.clone(),
+            out: if dir.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&dir))
+            },
+            pages,
+            pdf_a: self.pdf_a,
+        }
+    }
+
+    /// 真正把导出丢进后台线程。**两条入口共用**（直接跑 / 确认后跑），
+    /// 免得"确认后跑"那条悄悄少一个参数。
+    fn run_export(&mut self, job: PendingExport, kind: WordKind) {
+        let PendingExport {
+            docs,
+            out,
+            pages,
+            pdf_a,
+        } = job;
+        self.start("导出 PDF", true, move |log, prog| {
+            services::export_pdf_run(&docs, out.as_deref(), pages, pdf_a, kind, log, prog)
+        });
+    }
+
+    /// 「改用 WPS 导出」的确认框。
+    fn wps_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.wps_confirm {
+            return;
+        }
+        match ds::ConfirmDialog::new("本机没有 Microsoft Word，改用 WPS 导出？", engine::WPS_CONFIRM_BODY)
+            .danger()
+            .confirm_label("仍要导出（分页会变）")
+            .cancel_label("取消")
+            .show(ctx)
+        {
+            // 先关框、再开跑，否则下一帧还会画这个确认框。
+            Some(true) => {
+                self.wps_confirm = false;
+                if let Some(job) = self.wps_pending.take() {
+                    self.log("已确认：改用 WPS 文字排版导出。交付前请逐份核对页数与页码。".to_string());
+                    self.run_export(job, WordKind::Wps);
+                }
+            }
+            Some(false) => {
+                self.wps_confirm = false;
+                self.wps_pending = None;
+                self.log("已取消：没有导出。要拿到与 Word 一致的 PDF，请先安装 Microsoft Word。".to_string());
+            }
+            None => {}
+        }
     }
 
     // ==================== 共享：进度 / 结果 / 日志 ====================
@@ -1206,4 +1402,79 @@ fn doc_list(ui: &mut egui::Ui, id: &str, docs: &[String]) {
 /// 取文件名（去掉路径）。
 fn file_name(p: &str) -> String {
     p.rsplit(['\\', '/']).next().unwrap_or(p).to_string()
+}
+
+/// 输出目录的人话描述（留空 = 跟着源文件走）。日志里用。
+fn where_text(out: &Option<std::path::PathBuf>) -> String {
+    match out {
+        Some(p) => p.display().to_string(),
+        None => "每份文档旁的 pdf 子目录".to_string(),
+    }
+}
+
+/// 诊断开关：`WREPL_DEBUG_ENGINE=wps|none|word` 强制指定引擎判定。
+///
+/// 只为一种场景存在：**手上这台机器装了 Word，却要看"只有 WPS"时的界面长什么样**
+/// （截图、演示、给客户说明）。真机上永远走 [`EngineProbe::detect`]。
+/// 与既有的 `WREPL_DEBUG_PAGE` / `WREPL_DEBUG_PICKER` 同类。
+fn engine_override() -> Option<EngineProbe> {
+    let v = std::env::var("WREPL_DEBUG_ENGINE").ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "wps" => Some(EngineProbe::WpsOnly),
+        "none" => Some(EngineProbe::None),
+        "word" => Some(EngineProbe::Word),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 有真 Word：导出照旧，不需要任何确认。
+    #[test]
+    fn word_engine_exports_without_asking() {
+        assert_eq!(
+            plan_click(Sink::Pdf, EngineProbe::Word),
+            ClickPlan::Run(WordKind::Word)
+        );
+    }
+
+    /// ★ 只有 WPS：**必须**先问一声，不许直接跑。
+    #[test]
+    fn wps_engine_asks_before_exporting() {
+        assert_eq!(
+            plan_click(Sink::Pdf, EngineProbe::WpsOnly),
+            ClickPlan::ConfirmWps
+        );
+    }
+
+    /// 只有 WPS 时打印直接拦下来 —— 打错机器/打出错件的代价不可撤销。
+    #[test]
+    fn wps_engine_blocks_printing() {
+        match plan_click(Sink::Printer, EngineProbe::WpsOnly) {
+            ClickPlan::Blocked(why) => assert!(why.contains("Microsoft Word"), "{why}"),
+            other => panic!("只有 WPS 时打印不该放行，实际：{other:?}"),
+        }
+    }
+
+    /// 两样都没装：两条下游都拦，且理由指向"装一个"。
+    #[test]
+    fn no_engine_blocks_both() {
+        for sink in [Sink::Printer, Sink::Pdf] {
+            match plan_click(sink, EngineProbe::None) {
+                ClickPlan::Blocked(why) => assert!(why.contains("装"), "{why}"),
+                other => panic!("什么都没装却放行了 {sink:?}：{other:?}"),
+            }
+        }
+    }
+
+    /// 有 Word 的机器上，打印**永远不会**走到确认框 —— 别把日常路径也拦一下。
+    #[test]
+    fn word_engine_prints_directly() {
+        assert_eq!(
+            plan_click(Sink::Printer, EngineProbe::Word),
+            ClickPlan::Run(WordKind::Word)
+        );
+    }
 }

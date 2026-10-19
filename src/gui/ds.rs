@@ -29,8 +29,8 @@ use egui_sauge::{Density, Locale, Palette};
 
 // 组件与令牌按需再导出，`app.rs` 只 `use crate::ds::…` 一处。
 pub use egui_sauge::components::{
-    Button, ButtonSize, Card, Checkbox, ConfirmDialog, InputField, NavItem, ProgressBar, RadioGroup,
-    RadioOption, SelectField,
+    Alert, Button, ButtonSize, Card, Checkbox, ConfirmDialog, InputField, Level, NavItem,
+    ProgressBar, RadioGroup, RadioOption, SelectField,
 };
 pub use egui_sauge::{Icon, RADIUS, SPACING, palette_of};
 

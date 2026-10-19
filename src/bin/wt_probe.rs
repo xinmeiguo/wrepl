@@ -28,6 +28,9 @@
 //!                                            # 走「打印到虚拟打印机」出 PDF，
 //!                                            # 用来和 ExportAsFixedFormat 对比
 //! wt_probe wps <输出目录> <docx>...          # 用 WPS 的 KWPS.Application 导，同上对比
+//! wt_probe pdfwps <输出目录|-> <页码范围> <docx>...
+//!                                            # **产品那条降级路**：同一个
+//!                                            #   export_pdf_run，引擎换成 WPS
 //! ```
 
 // 探针把 `wordtool` 的六个子模块**整套** `#[path]` 搬进来（只为让探针与产品
@@ -39,6 +42,8 @@
 
 #[path = "../gui/wordtool/com.rs"]
 mod com;
+#[path = "../gui/wordtool/engine.rs"]
+mod engine;
 #[path = "../gui/wordtool/locator.rs"]
 mod locator;
 #[path = "../gui/wordtool/printers.rs"]
@@ -437,6 +442,24 @@ fn main() {
             return 0;
         }
 
+        // 引擎判定：与界面进「打印与导出」页时调的是同一个函数。
+        // 特意做成一档，是因为它读的是**真注册表** —— 单元测试只能喂假数据，
+        // 而 `LocalServer32` 的真实形状（带 `/Automation`）当初就把解析坑掉过。
+        if mode == "engine" {
+            let p = engine::EngineProbe::detect();
+            println!("判定：{}", p.label_cn());
+            println!(
+                "将使用：{}",
+                match p {
+                    engine::EngineProbe::Word => "Word.Application",
+                    engine::EngineProbe::WpsOnly => "KWPS.Application（分页会变）",
+                    engine::EngineProbe::None => "（无法执行）",
+                }
+            );
+            drop(init);
+            return 0;
+        }
+
         // 列本机打印机：打印路径能不能用，先看有没有驱动可打
         if mode == "printers" {
             match printers::list() {
@@ -504,7 +527,7 @@ fn main() {
         // COM 参数不对、还是界面那条线断了。这里直接调同一个
         // `services::export_pdf_run`，**走的是同一份源码**（`#[path]` 引入），
         // 所以探针能跑通，界面上就一定跑得通；探针报什么错，界面里也是那个错。
-        if mode == "pdf" || mode == "pdfa" {
+        if mode == "pdf" || mode == "pdfa" || mode == "pdfwps" {
             let out = docs.first().cloned().unwrap_or_default();
             let range = docs.get(1).cloned().unwrap_or_default();
             let files: Vec<String> = docs.iter().skip(2).cloned().collect();
@@ -524,9 +547,20 @@ fn main() {
                     return 2;
                 }
             };
+            // pdfwps 走的是**产品里那条降级路**：同一个 `export_pdf_run`，
+            // 只是把引擎换成 WPS。探针能跑通，界面里点了"仍要导出"就一定跑得通。
+            let kind = if mode == "pdfwps" {
+                engine::WordKind::Wps
+            } else {
+                engine::WordKind::Word
+            };
             println!(
                 "== 导出 {}｜{} 个文档｜{}｜{}",
-                if mode == "pdfa" { "PDF/A" } else { "PDF" },
+                match mode.as_str() {
+                    "pdfa" => "PDF/A",
+                    "pdfwps" => "PDF（WPS 引擎）",
+                    _ => "PDF",
+                },
                 files.len(),
                 pages.describe(),
                 match &dir {
@@ -541,6 +575,7 @@ fn main() {
                 dir.as_deref(),
                 pages,
                 mode == "pdfa",
+                kind,
                 &mut log,
                 &mut prog,
             );

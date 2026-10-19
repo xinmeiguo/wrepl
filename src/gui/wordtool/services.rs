@@ -1,6 +1,7 @@
 //! 三个业务服务（等价 C# Services/ 下的 TextReplaceService / ImageReplaceService / PrintService）。
 
 use super::com::{Disp, DispResult, res_disp, res_f32, var_bool, var_bstr, var_i4, var_r4};
+use super::engine::WordKind;
 use super::locator::for_each_first_cell;
 use super::wd;
 use super::word_session::{run_on_documents, run_on_documents_printing};
@@ -23,7 +24,12 @@ pub fn text_replace_run(
     progress: &mut dyn FnMut(usize, usize),
 ) -> (i32, i32) {
     let insert_text = compose(english, chinese);
+    // 页眉 COM 这条路**不做 WPS 降级**：WPS 的 Headers 对象模型没实测过，
+    // 而这是就地改写源文件 —— 没验过的路径不能上。只有 WPS 的机器上，
+    // 页眉替换请用纯 Rust 引擎（那本来就是默认值，且不依赖任何 Office）；
+    // 这次**没有**给它加自动降级或提示，切到 COM 只会拿到"启动 Microsoft Word 失败"。
     run_on_documents(
+        WordKind::Word,
         doc_paths,
         |doc, _src| unsafe {
             for_each_first_cell(doc, |cell, _tbl| replace_in_cell(cell, &insert_text))?;
@@ -89,6 +95,7 @@ pub fn image_replace_run(
     progress: &mut dyn FnMut(usize, usize),
 ) -> (i32, i32) {
     run_on_documents(
+        WordKind::Word, // 同上：图片替换也不降级
         doc_paths,
         |doc, _src| unsafe {
             for_each_first_cell(doc, |cell, tbl| {
@@ -387,6 +394,7 @@ pub fn export_pdf_run(
     out_dir: Option<&Path>,
     pages: PdfPages,
     pdf_a: bool,
+    kind: WordKind,
     log: &mut dyn FnMut(String),
     progress: &mut dyn FnMut(usize, usize),
 ) -> (i32, i32) {
@@ -402,7 +410,15 @@ pub fn export_pdf_run(
             return (0, doc_paths.len() as i32);
         }
     }
+    // 降级是**使用者点过确认**才会走到这里的（见 `ui::ClickPlan`），
+    // 但日志里也要留一条：事后翻日志的人得知道这批 PDF 是谁排的版。
+    if kind == WordKind::Wps {
+        log("注意：本机没有 Microsoft Word，这批 PDF 由 WPS 文字排版导出\
+             —— 分页、换行可能与 Word 不同，交付前请逐份核对页数与页码"
+            .to_string());
+    }
     run_on_documents(
+        kind,
         doc_paths,
         |doc, src| unsafe { export_one(doc, src, out_dir, pages, pdf_a) },
         log,
