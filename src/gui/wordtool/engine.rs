@@ -75,30 +75,22 @@ impl EngineProbe {
     }
 }
 
-/// 确认框正文。**写死实测数据，不写"可能有点不一样"这种空话** ——
-/// 使用者要判断的是"这批交付件能不能接受少一页"，得给得起的依据。
-pub const WPS_CONFIRM_BODY: &str = "本机没有 Microsoft Word，只找到 WPS 文字。\n\
-可以改用 WPS 导出，但产物会和 Word 不一样：\n\
-· 分页会变 —— 同一批交付件实测，每份都比 Word 少 1 页（23→22、10→9、27→26，三份全中），\
-页脚的「Page N of 23」会变成「of 22」；\n\
-· 表格里的自动换行位置也可能移动，单元格里的长句会换到别的行；\n\
-· PDF 不带标签（Tagged），PDF/A 归档开关在 WPS 上是否生效未经验证。\n\
-正式交付件建议先装 Microsoft Word 再导。";
+/// 确认框正文。**只留能让人做判断的那一条**：分页差异 + 实测数字。
+/// 展开写"表格换行也可能动""PDF/A 未验证"只会把重点冲淡 —— 详细对照在
+/// `CHANGELOG.md`，界面不重复。
+pub const WPS_CONFIRM_BODY: &str =
+    "WPS 与 Word 排版不同：每份少 1 页（页脚 of 23→of 22），PDF 无 Tagged 标签。";
 
 /// 「打印」这一档在只有 WPS 时的拒绝理由。
-pub const PRINT_NEEDS_WORD: &str = "打印必须由 Microsoft Word 出手：本机只找到 WPS。\
-可改用「导出 PDF」—— 那一条支持 WPS 接手（分页会变，点导出时会再确认一次）。";
+pub const PRINT_NEEDS_WORD: &str = "打印需要 Microsoft Word。可改用「导出 PDF」（会先确认）。";
 
 /// 「装什么都没装」时的拒绝理由。
-pub const NO_ENGINE: &str = "本机既没有 Microsoft Word 也没有 WPS 文字，\
-「打印与导出」用不了。装其中一个再回来。";
+pub const NO_ENGINE: &str = "未检测到 Microsoft Word / WPS，装一个再用。";
 
 /// 只有 WPS 时，页面上那条常驻横幅。
 ///
 /// **写在点按钮之前**：等人家点了才说，等于让人先以为"导出"是个安全的动作。
-pub const WPS_ONLY_BANNER: &str = "本机没有 Microsoft Word，只找到 WPS 文字。\
-导出会用 WPS 排版 —— 分页与 Word 不同（实测每份少 1 页、页脚页码跟着变），\
-点「导出 PDF」时会先弹确认框；打印仍然需要 Microsoft Word。";
+pub const WPS_ONLY_BANNER: &str = "本机只有 WPS 文字：导出按 WPS 排版（分页会变），打印不可用。";
 
 /// 纯判断：`word_srv` 是 `Word.Application` 那个 CLSID 的 `LocalServer32`
 /// 命令行（取不到就是 `None`），`wps_registered` 是 `KWPS.Application` 在不在。
@@ -267,5 +259,21 @@ mod tests {
         assert!(WPS_CONFIRM_BODY.contains("of 22"), "{WPS_CONFIRM_BODY}");
         assert!(WPS_CONFIRM_BODY.contains("WPS"), "{WPS_CONFIRM_BODY}");
         assert!(WPS_CONFIRM_BODY.contains("Tagged"), "{WPS_CONFIRM_BODY}");
+    }
+
+    /// 界面提示一律要短。**用字符数钉住**：这类文案没人管就会长成说明书
+    /// （一开始确认框写了 6 行、横幅写了 3 句，被要求精简过一次）。
+    #[test]
+    fn ui_hints_stay_short() {
+        for (name, s) in [
+            ("WPS_ONLY_BANNER", WPS_ONLY_BANNER),
+            ("WPS_CONFIRM_BODY", WPS_CONFIRM_BODY),
+            ("PRINT_NEEDS_WORD", PRINT_NEEDS_WORD),
+            ("NO_ENGINE", NO_ENGINE),
+        ] {
+            let n = s.chars().count();
+            assert!(n <= 70, "{name} 太长（{n} 字）：{s}");
+            assert!(!s.contains('\n'), "{name} 不许换行分多段：{s}");
+        }
     }
 }

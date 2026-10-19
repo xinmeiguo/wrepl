@@ -236,7 +236,7 @@ cd /d/test/wrepl
 cargo check --features gui --offline
 
 # ② 单元测试
-cargo test --features gui --offline --bin wrepl-gui      # 期望 77 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui      # 期望 78 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
@@ -308,7 +308,7 @@ vX.Y.Z：一句话说清这版干了什么
 - 修复：…
 - 交互：…
 
-验证：cargo check/build 0 error 且自家代码零警告；cargo test 77 passed；
+验证：cargo check/build 0 error 且自家代码零警告；cargo test 78 passed；
 regress.sh 通过 78 / 失败 0，含 26/26 SHA256 与基线完全相同。
 ```
 

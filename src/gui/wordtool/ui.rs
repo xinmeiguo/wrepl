@@ -822,7 +822,7 @@ impl WordTool {
                                 .leading(ds::Icon::Refresh)
                                 .disabled(busy),
                         )
-                        .on_hover_text("刚装完 Office / WPS 时点一下，不必重启程序")
+                        .on_hover_text("装完 Office / WPS 后点一下")
                         .clicked()
                     {
                         self.engine = Some(EngineProbe::detect());
@@ -887,9 +887,7 @@ impl WordTool {
                                 .leading(ds::Icon::Refresh)
                                 .disabled(busy),
                         )
-                        .on_hover_text(
-                            "重新枚举本机打印机（刚装了打印机 / 刚映射了共享打印机时用）",
-                        )
+                        .on_hover_text("重新枚举本机打印机")
                         .clicked()
                     {
                         self.reload_printers();
@@ -911,7 +909,7 @@ impl WordTool {
                                     .leading(ds::Icon::FolderOpen)
                                     .disabled(busy),
                             )
-                            .on_hover_text("把输出目录填成第一份文档所在的那个目录")
+                            .on_hover_text("填第一份文档所在目录")
                             .clicked()
                         {
                             if let Some(p) = self.print_docs.first() {
@@ -922,11 +920,7 @@ impl WordTool {
                         }
                         ui.add_space(ds::SPACING.s4);
                         ui.add(ds::Checkbox::with_label(&mut self.pdf_a, "PDF/A 归档格式"))
-                            .on_hover_text(
-                                "走 Word 的「PDF/A 兼容」开关（UseISO19005_1）。\
-                                 实测 Microsoft 365 输出的是 PDF/A-3b，\
-                                 长期归档、投标准入都认这个；日常传阅不必勾。",
-                            );
+                            .on_hover_text("归档用 PDF/A，体积更大。日常传阅不必勾。");
                     });
                 }
             }
@@ -1105,8 +1099,7 @@ impl WordTool {
         };
         let job = self.pending_from_ui(pages);
         self.log(format!(
-            "已暂停：本机没有 Microsoft Word，等待确认是否改用 WPS 导出\
-             （{} 个文档；{}；输出到 {}）",
+            "待确认：WPS 导出 · {} 个文档 · {} · {}",
             job.docs.len(),
             job.pages.describe(),
             where_text(&job.out),
@@ -1149,9 +1142,9 @@ impl WordTool {
         if !self.wps_confirm {
             return;
         }
-        match ds::ConfirmDialog::new("本机没有 Microsoft Word，改用 WPS 导出？", engine::WPS_CONFIRM_BODY)
+        match ds::ConfirmDialog::new("改用 WPS 导出？", engine::WPS_CONFIRM_BODY)
             .danger()
-            .confirm_label("仍要导出（分页会变）")
+            .confirm_label("仍要导出")
             .cancel_label("取消")
             .show(ctx)
         {
@@ -1159,14 +1152,14 @@ impl WordTool {
             Some(true) => {
                 self.wps_confirm = false;
                 if let Some(job) = self.wps_pending.take() {
-                    self.log("已确认：改用 WPS 文字排版导出。交付前请逐份核对页数与页码。".to_string());
+                    self.log("改用 WPS 导出（分页与 Word 不同）".to_string());
                     self.run_export(job, WordKind::Wps);
                 }
             }
             Some(false) => {
                 self.wps_confirm = false;
                 self.wps_pending = None;
-                self.log("已取消：没有导出。要拿到与 Word 一致的 PDF，请先安装 Microsoft Word。".to_string());
+                self.log("已取消导出".to_string());
             }
             None => {}
         }

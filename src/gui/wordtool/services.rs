@@ -413,9 +413,7 @@ pub fn export_pdf_run(
     // 降级是**使用者点过确认**才会走到这里的（见 `ui::ClickPlan`），
     // 但日志里也要留一条：事后翻日志的人得知道这批 PDF 是谁排的版。
     if kind == WordKind::Wps {
-        log("注意：本机没有 Microsoft Word，这批 PDF 由 WPS 文字排版导出\
-             —— 分页、换行可能与 Word 不同，交付前请逐份核对页数与页码"
-            .to_string());
+        log("这批 PDF 由 WPS 排版，分页与 Word 不同".to_string());
     }
     run_on_documents(
         kind,
