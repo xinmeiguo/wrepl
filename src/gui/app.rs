@@ -347,6 +347,25 @@ pub struct App {
     page: Page,
     /// 页眉替换与打印与导出的状态 + 任务（页眉替换纯 Rust，打印 / 导出走 Word COM）。
     wt: crate::wordtool::WordTool,
+
+    // ── 状态持久化（见 `crate::state`）──
+    /// **要不要读写 `%LOCALAPPDATA%\wrepl\state.json`。**
+    ///
+    /// 只有正常双击开窗才是 `true`（[`App::with_saved_state`]）。
+    /// `--preset` / `--selftest` / 单元测试一律 `false`：前者是脚本化的一次性跑动，
+    /// 让它去读写存档会跟命令行给的规则文件打架；后者必须保持
+    /// **`App::new()` 是纯内存构造**这条老规矩 —— 否则单元测试会读到这台机器上
+    /// 真实的规则表，红绿取决于使用者昨天填了什么。
+    save_state: bool,
+    /// 上次落盘的那份快照（`None` = 还没存过）。
+    ///
+    /// 拿它跟当前状态比，**不同才写**——不用在每个输入框上手写"这里要置脏标记"。
+    /// 规则表有几十处可改的地方，逐处打标记迟早早漏一处。
+    saved: Option<crate::state::State>,
+    /// 上次写盘的时刻（用来做 2 秒节流，见 [`App::maybe_save_state`]）。
+    last_save: std::time::Instant,
+    /// 写盘失败只记一次日志 —— 磁盘满时不该每 2 秒刷一行。
+    state_err_logged: bool,
 }
 
 /// 顶部的三个页。
@@ -418,6 +437,11 @@ impl App {
             picker_for: None,
             page: Page::Replace,
             wt: crate::wordtool::WordTool::new(),
+            // 默认**不持久化**：`new()` 必须保持纯内存（见 `save_state` 的说明）。
+            save_state: false,
+            saved: None,
+            last_save: std::time::Instant::now(),
+            state_err_logged: false,
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
         // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save|hdrdocs|printdocs|img|browse`
@@ -484,6 +508,169 @@ impl App {
             }
         }
         app
+    }
+
+    // ─────────────────────── 状态持久化 ───────────────────────
+    //
+    // 只有正常开窗走这条路（见 `gui/main.rs` 的那处 `match &preset`）。
+
+    /// 正常开窗用：先建纯内存的 [`App::new`]，再把磁盘上那份状态盖上去。
+    ///
+    /// 盖上去的三类东西各不相同，都在 [`App::apply_state`] 里说明。
+    pub fn with_saved_state() -> Self {
+        let mut app = App::new();
+        app.save_state = true;
+        match crate::state::load() {
+            Some(st) => {
+                let n = st.rules.len();
+                app.apply_state(&st);
+                // 记下来，免得第一帧又把刚读到的内容原样写回去一遍
+                app.saved = Some(st);
+                if n > 0 {
+                    app.push_log(format!(
+                        "已恢复上次的 {n} 条规则（含主题与导出设置）；要清空请点「清空规则」"
+                    ));
+                }
+            }
+            None => app.saved = None,
+        }
+        app
+    }
+
+    /// 把一份存档应用到界面上。
+    fn apply_state(&mut self, st: &crate::state::State) {
+        self.light_theme = !st.is_dark();
+        // `applied_light` 保持 `None`：让第一帧按真实主题装一次（`ds::apply`）。
+        self.applied_light = None;
+
+        self.rows = st
+            .rules
+            .iter()
+            .map(|r| Row {
+                find: r.find.clone(),
+                replace: r.replace.clone(),
+                scope: r.scope.clone(),
+                case_sensitive: r.case_sensitive,
+                whole_word: r.whole_word,
+                kana_sensitive: r.kana_sensitive,
+                note: r.note.clone(),
+                hits: None,
+            })
+            .collect();
+
+        self.chain = st.replace.chain;
+        self.longest_first = st.replace.longest_first;
+        self.rename_files = st.replace.rename_files;
+        self.backup = st.replace.backup;
+        self.recursive = st.replace.recursive;
+        self.exclude = st.replace.exclude.clone();
+
+        self.wt.sink = if st.print.is_pdf() {
+            crate::wordtool::Sink::Pdf
+        } else {
+            crate::wordtool::Sink::Printer
+        };
+        self.wt.page_range = st.print.page_range.clone();
+        self.wt.pdf_dir = st.print.pdf_dir.clone();
+        self.wt.pdf_a = st.print.pdf_a;
+        // 打印机要等**枚举完之后**才认得出（进打印页时才枚举，见 `reload_printers`），
+        // 所以这里只把名字挂过去；名字对不上就落回"系统默认"，不报错。
+        self.wt.want_printer(st.print.printer.clone());
+    }
+
+    /// 当前界面的快照。与 [`App::apply_state`] 严格互逆。
+    fn snapshot_state(&self) -> crate::state::State {
+        crate::state::State {
+            version: crate::state::VERSION,
+            theme: if self.light_theme { "light" } else { "dark" }.to_string(),
+            rules: self
+                .rows
+                .iter()
+                .map(|r| crate::state::RuleState {
+                    find: r.find.clone(),
+                    replace: r.replace.clone(),
+                    scope: r.scope.clone(),
+                    case_sensitive: r.case_sensitive,
+                    whole_word: r.whole_word,
+                    kana_sensitive: r.kana_sensitive,
+                    note: r.note.clone(),
+                })
+                .collect(),
+            replace: crate::state::ReplaceState {
+                chain: self.chain,
+                longest_first: self.longest_first,
+                rename_files: self.rename_files,
+                backup: self.backup,
+                recursive: self.recursive,
+                exclude: self.exclude.clone(),
+            },
+            print: crate::state::PrintState {
+                sink: match self.wt.sink {
+                    crate::wordtool::Sink::Pdf => "pdf",
+                    crate::wordtool::Sink::Printer => "printer",
+                }
+                .to_string(),
+                page_range: self.wt.page_range.clone(),
+                pdf_dir: self.wt.pdf_dir.clone(),
+                pdf_a: self.wt.pdf_a,
+                printer: self.wt.printer_name(),
+            },
+        }
+    }
+
+    /// 每帧调一次。**攒够 2 秒且内容有变化**才落盘。
+    ///
+    /// 为什么不"改一下就写"：规则表是逐字输入的，每敲一个字符写一次文件既没必要，
+    /// 也会撞上本机的防病毒（新文件会被扫一遍，实测能感到卡顿）。
+    /// 为什么不"只在关窗时写"：进程被外部干掉（管控套件 / 崩溃）时改动会整份丢掉。
+    /// 折中成"最多丢 2 秒的输入"。
+    fn maybe_save_state(&mut self) {
+        if !self.save_state {
+            return;
+        }
+        if self.last_save.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        let cur = self.snapshot_state();
+        if self.saved.as_ref() == Some(&cur) {
+            return;
+        }
+        self.write_state(cur);
+    }
+
+    /// 立刻落盘（关窗时用，绕过 2 秒节流）。
+    fn flush_state(&mut self) {
+        if !self.save_state {
+            return;
+        }
+        let cur = self.snapshot_state();
+        if self.saved.as_ref() == Some(&cur) {
+            return;
+        }
+        if self.write_state(cur) {
+            crate::diag::log("退出前已保存界面状态");
+        }
+    }
+
+    /// 写一次。返回是否成功。
+    fn write_state(&mut self, st: crate::state::State) -> bool {
+        self.last_save = std::time::Instant::now();
+        match crate::state::save(&st) {
+            Ok(()) => {
+                self.saved = Some(st);
+                self.state_err_logged = false;
+                true
+            }
+            Err(e) => {
+                // 不弹 toast：这是一份便利状态，写不上不该打断任何正事
+                // （同 `diag::save_last_dir` 的取向）。而且下个 2 秒还会再试。
+                if !self.state_err_logged {
+                    crate::diag::log(format!("界面状态写不进去（不影响正事，稍后重试）：{e}"));
+                    self.state_err_logged = true;
+                }
+                false
+            }
+        }
     }
 
     /// 从文本规则文件装载规则。
@@ -1223,6 +1410,10 @@ impl App {
         self.pump_job();
         // 新两页的任务状态在 `wt` 里，也每帧收一次
         self.wt.poll();
+        // ② 攒够 2 秒且内容有变化就把规则表 / 主题 / 导出设置落盘（见 `maybe_save_state`）。
+        //    放在这里而不是散在各个输入框上：界面上能改这些值的地方有几十处，
+        //    逐处打脏标记迟早漏一处，漏掉的那一处就是"我明明存过"的投诉来源。
+        self.maybe_save_state();
         // ② 有活干的时候定时重绘：串行阶段（预分配输出路径、改名）没有进度消息，
         //    不主动叫醒的话进度条会停住不动。200ms 一次，人眼看是连续的。
         if self.job.is_some() {
@@ -2672,6 +2863,18 @@ impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         ds::window_bg(self.light_theme)
     }
+
+    /// 关窗时把状态补存一次。
+    ///
+    /// `render` 里那条 2 秒节流意味着"最后一刻的改动"可能还没落盘 ——
+    /// 用户填完规则、按 Alt+F4 走人，正好卡在这 2 秒里就白填了。
+    ///
+    /// ⚠ 这个钩子**只在正常退出时**被调（关窗 / `run_native` 返回）。
+    /// 进程被外部干掉时它不会跑 —— 那种情况下的兜底就是上面那条 2 秒钟。
+    /// 两件不同的事：这里保"最后一下"，节流保"被杀之前的绝大多数"。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_state();
+    }
 }
 
 // ─────────────────────── 小工具 ───────────────────────
@@ -2843,85 +3046,9 @@ fn write_report(
         }
     }
 
-    let file_rows: Vec<report::FileRow> = res
-        .outcomes
-        .iter()
-        .map(|o| report::FileRow {
-            file: o
-                .src
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string(),
-            path: o.src.display().to_string(),
-            size_kb: o.size_kb,
-            mtime: o.mtime.clone(),
-            rule_count: o.rule_count,
-            total_hits: o.hits.len(),
-            applied: o.applied,
-            conflicts: o.conflicts,
-            status: o.status.to_string(),
-            sha_before: short_sha(&o.sha_before),
-            sha_after: short_sha(&o.sha_after),
-            parts_changed: o.parts.join(" "),
-            note: o.note.clone(),
-        })
-        .collect();
-
-    let mut file_rows = file_rows;
-    for s in &res.skipped {
-        file_rows.push(report::FileRow {
-            file: s
-                .path
-                .file_name()
-                .and_then(|x| x.to_str())
-                .unwrap_or("")
-                .to_string(),
-            path: s.path.display().to_string(),
-            size_kb: std::fs::metadata(&s.path)
-                .map(|m| m.len() as f64 / 1024.0)
-                .unwrap_or(0.0),
-            mtime: String::new(),
-            rule_count: rules.len(),
-            total_hits: 0,
-            applied: 0,
-            conflicts: 0,
-            status: "SKIP".to_string(),
-            sha_before: String::new(),
-            sha_after: String::new(),
-            parts_changed: String::new(),
-            note: s.reason.clone(),
-        });
-    }
-
-    let mut hit_rows: Vec<report::HitRow> = Vec::new();
-    for o in &res.outcomes {
-        let fname = o
-            .src
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        for h in &o.hits {
-            let find = rules
-                .iter()
-                .find(|r| r.id == h.rule_id)
-                .map(|r| r.find.clone())
-                .unwrap_or_default();
-            hit_rows.push(report::HitRow {
-                file: fname.clone(),
-                rule_id: h.rule_id,
-                find,
-                replace: h.replaced_by.clone(),
-                slot: h.slot.label().to_string(),
-                para: h.para,
-                matched: h.matched.clone(),
-                applied: h.applied,
-                reason: h.reason.clone(),
-                strategy: h.strategy.clone(),
-            });
-        }
-    }
+    // 三张明细表的行由 `report` 统一摊平，与命令行共用同一份实现
+    // （此前这里抄过一份，「被跳过文件的修改时间」就抄漏了）。
+    let rows = report::rows_from_run(res, rules);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2974,42 +3101,18 @@ fn write_report(
         verdict: verdict_text(res, false),
     };
 
-    let rule_rows: Vec<report::RuleRow> = rules
-        .iter()
-        .map(|r| report::RuleRow {
-            id: r.id,
-            enabled: r.enabled,
-            find: r.find.clone(),
-            replace: r.replace.clone(),
-            scope: r.scope.display().to_string(),
-            case_sensitive: r.case_sensitive,
-            whole_word: r.whole_word,
-            kana_sensitive: r.kana_sensitive,
-            wildcard: r.use_wildcard,
-            note: r.note.clone(),
-        })
-        .collect();
-
     report::write_xlsx(
         &path,
         &meta,
-        &file_rows,
-        &hit_rows,
-        &rule_rows,
+        &rows.files,
+        &rows.hits,
+        &rows.rules,
         &res.name_rows,
         &res.verify_rows,
     )
     .map_err(|e| format!("{e:#}"))?;
 
     Ok(path)
-}
-
-fn short_sha(s: &str) -> String {
-    if s.is_empty() {
-        String::new()
-    } else {
-        s.chars().take(16).collect()
-    }
 }
 
 // ─────────────────────── 字号与字体 ───────────────────────
@@ -4398,5 +4501,113 @@ mod tests {
             matches!(app.picker_for, Some(PickFor::PrintDocs)),
             "打印与导出页同理"
         );
+    }
+
+    // ═══════════════════ 状态持久化 ═══════════════════
+
+    /// 存档往返：`snapshot_state` 写出的、`apply_state` 盖回去的必须是同一份东西。
+    ///
+    /// 这条钉的是"两份手写映射走偏"：将来加字段只改了一边，用户重启后发现某一项
+    /// 悄悄回到默认值 —— 那种问题不报错，只会让人以为"这程序记不住东西"。
+    #[test]
+    fn 状态快照与恢复互逆() {
+        let mut a = App::new();
+        assert!(!a.save_state, "App::new 必须是纯内存构造，不许碰磁盘上的存档");
+
+        a.light_theme = false;
+        a.rows = vec![
+            Row {
+                find: "冻干机".into(),
+                replace: "清洗机".into(),
+                scope: "正文".into(),
+                case_sensitive: true,
+                whole_word: true,
+                kana_sensitive: true,
+                note: "备注里有\"引号\" 和 \\ 反斜杠".into(),
+                hits: None,
+            },
+            Row::new("LYO", "APS", "全部"),
+        ];
+        a.chain = true;
+        a.longest_first = true;
+        a.rename_files = false;
+        a.backup = true;
+        a.recursive = true;
+        a.exclude = "*.bak;临时/**".into();
+        a.wt.sink = crate::wordtool::Sink::Pdf;
+        a.wt.page_range = "1-3,5".into();
+        a.wt.pdf_dir = "D:/交付/pdf".into();
+        a.wt.pdf_a = true;
+
+        let st = a.snapshot_state();
+        let mut b = App::new();
+        b.apply_state(&st);
+        assert_eq!(b.snapshot_state(), st, "恢复后再取快照必须逐字段相同");
+
+        // 过一趟 serde（真实路径是 JSON 文件），转义与浮点都不该让内容变样
+        let text = serde_json::to_string(&st).expect("序列化");
+        let back: crate::state::State = serde_json::from_str(&text).expect("反序列化");
+        assert_eq!(back, st);
+    }
+
+    /// 默认值必须与 `App::new` 对齐 —— 否则"首次启动"与"读回旧存档"是两副样子。
+    ///
+    /// 最容易错的是 `rename_files`：界面默认**勾上**，而 `bool::default()` 是 `false`。
+    #[test]
+    fn 存档默认值与界面默认值一致() {
+        let app = App::new();
+        let st = crate::state::State::default();
+        assert_eq!(st.replace.rename_files, app.rename_files);
+        assert_eq!(st.replace.chain, app.chain);
+        assert_eq!(st.replace.longest_first, app.longest_first);
+        assert_eq!(st.replace.backup, app.backup);
+        assert_eq!(st.replace.recursive, app.recursive);
+        assert!(!st.is_dark(), "默认浅色");
+        assert!(!st.print.is_pdf(), "默认送打印机");
+    }
+
+    /// **端到端**：界面的 `write_report` 写出来的「文件清单」必须带上被跳过文件的
+    /// 磁盘事实（尺寸 + 修改时间）。
+    ///
+    /// 这条覆盖的是从界面到 xlsx 的**整条路**（`rows_from_run` → `report::write_xlsx`），
+    /// 而不只是内存里的行结构：`read_sheet` 读回来的才是用户真正看到的东西。
+    ///
+    /// 历史上这里是两处各写一份实现，界面那份把 `mtime` 抄成了空串 ——
+    /// 同一批文件在命令行与界面各导一份报告，「文件清单」表会对不上。
+    #[test]
+    fn 界面报告的被跳过文件带修改时间() {
+        let dir = 临时目录("report-skip");
+        let skip = dir.join("说明.txt");
+        std::fs::write(&skip, vec![b'x'; 3072]).expect("写一个非 docx 的干扰文件");
+
+        let res = RunResult {
+            skipped: vec![wrepl::pipeline::Skipped {
+                path: skip.clone(),
+                reason: "不是 .docx".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = dir.join("报告.xlsx");
+        let written = write_report(
+            &out.display().to_string(),
+            &res,
+            &[],
+            &[],
+            &Options::default(),
+        )
+        .expect("导出报告");
+        assert_eq!(written, out);
+
+        let rows = wrepl::report::read_sheet(&out, "文件清单").expect("读回文件清单");
+        assert!(rows.len() >= 2, "至少要有表头 + 一行，实际 {} 行", rows.len());
+        let row = &rows[1];
+        assert_eq!(row[4], "SKIP", "状态列");
+        assert_eq!(row[5], "不是 .docx", "备注列要写清为什么跳过");
+        assert!(
+            !row[3].trim().is_empty(),
+            "修改时间不能是空串（界面这份曾经抄漏的就是它）：{row:?}"
+        );
+        let kb: f64 = row[2].parse().expect("大小列应是数字");
+        assert!((kb - 3.0).abs() < 0.01, "大小应现读磁盘，实际 {kb}");
     }
 }

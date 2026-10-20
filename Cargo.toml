@@ -21,6 +21,8 @@ gui = [
     "dep:egui_sauge",
     "dep:egui-phosphor",
     "dep:log",
+    "dep:serde",
+    "dep:serde_json",
 ]
 
 [dependencies]
@@ -63,6 +65,18 @@ rfd = { version = "0.15.4", optional = true }
 # 版本已经随 eframe 进树（Cargo.lock 里是唯一的 0.4.34），提升为直接依赖
 # 不会引入第二份。
 log = { version = "0.4", optional = true }
+
+# 界面状态持久化（`src/gui/state.rs`）：规则表 / 主题 / 导出设置落一份 JSON。
+#
+# **为什么破例引入新依赖**：这份状态里装的是自由文本（查找内容、替换为、备注），
+# 任何手写的行格式都得自己解决转义、引号、换行、控制字符 —— 那正是最容易写错、
+# 又最难被测试覆盖的一段代码。serde_json 是现成且被广泛验证的。
+#
+# 代价已经核过：`serde` 本来就在依赖树里（Cargo.lock 里是唯一的 1.0.x），
+# 新增的编译单元只有 `serde_json` 一个；且**只挂在 `gui` feature 下**，
+# 命令行构建一个字节都不多拉。
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.151", optional = true }
 
 # ── 设计系统（迁移第 2 步接入）───────────────────────────────────────────
 #

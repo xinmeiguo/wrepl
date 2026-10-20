@@ -33,6 +33,7 @@ mod app;
 mod diag;
 mod ds;
 mod picker;
+mod state;
 mod wordtool;
 
 use eframe::egui;
@@ -101,7 +102,11 @@ fn run_and_report(
             ds::apply(&cc.egui_ctx, true);
             Ok(Box::new(match &preset {
                 Some(p) => app::App::with_preset(p),
-                None => app::App::new(),
+                // ★ 只有正常开窗才读写 `state.json`。
+                //   `--preset` / `--selftest` 是脚本化的一次性跑动，若也去读，
+                //   存档里的规则表会跟命令行给的规则文件打架；若也去写，
+                //   一次自动化跑动就会把用户手填的规则冲掉。
+                None => app::App::with_saved_state(),
             }))
         }),
     );

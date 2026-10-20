@@ -378,13 +378,16 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 > ⚠ 顺带更正当初的估计：这里原写"50 文件省 5–10 s"，**估高了**。真实语料单件
 > 约 40 ms，50 个文件的上限也就 2 s 左右。实际是 **26 文件省 0.5–0.75 s**，
 > 收益随文件数线性放大，不是数量级。
+>
+> **「报告行构造下沉」与「状态持久化」也于 2026-10-20 落地**（未发版），见
+> `CHANGELOG.md` 的「报告行构造下沉到 `report`」「界面状态持久化」两节。
+> 前者消掉三处重复并修掉界面报告里"被跳过文件 mtime 是空串"的偏差；
+> 后者把规则表 / 主题 / 导出设置落到 `%LOCALAPPDATA%\wrepl\state.json`。
 
 | 项 | 位置 | 收益 / 代价 |
 |---|---|---|
-| **报告行构造下沉到 `report` 模块** | `main.rs:402-606` vs `app.rs:2846-3005` | CLI 与 GUI 各写一份 `FileRow` / `HitRow` / `RuleRow` / `ReportMeta`；`short` / `short_sha` 同函数两名；verdict 文案已漂移（CLI 多 `name_warn` 一档）。下沉同时消三条重复 |
 | **GUI 错误类型统一成 `anyhow::Result`** | `app.rs` 6 处、`picker.rs:1842`、`printers.rs:56`、`services.rs:83` | GUI 侧整片 `Result<_, String>`，边界处一堆 `map_err(|e| format!("…{e:#}"))`。统一后只在 toast / 日志那一层转 String。**注意：`{e:#}` 本身是对的**（anyhow 链式 Display），别改成 `{e}` |
 | **取消信号 + 关窗 join** | `app.rs:186` `Job { rx, handle }` | 执行中按钮只能变「执行中…」；关窗时 `JoinHandle` drop 不 join，后台线程 + Word 进程变孤儿。加 `Arc<AtomicBool>`，worker 在**每个文件边界**检查；eframe `on_exit` 发信号 + join |
-| **规则表 / 主题 / PDF 设置持久化** | `diag.rs:57-106` | 只存「上次目录」一个值，规则表整张关窗即失。落 `%LOCALAPPDATA%\wrepl\state.json`（与 `last-dir.txt` 同目录） |
 | **CLI ↔ GUI 功能对齐** | `cli.rs:84-207`、`app.rs:1851` | `Inspect/Passthrough/Diff/Dump/Probe/Verify --batch` GUI 无入口；规则表的 `区分大小写 / 全字匹配 / 区分全半角 / 作用域` 只能 Excel 往返调；`--exclude` / `--threads` 在界面上被隐掉 |
 
 ### 7.2 结构 / 维护性（改动量大，收益是"以后好改"）

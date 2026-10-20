@@ -399,88 +399,8 @@ fn cmd_apply(
     };
 
     // ─────────────────────────── 报告 ───────────────────────────
-    let mut file_rows: Vec<report::FileRow> = res
-        .outcomes
-        .iter()
-        .map(|o| report::FileRow {
-            file: o
-                .src
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string(),
-            path: o.src.display().to_string(),
-            size_kb: o.size_kb,
-            mtime: o.mtime.clone(),
-            rule_count: o.rule_count,
-            total_hits: o.hits.len(),
-            applied: o.applied,
-            conflicts: o.conflicts,
-            status: o.status.to_string(),
-            sha_before: short(&o.sha_before),
-            sha_after: short(&o.sha_after),
-            parts_changed: o.parts.join(" "),
-            note: o.note.clone(),
-        })
-        .collect();
-
-    // 被跳过的文件也写进报告——QA 归档必须能看出"哪些文件没处理、为什么没处理"
-    for s in &res.skipped {
-        let md = std::fs::metadata(&s.path).ok();
-        file_rows.push(report::FileRow {
-            file: s
-                .path
-                .file_name()
-                .and_then(|x| x.to_str())
-                .unwrap_or("")
-                .to_string(),
-            path: s.path.display().to_string(),
-            size_kb: md.as_ref().map(|m| m.len() as f64 / 1024.0).unwrap_or(0.0),
-            mtime: md
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| pipeline::format_epoch(d.as_secs()))
-                .unwrap_or_default(),
-            rule_count: rl.len(),
-            total_hits: 0,
-            applied: 0,
-            conflicts: 0,
-            status: "SKIP".to_string(),
-            sha_before: String::new(),
-            sha_after: String::new(),
-            parts_changed: String::new(),
-            note: s.reason.clone(),
-        });
-    }
-
-    let mut hit_rows: Vec<report::HitRow> = Vec::new();
-    for o in &res.outcomes {
-        let fname = o
-            .src
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        for h in &o.hits {
-            let find = rl
-                .iter()
-                .find(|r| r.id == h.rule_id)
-                .map(|r| r.find.clone())
-                .unwrap_or_default();
-            hit_rows.push(report::HitRow {
-                file: fname.clone(),
-                rule_id: h.rule_id,
-                find,
-                replace: h.replaced_by.clone(),
-                slot: h.slot.label().to_string(),
-                para: h.para,
-                matched: h.matched.clone(),
-                applied: h.applied,
-                reason: h.reason.clone(),
-                strategy: h.strategy.clone(),
-            });
-        }
-    }
+    // 三张明细表的行由 `report` 统一摊平，与界面共用同一份实现。
+    let rows = report::rows_from_run(&res, &rl);
 
     // ── 正式报告：封面元信息 + 规则快照，便于 QA 归档自证 ──
     let now = std::time::SystemTime::now()
@@ -579,28 +499,12 @@ fn cmd_apply(
         verdict,
     };
 
-    let rule_rows: Vec<report::RuleRow> = rl
-        .iter()
-        .map(|r| report::RuleRow {
-            id: r.id,
-            enabled: r.enabled,
-            find: r.find.clone(),
-            replace: r.replace.clone(),
-            scope: r.scope.display().to_string(),
-            case_sensitive: r.case_sensitive,
-            whole_word: r.whole_word,
-            kana_sensitive: r.kana_sensitive,
-            wildcard: r.use_wildcard,
-            note: r.note.clone(),
-        })
-        .collect();
-
     report::write_xlsx(
         rp,
         &meta,
-        &file_rows,
-        &hit_rows,
-        &rule_rows,
+        &rows.files,
+        &rows.hits,
+        &rows.rules,
         &res.name_rows,
         &res.verify_rows,
     )?;
@@ -627,14 +531,6 @@ fn exit_for_failures(res: &pipeline::RunResult) {
             "\n退出码 2：{failed} 个文件处理失败、{verify_bad} 个产物验证不通过"
         );
         std::process::exit(2);
-    }
-}
-
-fn short(s: &str) -> String {
-    if s.is_empty() {
-        String::new()
-    } else {
-        s.chars().take(16).collect()
     }
 }
 

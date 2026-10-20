@@ -70,7 +70,10 @@ pub fn path_text() -> String {
 // 变成猜谜。范围越小越不容易写坏，也越不需要迁移逻辑。
 
 /// 状态文件所在目录（与 `wrepl-gui.log` 同目录，见 `log_path`）。
-fn state_dir() -> Option<PathBuf> {
+///
+/// `pub` 是因为 `state.rs` 的 `state.json` 也要落在这里 —— 两个文件放在一起，
+/// 用户排查时只需去一个地方（见 [`crate::state`]）。
+pub fn state_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
         let base = std::env::var_os("LOCALAPPDATA")

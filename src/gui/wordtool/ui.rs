@@ -194,6 +194,12 @@ pub struct WordTool {
     /// 枚举打印机失败的原因（显示在页面上，而不是让下拉框空着让人猜）。
     pub printers_err: Option<String>,
     printers_loaded: bool,
+    /// 想选的那台打印机**名字**（来自存档），等枚举完再认。
+    ///
+    /// 为什么不直接存下标：打印机在**进打印页时才枚举**（见 [`Self::reload_printers`]），
+    /// 存档恢复到界面这一刻 `printers` 还是空的，下标无从谈起；而且列表顺序会随
+    /// 系统变化（改用下标就会指错打印机）。名字是唯一稳定的键。
+    printer_wanted: Option<String>,
     /// 本机能用哪套 Word 兼容引擎。**进本页时探一次**（只读注册表，几微秒），
     /// `None` = 还没探过。装了 Office 之后可以用「重新检测」刷新。
     pub engine: Option<EngineProbe>,
@@ -240,6 +246,7 @@ impl WordTool {
             printer_pick: 0,
             printers_err: None,
             printers_loaded: false,
+            printer_wanted: None,
             engine: None,
             wps_confirm: false,
             wps_pending: None,
@@ -314,7 +321,12 @@ impl WordTool {
         match printers::list() {
             Ok(v) => {
                 // 选择按**名字**保留：重扫后顺序可能变，按下标留会指错打印机。
-                let keep = self.selected_printer().map(|p| p.name.clone());
+                // 存档里的那台优先（`printer_wanted`）—— 它比"当前选中的"更权威：
+                // 刚恢复存档时前者有值、后者还是 0。
+                let keep = self
+                    .printer_wanted
+                    .take()
+                    .or_else(|| self.selected_printer().map(|p| p.name.clone()));
                 self.printers = v;
                 self.printers_err = None;
                 self.printer_pick = keep
@@ -338,6 +350,40 @@ impl WordTool {
         self.printer_pick
             .checked_sub(1)
             .and_then(|i| self.printers.get(i))
+    }
+
+    /// 当前选中的打印机名字（空串 = 用系统默认）。给状态持久化用，见 [`crate::state`]。
+    pub fn printer_name(&self) -> String {
+        self.selected_printer()
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// 按名字选一台打印机（来自存档）。
+    ///
+    /// 三种情形都不报错，因为**一台打印机没选上不算故障**：
+    /// 已经枚举过就当场定位；还没枚举（`printers` 为空）就记下来等
+    /// [`Self::reload_printers`] 认；名字在这台机器上根本不存在 → 落回"系统默认"，
+    /// 也就是存档来自另一台机器（打印机名是机器相关的）。
+    pub fn want_printer(&mut self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        match self
+            .printers
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(&name))
+        {
+            Some(i) => self.printer_pick = i + 1,
+            // 还没枚举：记下来，等 `reload_printers` 认
+            None if self.printers.is_empty() && !self.printers_loaded => {
+                self.printer_wanted = Some(name)
+            }
+            // 枚举过了但没有这台：存档来自另一台机器（打印机名是机器相关的）→
+            // 老实退回"系统默认"，而不是硬指一台不存在的。
+            None => self.printer_pick = 0,
+        }
     }
 
     /// 下拉框当前显示的文字。
@@ -1387,5 +1433,65 @@ mod tests {
             plan_click(Sink::Printer, EngineProbe::Word),
             ClickPlan::Run(WordKind::Word)
         );
+    }
+
+    // ═══════════════ 打印机选择：存档按名字恢复 ═══════════════
+
+    fn 假打印机(名字: &str) -> Printer {
+        Printer {
+            name: 名字.to_string(),
+            port: "Ne01:".to_string(),
+            is_default: false,
+        }
+    }
+
+    /// 存档里存的是**名字**，恢复时按名字定位 —— 不能按下标。
+    ///
+    /// 按下标的后果：这台机器上加/删了一台打印机，列表顺序一变，
+    /// 用户回来发现"上次选的是激光机，这次却打到标签机上"。
+    #[test]
+    fn 打印机按名字恢复() {
+        let mut wt = WordTool::new();
+        wt.printers = vec![假打印机("标签机"), 假打印机("激光机")];
+        wt.printers_loaded = true;
+
+        wt.want_printer("激光机".into());
+        assert_eq!(wt.printer_pick, 2);
+        assert_eq!(wt.printer_name(), "激光机");
+
+        // 大小写不该影响（Windows 打印机名不区分大小写）
+        wt.want_printer("标签机".into());
+        assert_eq!(wt.printer_pick, 1);
+    }
+
+    /// 还没枚举（刚开窗、存档刚盖上来）时先记着，等枚举完再认。
+    #[test]
+    fn 枚举前的存档名字会挂着等() {
+        let mut wt = WordTool::new();
+        assert!(!wt.printers_loaded);
+        wt.want_printer("激光机".into());
+        assert_eq!(wt.printer_pick, 0, "还没列表，只能先挂着");
+
+        // 枚举完成后按名字认出来（`reload_printers` 读的就是 printer_wanted）
+        wt.printers = vec![假打印机("标签机"), 假打印机("激光机")];
+        let keep = wt.printer_wanted.take();
+        wt.printer_pick = keep
+            .and_then(|n| wt.printers.iter().position(|p| p.name == n))
+            .map_or(0, |i| i + 1);
+        wt.printers_loaded = true;
+        assert_eq!(wt.printer_name(), "激光机");
+    }
+
+    /// 存档来自另一台机器：名字在这台机器上不存在 → 落回系统默认，不报错、不 panic。
+    #[test]
+    fn 不存在的打印机落回系统默认() {
+        let mut wt = WordTool::new();
+        wt.printers = vec![假打印机("标签机")];
+        wt.printers_loaded = true;
+        wt.printer_pick = 1;
+
+        wt.want_printer(r"\\别的电脑\打印机".into());
+        assert_eq!(wt.printer_pick, 0);
+        assert_eq!(wt.printer_name(), "", "空串＝用系统默认");
     }
 }

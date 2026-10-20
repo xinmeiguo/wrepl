@@ -10,8 +10,13 @@
 //!   用已在用的 quick-xml 直接流式取单元格足够
 //!
 //! 单元格文本一律用 `inlineStr` 写入，省掉 sharedStrings 这一层。
+//!
+//! 本模块还负责**把一次运行的结果摊平成报告行**（[`rows_from_run`]）：
+//! 命令行与图形界面只调这一份，两个前端不许各写一遍。
 
 use crate::docx::scan::escape_text;
+use crate::pipeline::RunResult;
+use crate::rules::Rule;
 use anyhow::{Context, Result, bail};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -110,6 +115,142 @@ impl VerifyRow {
     /// 通过 = 关卡 1 通过 + 关卡 2 通过 + 全包无残留。
     pub fn ok(&self) -> bool {
         self.level1 == "通过" && self.level2 == "通过" && self.residue == "无残留"
+    }
+}
+
+/// 一次运行要写进报告的三张明细表（汇总/明细/规则清单）。
+///
+/// 「文件清单」「文件名对照」「验证结论」不在内——后两张要的是原始
+/// [`NameRow`] / [`VerifyRow`]，直接取自 [`RunResult`]，不必再过一道手。
+#[derive(Debug, Default)]
+pub struct RunRows {
+    pub files: Vec<FileRow>,
+    pub hits: Vec<HitRow>,
+    pub rules: Vec<RuleRow>,
+}
+
+/// 把一次运行的结果摊平成报告行。**命令行与图形界面共用这一份。**
+///
+/// ## 为什么必须只有一份
+///
+/// 报告是归档凭据：同一批文件、同一套规则，在命令行跑和在界面跑出来的表
+/// 应当逐格一样。两个前端各写一遍的后果已经出现过——被跳过文件的
+/// 「修改时间」，界面那份填的是空串，命令行那份会去读 `metadata`。
+/// 这类偏差不报错、不影响产物，只有真去比对两份报告时才会发现。
+///
+/// ## 台账口径
+///
+/// - **被跳过的文件也进「文件清单」**，状态记 `SKIP`、原因进「备注」，
+///   尺寸与修改时间现读磁盘（读不出来记 0 / 空，不因此中断导出）。
+///   QA 归档要能回答"这个文件为什么没被处理"。
+/// - **规则数**取本次实际生效的规则条数；被跳过的文件没跑规则，
+///   但"本该按几条规则处理"同样是事实，照填。
+/// - **SHA256 截前 16 位**：整串 64 位在表里挤成一团反而看不清，
+///   核对用途下足够；完整值要从日志取。
+/// - 「查找内容」按 `rule_id` 回查规则得到——命中项本身只存 `replaced_by`，
+///   不存 `find`，是为了让报告里"查找→替换"这一对与规则快照对得上。
+pub fn rows_from_run(res: &RunResult, rules: &[Rule]) -> RunRows {
+    let mut files: Vec<FileRow> = res
+        .outcomes
+        .iter()
+        .map(|o| FileRow {
+            file: file_name_of(&o.src),
+            path: o.src.display().to_string(),
+            size_kb: o.size_kb,
+            mtime: o.mtime.clone(),
+            rule_count: o.rule_count,
+            total_hits: o.hits.len(),
+            applied: o.applied,
+            conflicts: o.conflicts,
+            status: o.status.to_string(),
+            sha_before: short_sha(&o.sha_before),
+            sha_after: short_sha(&o.sha_after),
+            parts_changed: o.parts.join(" "),
+            note: o.note.clone(),
+        })
+        .collect();
+
+    for s in &res.skipped {
+        let md = std::fs::metadata(&s.path).ok();
+        files.push(FileRow {
+            file: file_name_of(&s.path),
+            path: s.path.display().to_string(),
+            size_kb: md
+                .as_ref()
+                .map(|m| m.len() as f64 / 1024.0)
+                .unwrap_or(0.0),
+            mtime: md
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| crate::pipeline::format_epoch(d.as_secs()))
+                .unwrap_or_default(),
+            rule_count: rules.len(),
+            total_hits: 0,
+            applied: 0,
+            conflicts: 0,
+            status: "SKIP".to_string(),
+            sha_before: String::new(),
+            sha_after: String::new(),
+            parts_changed: String::new(),
+            note: s.reason.clone(),
+        });
+    }
+
+    let mut hits: Vec<HitRow> = Vec::new();
+    for o in &res.outcomes {
+        let fname = file_name_of(&o.src);
+        for h in &o.hits {
+            hits.push(HitRow {
+                file: fname.clone(),
+                rule_id: h.rule_id,
+                find: rules
+                    .iter()
+                    .find(|r| r.id == h.rule_id)
+                    .map(|r| r.find.clone())
+                    .unwrap_or_default(),
+                replace: h.replaced_by.clone(),
+                slot: h.slot.label().to_string(),
+                para: h.para,
+                matched: h.matched.clone(),
+                applied: h.applied,
+                reason: h.reason.clone(),
+                strategy: h.strategy.clone(),
+            });
+        }
+    }
+
+    let rows = rules
+        .iter()
+        .map(|r| RuleRow {
+            id: r.id,
+            enabled: r.enabled,
+            find: r.find.clone(),
+            replace: r.replace.clone(),
+            scope: r.scope.display().to_string(),
+            case_sensitive: r.case_sensitive,
+            whole_word: r.whole_word,
+            kana_sensitive: r.kana_sensitive,
+            wildcard: r.use_wildcard,
+            note: r.note.clone(),
+        })
+        .collect();
+
+    RunRows { files, hits, rules: rows }
+}
+
+fn file_name_of(p: &Path) -> String {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// SHA256 只留前 16 位（见 [`rows_from_run`] 的口径说明）。
+fn short_sha(s: &str) -> String {
+    if s.is_empty() {
+        String::new()
+    } else {
+        s.chars().take(16).collect()
     }
 }
 
@@ -1052,4 +1193,140 @@ fn col_index(reff: &str) -> usize {
         }
     }
     v.saturating_sub(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Hit;
+    use crate::pipeline::{Outcome, RunResult, Skipped};
+    use crate::rules::Slot;
+    use std::path::PathBuf;
+
+    /// 建在测试二进制旁边，不用 `%TEMP%`：本机 `%TEMP%` 在 C 盘，
+    /// 那里对非系统进程不是稳定可写（见 `verify` 模块同款注释）。
+    fn scratch(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().expect("取当前测试可执行文件路径");
+        let dir = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(exe.as_path())
+            .join("wrepl-report-tmp");
+        std::fs::create_dir_all(&dir).expect("建测试临时目录");
+        dir.join(name)
+    }
+
+    fn hit(rule_id: u32, matched: &str, applied: bool) -> Hit {
+        Hit {
+            rule_id,
+            para: 3,
+            slot: Slot::Body,
+            a: 0,
+            b: matched.len(),
+            matched: matched.to_string(),
+            replaced_by: format!("<{matched}>"),
+            applied,
+            reason: if applied { String::new() } else { "冲突".into() },
+            strategy: "整段".into(),
+        }
+    }
+
+    fn outcome(src: &str, hits: Vec<Hit>, applied: usize) -> Outcome {
+        Outcome {
+            src: PathBuf::from(src),
+            dst: None,
+            status: "OK",
+            hits,
+            parts: vec!["word/document.xml".into()],
+            conflicts: 0,
+            applied,
+            note: String::new(),
+            sha_before: "0123456789abcdef0123456789abcdef".into(),
+            sha_after: "fedcba9876543210fedcba9876543210".into(),
+            size_kb: 12.5,
+            mtime: "2026-10-20 10:00:00".into(),
+            rule_count: 2,
+            verdict: None,
+            mirrored: false,
+            written: true,
+        }
+    }
+
+    /// 被跳过的文件必须带上磁盘事实（尺寸 + 修改时间）。
+    ///
+    /// 这条钉的是**两处实现漂移**：界面那份抄的时候把 `mtime` 写成了空串，
+    /// 而命令行那份会去读 `metadata`。同一批文件在两个前端各导一份报告，
+    /// 「文件清单」表会不一样——归档时以为是两批不同的输入。
+    #[test]
+    fn skip_row_carries_disk_facts() {
+        let path = scratch("skip-row.docx");
+        std::fs::write(&path, vec![b'x'; 2048]).expect("写测试文件");
+
+        let res = RunResult {
+            outcomes: vec![],
+            skipped: vec![Skipped {
+                path: path.clone(),
+                reason: "不是 docx".into(),
+            }],
+            ..Default::default()
+        };
+
+        let rows = rows_from_run(&res, &[]);
+        assert_eq!(rows.files.len(), 1);
+        let f = &rows.files[0];
+        assert_eq!(f.status, "SKIP");
+        assert_eq!(f.note, "不是 docx");
+        assert_eq!(f.file, "skip-row.docx");
+        assert!(
+            (f.size_kb - 2.0).abs() < 0.01,
+            "尺寸应现读磁盘，实际 {}",
+            f.size_kb
+        );
+        assert!(
+            !f.mtime.is_empty(),
+            "被跳过文件的修改时间不能是空串（这正是界面那份抄漏的字段）"
+        );
+    }
+
+    /// 命中行的「查找内容」按 `rule_id` 回查规则表，规则清单按原顺序展开；
+    /// 拼不出规则时留空而不是丢掉整行。
+    #[test]
+    fn hit_rows_look_up_find_and_rules_keep_order() {
+        let rules = vec![
+            Rule::new(1, "冻干机", "清洗机"),
+            Rule::new(2, "冻干", "清洗"),
+        ];
+        // 第 2 条命中两次、第 9 条是本次没带上规则的旧命中
+        let res = RunResult {
+            outcomes: vec![outcome(
+                "D:/in/a.docx",
+                vec![hit(2, "冻干", true), hit(2, "冻干", true), hit(9, "幽灵", false)],
+                2,
+            )],
+            ..Default::default()
+        };
+
+        let rows = rows_from_run(&res, &rules);
+
+        assert_eq!(rows.hits.len(), 3);
+        assert_eq!(rows.hits[0].find, "冻干", "find 必须来自规则表而不是命中项");
+        assert_eq!(rows.hits[0].file, "a.docx");
+        assert_eq!(rows.hits[0].slot, "正文");
+        assert_eq!(rows.hits[0].replace, "<冻干>");
+        assert_eq!(rows.hits[2].find, "", "查不到规则时留空，不丢行");
+
+        assert_eq!(rows.rules.len(), 2);
+        assert_eq!(
+            rows.rules.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "规则清单必须保持规则表原顺序（报告要能对着规则表逐条核）"
+        );
+        assert_eq!(rows.rules[0].scope, "全部", "Scope::ALL 的显示名");
+        assert!(rows.rules[0].enabled);
+
+        // SHA 截 16 位：整串 64 位在表里挤成一团
+        assert_eq!(rows.files[0].sha_before, "0123456789abcdef");
+        assert_eq!(rows.files[0].sha_after, "fedcba9876543210");
+        assert_eq!(rows.files[0].parts_changed, "word/document.xml");
+    }
 }
