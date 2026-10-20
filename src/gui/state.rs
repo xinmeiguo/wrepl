@@ -166,13 +166,23 @@ pub fn path() -> Option<PathBuf> {
 /// 读状态。**任何失败都返回 `None`**，并把原因记进日志。
 pub fn load() -> Option<State> {
     let p = path()?;
-    let st = load_from(&p)?;
-    crate::diag::log(format!(
-        "已读回界面状态：{} 条规则（{}）",
-        st.rules.len(),
-        p.display()
-    ));
-    Some(st)
+    match read_state(&p) {
+        // 第一次启动（文件还不存在）是**正常情况**，不该往日志里写东西
+        Ok(None) => None,
+        Ok(Some(st)) => {
+            crate::diag::log(format!(
+                "已读回界面状态：{} 条规则（{}）",
+                st.rules.len(),
+                p.display()
+            ));
+            Some(st)
+        }
+        Err(e) => {
+            // 坏文件**不删**：万一里面有用户手写的东西，留着让他自己看。
+            crate::diag::log(format!("界面状态读不出来（按默认值继续）：{e}"));
+            None
+        }
+    }
 }
 
 /// 落盘。返回给人看的错误文本（调用方只记日志，不弹窗）。
@@ -181,16 +191,19 @@ pub fn save(st: &State) -> Result<(), String> {
     save_to(&p, st)
 }
 
-fn load_from(p: &Path) -> Option<State> {
-    let raw = std::fs::read_to_string(p).ok()?;
-    match serde_json::from_str::<State>(&raw) {
-        Ok(st) => Some(st),
-        Err(e) => {
-            // 坏文件不删：万一里面有用户手写的东西，留着让他自己看。
-            crate::diag::log(format!("界面状态读不出来（按默认值继续）：{e}"));
-            None
-        }
-    }
+/// 读文件 → 解析。**不记日志**：测试会故意喂坏文件，让它往用户的真实日志里
+/// 写"界面状态读不出来"，下一个人查问题时就会对着一条假线索发呆（真栽过一次）。
+/// 记日志的活留给 [`load`]，那里能区分"文件还不存在"（正常）与"文件坏了"。
+///
+/// 返回：`Ok(None)` = 文件不存在；`Ok(Some)` = 读到了；
+/// `Err` = 存在但读不出来（原因给人看）。
+fn read_state(p: &Path) -> Result<Option<State>, String> {
+    let raw = match std::fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}：{e}", p.display())),
+    };
+    serde_json::from_str::<State>(&raw).map(Some).map_err(|e| e.to_string())
 }
 
 /// 先写 `state.json.tmp` 再改名。见模块头第 3 条。
@@ -253,13 +266,15 @@ mod tests {
         assert_eq!(st.rules.len(), 1, "规则表照常读进来");
     }
 
-    /// 坏 JSON → `None`，不 panic。
+    /// 坏 JSON → `Err`（调用方按默认值继续），文件不存在 → `Ok(None)`。
+    ///
+    /// 两者**必须分得开**：不存在是第一次启动的正常情况，不该在日志里报错。
     #[test]
     fn 坏文件读成没有() {
         let p = scratch("broken.json");
         std::fs::write(&p, b"{ this is not json ").expect("写测试文件");
-        assert!(load_from(&p).is_none());
-        assert!(load_from(&scratch("not-there.json")).is_none());
+        assert!(read_state(&p).is_err(), "坏文件要报出来（调用方据此记日志）");
+        assert_eq!(read_state(&scratch("not-there.json")).ok(), Some(None));
     }
 
     /// 转义往返：引号、反斜杠、换行、制表符、中日文、emoji 一个都不许变。
@@ -315,7 +330,7 @@ mod tests {
             ..Default::default()
         };
         save_to(&p, &st).expect("写状态");
-        assert_eq!(load_from(&p).as_ref(), Some(&st));
+        assert_eq!(read_state(&p).ok().flatten().as_ref(), Some(&st));
         let tmp = p.with_extension("json.tmp");
         assert!(!tmp.exists(), "临时文件必须已经被改名走，不该留在目录里");
 
@@ -325,6 +340,6 @@ mod tests {
             ..Default::default()
         };
         save_to(&p, &st2).expect("覆盖写状态");
-        assert_eq!(load_from(&p).as_ref(), Some(&st2));
+        assert_eq!(read_state(&p).ok().flatten().as_ref(), Some(&st2));
     }
 }
