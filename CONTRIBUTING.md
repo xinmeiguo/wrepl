@@ -277,16 +277,16 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 拼进 Release 正文。所以：
 
 ```markdown
-## [0.5.0] - 2026-10-19
+## [0.6.0] - 2026-10-20
 
-> - 新增：批量打印页多一条下游 —— **导出 PDF**：同一份清单、同一个页码字段，既能送打印机也能落成 PDF。
-> - 新增：**没装 Microsoft Word 的机器可以降级用 WPS 导 PDF**（先亮黄条、点导出再确认，打印仍要求 Word）。
-> - 仓库：`regress.sh` 的可移植性补完 —— 夹具不再写死本机路径，缺了跳过而不是报红。
+> - 移除：页眉替换不再有「Word COM」这一个选项 —— 只留纯 Rust 一条路，目标机器彻底不用装 Word；打印与导出仍然需要 Microsoft Word。
+> - 界面：页眉替换页的「执行方式」卡片改成「落盘方式」，只剩「直接改写源文件」一个勾选。
+> - 修复：打印中途 panic 或提前返回时，Word 的全局默认打印机仍会恢复。
 
 ### 明细小节（写多细都行，不会进 Release 正文）
 ```
 
-- 标题写成 `## [0.5.0] - 2026-10-19`（方括号里与 tag 去掉 `v` 后一致）；
+- 标题写成 `## [0.6.0] - 2026-10-20`（方括号里与 tag 去掉 `v` 后一致）；
 - 标题下面**紧跟那组引用行**；
 - **引用行只写主要条目** —— 实现细节（文件名、行号、实测数字）放下面的明细；
 - **找不到对应小节、或小节里没有这组引用行 → 发版失败并明确报错**
@@ -297,7 +297,7 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 | 位置 | 说明 |
 |---|---|
 | `Cargo.toml` 的 `version` | 唯一真源 |
-| `README.md` 的启动日志示例 | `======== wrepl-gui v0.5.0 启动 ========` —— 这行来自 `env!("CARGO_PKG_VERSION")`，不改就对不上 |
+| `README.md` 的启动日志示例 | `======== wrepl-gui v0.6.0 启动 ========` —— 这行来自 `env!("CARGO_PKG_VERSION")`，不改就对不上 |
 | `Cargo.lock` 里 `name = "wrepl"` 那一条 | **按 `name = "wrepl"` 定位，别按版本号全文替换** —— 别的 crate 也可能是同一个号（0.4.2 时 `xkbcommon-dl` 就是）。改完跑 `cargo metadata --locked --offline`，退出码必须是 0 |
 
 ### 3.4 提交信息

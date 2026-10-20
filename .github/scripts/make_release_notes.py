@@ -54,8 +54,8 @@ DOWNLOAD_BLOCK = """## 下载
 | **`wrepl-gui.exe`** | **图形界面 —— 双击这个** |
 | `wrepl.exe` | 命令行版，在 cmd / PowerShell 里运行（双击它只会一闪而过） |
 
-自带运行时，**不需要额外装 DLL**。正文替换不依赖 Office；
-「页眉替换」与「打印 / 导出 PDF」走本机的 Word（只有 WPS 时可降级导 PDF，分页会不同）。
+自带运行时，**不需要额外装 DLL**。正文替换与页眉替换都**不依赖 Office**（纯 Rust 改 OOXML）；
+只有「打印 / 导出 PDF」走本机的 Word（只有 WPS 时可降级导 PDF，分页会不同）。
 包内附 `README.md`、`LICENSE`、`CHANGELOG.md`，以及同目录的 `.sha256` 校验值。"""
 
 
