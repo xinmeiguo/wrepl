@@ -698,18 +698,7 @@ pub fn process_one(
 
     let conflicts = hits.iter().filter(|h| !h.applied).count();
     let applied = hits.iter().filter(|h| h.applied).count();
-    // ★ 文件级 SHA256 按需才算：整读两遍 + 两次 SHA256，只有报告与完整镜像用得上。
-    let sha_before = if want_sha { file_sha(src)? } else { String::new() };
 
-    let meta = std::fs::metadata(src)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| format_epoch(d.as_secs()))
-        .unwrap_or_default();
-
-    let mut sha_after = sha_before.clone();
     let mut note = String::new();
     let mut verdict: Option<verify::PairVerdict> = None;
     let mut snap_err: Option<String> = None;
@@ -718,18 +707,21 @@ pub fn process_one(
     // 这样"部分落笔 + 部分冲突"（`status = CONFLICT`）的产物不会被当成"未产出"。
     let mut written = false;
 
-    if !dry && !replaced.is_empty() {
-        // ★★ **就地替换的验证基准只能在这里扣下来。**
-        //
-        // 下面那一步会把 `src` 覆盖掉；覆盖之后，`src` 指的就是产物本身了。
-        // 不留基准的话，"执行后自动验证"只能拿这个文件跟它自己比 ——
-        // 关卡 1/2 必然全等通过，报表一片绿，实际什么都没验。
-        //
-        // 而且关卡 1 现在比的是**压缩字节**（见 `verify::compare_level1`）：
-        // 就地替换下"原件的那段压缩字节"同样只存在于覆盖之前 —— 所以不能只留指纹，
-        // 得把**整份原件字节**留在手上（`Arc`，比完即丢）。顺带省一次读盘：
-        // 这份字节本来就是就地改写要用的（`rewrite_in_place_with`）。
-        let origin: Option<std::sync::Arc<Vec<u8>>> = if in_place && want_verify {
+    // ★★ **就地替换的验证基准只能在这里扣下来。**
+    //
+    // 下面那一步会把 `src` 覆盖掉；覆盖之后，`src` 指的就是产物本身了。
+    // 不留基准的话，"执行后自动验证"只能拿这个文件跟它自己比 ——
+    // 关卡 1/2 必然全等通过，报表一片绿，实际什么都没验。
+    //
+    // 而且关卡 1 现在比的是**压缩字节**（见 `verify::compare_level1`）：
+    // 就地替换下"原件的那段压缩字节"同样只存在于覆盖之前 —— 所以不能只留指纹，
+    // 得把**整份原件字节**留在手上（`Arc`，比完即丢）。顺带省一次读盘：
+    // 这份字节本来就是就地改写要用的（`rewrite_in_place_with`）。
+    //
+    // ★ 之所以提到 `sha_before` 之前算：文件级 SHA256 可以直接复用这份字节。
+    //   原来 sha 先 `fs::read` 整读一遍、这里再读一遍，8 MB 的文件就是白读 8 MB。
+    let origin: Option<std::sync::Arc<Vec<u8>>> =
+        if !dry && !replaced.is_empty() && in_place && want_verify {
             match std::fs::read(src) {
                 Ok(b) => Some(std::sync::Arc::new(b)),
                 Err(e) => {
@@ -740,6 +732,28 @@ pub fn process_one(
         } else {
             None
         };
+
+    // ★ 文件级 SHA256 按需才算：只有报告与完整镜像用得上。
+    // 原件字节已在手上（就地 + 要验证）就直接用，别再整读一遍 —— 实测 8 MB 省 10–30 ms。
+    let sha_before = if want_sha {
+        match &origin {
+            Some(b) => hex::encode(Sha256::digest(b.as_slice())),
+            None => file_sha(src)?,
+        }
+    } else {
+        String::new()
+    };
+    let mut sha_after = sha_before.clone();
+
+    let meta = std::fs::metadata(src)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| format_epoch(d.as_secs()))
+        .unwrap_or_default();
+
+    if !dry && !replaced.is_empty() {
         let before = match &origin {
             Some(b) => match verify::snapshot_from_bytes(src, std::sync::Arc::clone(b)) {
                 Ok(s) => Some(s),

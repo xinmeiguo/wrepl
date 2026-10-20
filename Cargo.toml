@@ -80,12 +80,15 @@ egui_sauge = { path = "../egui_sauge", optional = true }
 # 版本必须与 egui_sauge 内部一致（0.12），否则字体表里会出现两个 phosphor。
 egui-phosphor = { version = "0.12", optional = true }
 
-# Word COM —— 页眉替换（文本/图片）与批量打印走这条路。
+# Word COM —— **批量打印与导出 PDF** 走这条路。
 # 晚期绑定（ProgID + IDispatch），不依赖类型库、不挑 Office 版本。
 # 只在 gui feature 下编，CLI 构建完全不拉它。
 #
-# 注意：引入它之后，「页眉替换 / 批量打印」这两项**需要目标机器装 Word**
-# （正文替换不受影响，仍是纯 Rust 改 OOXML）。这条边界不要含糊。
+# 注意：引入它之后，「打印 / 导出 PDF」这两项**需要目标机器装 Word**
+# （正文替换与页眉替换都不受影响，都是纯 Rust 改 OOXML）。这条边界不要含糊。
+#
+# 2026-10-19 起页眉替换的 COM 引擎已退役，只剩纯 Rust 一条路 —— 别再把
+# 「页眉替换要装 Word」写进文档。
 #
 # `Win32_Graphics_Printing` + `Win32_Graphics_Gdi`：批量打印页那张打印机
 # 下拉表要 `EnumPrintersW`（`PRINTER_INFO_2W` 里带 `DEVMODEW` 指针，

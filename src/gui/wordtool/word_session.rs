@@ -7,7 +7,13 @@ use super::wd;
 use windows::core::w;
 
 pub struct WordSession {
-    pub word: Disp,
+    /// 原始 `Application` 句柄。
+    ///
+    /// **只给同 crate 的批处理循环与诊断探针（`wt_probe`）用** —— 它俩要直接
+    /// 发 IDispatch 调用（`Documents` / `ActivePrinter` / `PrintOut` 等）。
+    /// 其余代码别碰：`WordSession` 靠 `Disp` 的 `Drop` 即时 `Release`，
+    /// 一旦有人 `mem::forget` 掉这个字段，Word 进程就变成孤儿了。
+    pub(crate) word: Disp,
 }
 
 impl WordSession {
@@ -51,6 +57,81 @@ impl WordSession {
 
 fn file_name(p: &str) -> &str {
     p.rsplit(['\\', '/']).next().unwrap_or(p)
+}
+
+/// 「临时切换 Word 的全局默认打印机」这件事的守卫。
+///
+/// `ActivePrinter` 不是文档属性，是 **Word 应用级设置**，落在注册表里 ——
+/// 换了不换回来，用户以后从 Word 里点「打印」就默认跑到我们选的那台去，
+/// 而他根本不知道是谁改的。
+///
+/// 正常路径由 [`restore`](PrinterGuard::restore) 显式收尾（能打日志、能补端口、
+/// 能汇报失败）。但 `ActivePrinter` 最危险的时候恰恰是**没走正常路径**：
+/// 批处理中途 panic，或某处 `?` 提前返回 —— 那时函数末尾那几行恢复代码根本跑不到。
+/// `Drop` 是唯一能覆盖这两种情况的钩子，所以恢复逻辑必须**同时**挂在这里
+/// （Drop 里拿不到 `log`，也不再读打印机列表补端口：尽力换回裸名字即可，
+/// 而裸名字 Word 是收的，已实测）。
+struct PrinterGuard<'a> {
+    word: &'a Disp,
+    /// 切换前的原值；`None` = 没切过 / 已经恢复过。
+    previous: Option<String>,
+    /// 显式恢复过了吗？恢复过 `Drop` 就不再碰，免得把用户自己又改的值覆盖掉。
+    restored: bool,
+}
+
+impl<'a> PrinterGuard<'a> {
+    /// `previous` 是**切换前**读到的原值（读不到就传 `None`：没有可恢复的东西）。
+    fn new(word: &'a Disp, previous: Option<String>) -> Self {
+        Self {
+            restored: previous.is_none(),
+            word,
+            previous,
+        }
+    }
+
+    /// 正常收尾。失败只说一句、**不改返回值** —— 打印本身已经完成了，
+    /// 不该因为"没恢复成"就把整批算作失败。
+    fn restore(&mut self, log: &mut dyn FnMut(String)) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        let Some(prev) = self.previous.take() else {
+            return;
+        };
+        // 实测（2026-10-10，本机 MS Word）：`ActivePrinter` 读回来往往是**裸名字**
+        // （`"ApeosPort-V C4475 T2"`），而不是老文档里写的 `"Name on Ne01:"`。
+        // 裸名字 Word 也收（已实测），但带端口的写法才是文档记载的规范形状，
+        // 所以能补上端口就补上 —— 兼容"只认带端口写法"的版本。
+        let restore = if prev.contains(" on ") {
+            prev
+        } else {
+            super::printers::list()
+                .ok()
+                .and_then(|l| {
+                    l.into_iter()
+                        .find(|x| x.name.eq_ignore_ascii_case(&prev))
+                })
+                .map(|x| x.active_string())
+                .unwrap_or(prev)
+        };
+        if let Err(e) = unsafe { self.word.put("ActivePrinter", var_bstr(&restore)) } {
+            log(format!("提示：恢复原打印机失败（{restore}，{e}）"));
+        } else {
+            log(format!("已恢复原打印机：{restore}"));
+        }
+    }
+}
+
+impl Drop for PrinterGuard<'_> {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        if let Some(prev) = self.previous.take() {
+            let _ = unsafe { self.word.put("ActivePrinter", var_bstr(&prev)) };
+        }
+    }
 }
 
 /// 通用批处理骨架：对每个文档执行 action，自动完成 打开 → 处理 → (可选)保存 → 关闭 → 释放 → 日志。
@@ -149,6 +230,11 @@ where
         log(format!("已选用打印机：{want}"));
     }
 
+    // ★ 守卫在**切换之后**建：它拿到的 `previous` 是切换前读到的值，
+    //   之后任何一条退出路径 —— 正常跑完、`batch_loop` 里 panic、某处 `?` 提前
+    //   返回 —— 都会走到它的 `Drop`，轮到那条路径也把用户的默认打印机换回去。
+    let mut guard = PrinterGuard::new(&session.word, previous);
+
     let r = batch_loop(
         &session.word,
         doc_paths,
@@ -159,34 +245,11 @@ where
         done_verb,
     );
 
-    // 恢复原打印机。**失败只说一句，不改返回值** —— 打印本身已经完成了，
-    // 不该因为"没恢复成"就把整批算作失败。
-    if printer.is_some() {
-        if let Some(prev) = previous {
-            // 实测（2026-10-10，本机 MS Word）：`ActivePrinter` 读回来往往是**裸名字**
-            // （`"ApeosPort-V C4475 T2"`），而不是老文档里写的 `"Name on Ne01:"`。
-            // 裸名字 Word 也收（已实测），但带端口的写法才是文档记载的规范形状，
-            // 所以能补上端口就补上 —— 兼容"只认带端口写法"的版本。
-            let restore = if prev.contains(" on ") {
-                prev
-            } else {
-                super::printers::list()
-                    .ok()
-                    .and_then(|l| {
-                        l.into_iter()
-                            .find(|x| x.name.eq_ignore_ascii_case(&prev))
-                    })
-                    .map(|x| x.active_string())
-                    .unwrap_or(prev)
-            };
-            if let Err(e) = unsafe { session.word.put("ActivePrinter", var_bstr(&restore)) } {
-                log(format!("提示：恢复原打印机失败（{restore}，{e}）"));
-            } else {
-                log(format!("已恢复原打印机：{restore}"));
-            }
-        }
-    }
-
+    // 正常收尾：这里能打日志、能补端口，优先于 `Drop` 的裸名字兜底。
+    guard.restore(log);
+    // 显式 drop 结束对 `session.word` 的借用（下面 `cleanup()` 要 `&mut`）。
+    // `restored` 已置位，这次 Drop 不会再碰打印机。
+    drop(guard);
     session.cleanup();
     r
 }

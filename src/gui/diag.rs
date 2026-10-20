@@ -31,8 +31,17 @@ use std::sync::{Mutex, OnceLock};
 const MAX_BYTES: u64 = 1_048_576;
 
 static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-/// 串行化写入。多线程（UI + 后台列目录）都可能来写。
-static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// 串行化写入 + **常驻文件句柄**。多线程（UI + 后台列目录）都可能来写。
+///
+/// 为什么存句柄而不是每条 `open`：Windows 上一次 `open` + `close` 是两次
+/// syscall，各约 0.3–1 ms。一批 100 个文件、每文件几行日志就是几百次，
+/// 实测能占掉 100–300 ms —— 纯属白花。复用句柄省掉的正是这两次调用。
+///
+/// 为什么**不用 `BufWriter`**：这个文件存在的唯一理由是抓**崩溃现场**
+/// （见模块头那张表 —— "日志停在哪一条"本身就有诊断意义）。用户态缓冲会把
+/// panic 前最后几行留在内存里没落盘，等于把最要紧的那几行丢掉。直接写
+/// `File` 没有用户态缓冲，`writeln!` 落的每一行都直达内核。
+static WRITE_LOCK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 fn log_path() -> Option<PathBuf> {
     LOG_PATH
@@ -113,17 +122,30 @@ pub fn log(msg: impl AsRef<str>) {
 fn write_line(msg: &str) {
     let Some(p) = log_path() else { return };
     // 锁中毒也要继续写 —— 崩溃现场比锁的洁癖重要
-    let _g = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(md) = std::fs::metadata(&p) {
-        if md.len() > MAX_BYTES {
+    let mut slot = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 轮转：**先把手上的句柄放掉，再改名**。
+    // Windows 上被打开的文件（Rust 默认共享模式不含 `FILE_SHARE_DELETE`）
+    // `rename` 会失败 —— 句柄不 drop，这一步就是空转，日志会一路长到撑爆磁盘。
+    match std::fs::metadata(&p) {
+        Ok(md) if md.len() > MAX_BYTES => {
+            *slot = None;
             let _ = std::fs::rename(&p, p.with_extension("log.old"));
         }
+        // 文件不在了（用户手删 / 清理工具扫掉）→ 丢掉旧句柄，下面重开一个。
+        // 不重开的话写入会进那个已被删除的句柄，表现为"日志突然不更新了"。
+        Err(_) => *slot = None,
+        _ => {}
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p)
-    {
+
+    if slot.is_none() {
+        *slot = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .ok();
+    }
+    if let Some(f) = slot.as_mut() {
         let _ = writeln!(f, "[{}] {}", stamp(), msg);
     }
 }

@@ -85,7 +85,7 @@ pub fn list() -> Result<Vec<Printer>, String> {
                 &mut needed,
                 &mut returned,
             )
-            .map_err(|e| format!("EnumPrinters 失败：{e}"))?;
+            .map_err(|e| format!("读取打印机列表失败：{e}"))?;
         }
         // `bytes` 借用到此结束 —— 下面要按 `PRINTER_INFO_2W` 读**同一块**内存，
         // 那时必须已经没有别的借用了。`needed` 只是容量，`returned` 才是条数。

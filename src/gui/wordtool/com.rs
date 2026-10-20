@@ -27,9 +27,9 @@ pub struct ComInit;
 impl ComInit {
     pub fn sta() -> DispResult<Self> {
         unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-                .ok()
-                .map_err(|_| "COM 初始化失败。".to_string())?;
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().map_err(|e| {
+                format!("COM 初始化失败（错误码 {:#010x}）", e.code().0 as u32)
+            })?;
         }
         Ok(ComInit)
     }
@@ -58,9 +58,22 @@ impl Disp {
     /// 按 ProgID 创建 COM 实例（等价 C# 的 Activator.CreateInstance(Type.GetTypeFromProgID(...))）。
     pub fn from_progid(progid: PCWSTR) -> DispResult<Self> {
         unsafe {
-            let clsid = CLSIDFromProgID(progid).map_err(|_| "Word COM 组件未注册。".to_string())?;
-            let itf: IDispatch = CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER)
-                .map_err(|_| "本机未安装 Word，或 Word COM 组件未注册。".to_string())?;
+            // ★ 两处都带上错误码：`REGDB_E_CLASSNOTREG`（0x80040154）与
+            // `CO_E_SERVER_EXEC_FAILURE` 是两种完全不同的病 —— 前者是"没装"，
+            // 后者是"装了但起不来（安全策略 / 许可 / 别的实例卡住）"。
+            // 只给一句"未注册"，用户只能猜；带上码，报障时能一眼分开。
+            let clsid = CLSIDFromProgID(progid).map_err(|e| {
+                format!(
+                    "Word COM 组件未注册（错误码 {:#010x}）",
+                    e.code().0 as u32
+                )
+            })?;
+            let itf: IDispatch = CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER).map_err(|e| {
+                format!(
+                    "本机未安装 Word，或 Word 没能启动（错误码 {:#010x}）",
+                    e.code().0 as u32
+                )
+            })?;
             Ok(Disp(itf))
         }
     }
@@ -80,7 +93,12 @@ impl Disp {
                     LOCALE_USER_DEFAULT,
                     ids.as_mut_ptr(),
                 )
-                .map_err(|e| format!("未知成员「{name}」（{:#010x}）", e.code().0 as u32))?;
+                .map_err(|e| {
+                    format!(
+                        "Word 不支持「{name}」这个操作（错误码 {:#010x}）",
+                        e.code().0 as u32
+                    )
+                })?;
             Ok(ids[0])
         }
     }
@@ -139,7 +157,7 @@ impl Disp {
                     drop(core::mem::ManuallyDrop::into_inner(core::mem::take(f)));
                 }
                 let msg = if desc.is_empty() {
-                    format!("COM 错误 {:#010x}", e.code().0 as u32)
+                    format!("Word 拒绝了操作（错误码 {:#010x}）", e.code().0 as u32)
                 } else {
                     desc
                 };
@@ -219,7 +237,12 @@ impl Disp {
                     LOCALE_USER_DEFAULT,
                     ids.as_mut_ptr(),
                 )
-                .map_err(|e| format!("未知成员「{name}」（{:#010x}）", e.code().0 as u32))?;
+                .map_err(|e| {
+                    format!(
+                        "Word 不支持「{name}」这个操作（错误码 {:#010x}）",
+                        e.code().0 as u32
+                    )
+                })?;
             let dispids = ids[1..].to_vec();
             let mut r = self.invoke(
                 ids[0],

@@ -3,7 +3,8 @@
 > **这个文件只记"还没做的"和"为什么先不做"。**
 > 做完的进 [`CHANGELOG.md`](../CHANGELOG.md)；过程、约束与验证链进 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。
 >
-> 最后更新：2026-10-19（0.5.0 已发版；增量导出已否决，见 §2.3）
+> 最后更新：2026-10-20（0.5.0 已发版；增量导出已否决，见 §2.3；全项目扫描的
+> 剩余项见 §7，其中「行为不变」的 7 条已落地，见 `CHANGELOG.md`）
 
 ## 0. 顺序不是按"重要性"排的，是按**依赖**排的
 
@@ -47,6 +48,7 @@
 |---|---|---|
 | §2.2 | 界面「预演」入口 | **等你拍板** |
 | §2.3 | 增量导出 | **已否决**（2026-10-19） |
+| §7 | 全项目扫描剩下的 23 条（性能 / 架构 / 边界） | 按优先级排好了，**等你挑** |
 | §4 | 五项品味遗留 + `PERFORMANCE.md` §4 三项 | 已决定先不动 |
 | §5 | 测试覆盖缺口、版本语义 | 不急，迟早要还 |
 
@@ -352,6 +354,56 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 | 没有第二个人 review | ⚠ **仍在**：属团队规模问题，跟依赖无关 |
 
 
+
+---
+
+## 7. 2026-10-20 全项目扫描：还没做的
+
+> 三维度（功能 / 架构 / 性能）扫了一遍，**已落地的 7 条见 `CHANGELOG.md` 的
+> 「顺手清理」一节**（都是行为不变的）。下面是扫出来但**还没动**的，
+> 按"值不值得动"排，不是按重要性。
+
+### 7.1 真实痛点（有明确收益，但要动设计）
+
+| 项 | 位置 | 收益 / 代价 |
+|---|---|---|
+| **批量验证 / 侦察并行化 + 单次开容器** | `probe.rs:312`、`verify.rs:1246` | 这两处都是 `inspect()` + 每个 part 再 `read_part` —— **N+1 次开容器**；`pair_dirs` / `probe_dir` 还全串行。改 `read_parts_where` + `parallel_map`：50 文件批量验证省 5–10s。**纯 Rust、无 COM、用户高频路径**，是这份清单里收益最大的单项 |
+| **报告行构造下沉到 `report` 模块** | `main.rs:402-606` vs `app.rs:2846-3005` | CLI 与 GUI 各写一份 `FileRow` / `HitRow` / `RuleRow` / `ReportMeta`；`short` / `short_sha` 同函数两名；verdict 文案已漂移（CLI 多 `name_warn` 一档）。下沉同时消三条重复 |
+| **GUI 错误类型统一成 `anyhow::Result`** | `app.rs` 6 处、`picker.rs:1842`、`printers.rs:56`、`services.rs:83` | GUI 侧整片 `Result<_, String>`，边界处一堆 `map_err(|e| format!("…{e:#}"))`。统一后只在 toast / 日志那一层转 String。**注意：`{e:#}` 本身是对的**（anyhow 链式 Display），别改成 `{e}` |
+| **取消信号 + 关窗 join** | `app.rs:186` `Job { rx, handle }` | 执行中按钮只能变「执行中…」；关窗时 `JoinHandle` drop 不 join，后台线程 + Word 进程变孤儿。加 `Arc<AtomicBool>`，worker 在**每个文件边界**检查；eframe `on_exit` 发信号 + join |
+| **规则表 / 主题 / PDF 设置持久化** | `diag.rs:57-106` | 只存「上次目录」一个值，规则表整张关窗即失。落 `%LOCALAPPDATA%\wrepl\state.json`（与 `last-dir.txt` 同目录） |
+| **CLI ↔ GUI 功能对齐** | `cli.rs:84-207`、`app.rs:1851` | `Inspect/Passthrough/Diff/Dump/Probe/Verify --batch` GUI 无入口；规则表的 `区分大小写 / 全字匹配 / 区分全半角 / 作用域` 只能 Excel 往返调；`--exclude` / `--threads` 在界面上被隐掉 |
+
+### 7.2 结构 / 维护性（改动量大，收益是"以后好改"）
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| `Picker::content` 拆段 | `picker.rs:1245-1836` | 591 行单函数、6 层嵌套。拆 header / list / rubber_band / status_bar / action_bar |
+| `process_one` 参数收进 `ProcessCtx` | `pipeline.rs:668` | 11 个位置参数，已出现过 `want_sha` 与 `mirror` 顺位搞反的注释风险 |
+| `App::render` 拆段 | `app.rs:1219-1481` | 262 行；topbar / sidebar / bottombar 各抽 `fn` |
+| `WordTool::ui_print` 拆段 | `ui.rs:682-952` | 270 行画四张卡 |
+| `WordTool` 字段私有化 | `ui.rs:155-208` | 20+ 字段全 `pub`；生产代码只用方法访问，直接读写只发生在 `selftest` |
+| `adjudicate` / `mark_overlap` 的 O(N²) | `engine.rs:380-389`、`naming.rs:111-124` | 真实 N 通常 1–3，长规则表才涨。按 `a` 排序 + 维护右端 max → O(N log N) |
+
+### 7.3 边界场景 / 细节
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| Word「文档修复」模态框会卡死整批 | `word_session.rs` `batch_loop` | `DisplayAlerts=none` 挡不住损坏文档的修复对话框，且 Word 不可见 → 用户看不到，批次一直等。建议每个文档 60s 超时后强制 `Close` 跳过 |
+| 超大文件一次性读进内存 | `pipeline.rs` `process_one` | 不设上限；GUI 又没有 `--threads` 旋钮。建议「单文件超 50 MB 自动降到单线程」 |
+| `EnumPrintersW` 可能卡 UI 首帧 | `printers.rs:list`、`ui.rs:310` | 本机几毫秒，网络打印机 / 域控环境实测能到几百毫秒。建议放后台线程，下拉先空着 |
+| `F5` 实际跑的是 dry_run，但界面上没有「预演」按钮 | `app.rs:2229` | 名字 / 行为 / 按钮三处对不上。要么补按钮、要么写进帮助（与 §2.2 的「预演入口」是同一件事） |
+| 另两页没有快捷键、导航不能键盘切 | `app.rs:2209-2236`、`1289` | `Ctrl+Enter` 只在批量替换页生效；建议按 `self.page` 分发，另加 `Ctrl+1/2/3` 切页 |
+| 聚焦框可见性弱 | `ds::apply` | egui 默认在 Windows 上偏弱，Tab 导航看不出焦点 |
+| WPS 确认框里的「Tagged 标签」是术语 | `engine.rs:82` | 改「PDF 没有结构标签（屏幕阅读器读不了）」或直接删掉这半句 |
+| 建窗失败的提示术语密集 | `diag.rs:296-345` | 补一句「到 Intel / NVIDIA / AMD 官网按机型搜『显卡驱动』」比「整机厂官网的驱动包」具体 |
+| `windows` 的 `Win32_Graphics_Gdi` 可能是死 feature | `Cargo.toml:93-105` | 全代码 0 处直接调用，`pinners.rs` 只读 `pPrinterName` / `pPortName`，从不碰 `pDevMode`。试砍，能编过就省 1–3s 编译时间 |
+| 引擎热路径的小分配 | `engine.rs:67` `fold`、`:230` `matched`、`verify.rs:597` `deleted` | `fold()` 每次 `Vec<char>`；`matched` / `deleted` 用 owned String。长文档场景合计 5–15% 引擎时间 |
+| `hdr.rs` 的开标签解析 | `hdr.rs:1146` `find_sub`、`:1159` `each_attr` | 朴素 O(N·M) 子串查找 + 每次重扫整个开标签。多节文档省 5–20ms/文件 |
+
+**没列进来的**：`residue` 重复解压、整文件 SHA256、启动读 `msyh.ttc`、wgpu DX12、
+`#51` egui_sauge SHA、五项 `ds::*` 品味遗留 —— 这些在 §2 / §4 / PERFORMANCE 里
+已有明确结论，不再重复。
 
 ---
 
