@@ -237,7 +237,7 @@ cargo check --features gui --offline
 
 # ② 单元测试（★ 两个都要跑，这是两套不同的测试集）
 cargo test --features gui --offline --lib                 # 期望 83 passed / 0 failed
-cargo test --features gui --offline --bin wrepl-gui       # 期望 89 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui       # 期望 92 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
@@ -278,16 +278,20 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 拼进 Release 正文。所以：
 
 ```markdown
-## [0.6.0] - 2026-10-20
+## [0.7.0] - 2026-10-21
 
-> - 移除：页眉替换不再有「Word COM」这一个选项 —— 只留纯 Rust 一条路，目标机器彻底不用装 Word；打印与导出仍然需要 Microsoft Word。
-> - 界面：页眉替换页的「执行方式」卡片改成「落盘方式」，只剩「直接改写源文件」一个勾选。
-> - 修复：打印中途 panic 或提前返回时，Word 的全局默认打印机仍会恢复。
+> - 新增：界面状态自动保存 —— **规则表、主题、「打印与导出」设置（含选中的打印机）关窗不再丢**，落 `%LOCALAPPDATA%\wrepl\state.json`。
+> - 界面：批量替换的进度条换成与「页眉替换」**同一个组件**（细条 + 文案在上），不再用 egui 自带那个文字压在条里、定宽 320 px 的。
+> - 修复：界面导出的报告里，「被跳过文件的修改时间」一直是空串（命令行那份是好的）；两份实现已合成一份。
+> - 架构：报告行构造下沉到 `report` 模块，命令行与界面共用；`short` / `short_sha` 同函数两名一并消掉。
+> - 性能：「侦察目录」与批量验证改成**按文件并行**，且一个文件只开一次容器 —— 26 个真实交付包上侦察快 **1.96×**、批量验证快 **1.69×**，输出逐字相同。
 
 ### 明细小节（写多细都行，不会进 Release 正文）
 ```
 
-- 标题写成 `## [0.6.0] - 2026-10-20`（方括号里与 tag 去掉 `v` 后一致）；
+★ 这段示例**是真实的最近一版内容**，换版号时**连内容一起换** —— 只改数字会让它变成假话。
+
+- 标题写成 `## [0.7.0] - 2026-10-21`（方括号里与 tag 去掉 `v` 后一致）；
 - 标题下面**紧跟那组引用行**；
 - **引用行只写主要条目** —— 实现细节（文件名、行号、实测数字）放下面的明细；
 - **找不到对应小节、或小节里没有这组引用行 → 发版失败并明确报错**
@@ -298,7 +302,7 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 | 位置 | 说明 |
 |---|---|
 | `Cargo.toml` 的 `version` | 唯一真源 |
-| `README.md` 的启动日志示例 | `======== wrepl-gui v0.6.0 启动 ========` —— 这行来自 `env!("CARGO_PKG_VERSION")`，不改就对不上 |
+| `README.md` 的启动日志示例 | `======== wrepl-gui v0.7.0 启动 ========` —— 这行来自 `env!("CARGO_PKG_VERSION")`，不改就对不上 |
 | `Cargo.lock` 里 `name = "wrepl"` 那一条 | **按 `name = "wrepl"` 定位，别按版本号全文替换** —— 别的 crate 也可能是同一个号（0.4.2 时 `xkbcommon-dl` 就是）。改完跑 `cargo metadata --locked --offline`，退出码必须是 0 |
 
 ### 3.4 提交信息
@@ -310,7 +314,7 @@ vX.Y.Z：一句话说清这版干了什么
 - 修复：…
 - 交互：…
 
-验证：cargo check/build 0 error 且自家代码零警告；cargo test --lib 83 / --bin 89 全绿；
+验证：cargo check/build 0 error 且自家代码零警告；cargo test --lib 83 / --bin 92 全绿；
 regress.sh 通过 78 / 失败 0，含 26/26 SHA256 与基线完全相同。
 ```
 

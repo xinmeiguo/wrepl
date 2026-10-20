@@ -205,6 +205,31 @@ struct Job {
     log_path: PathBuf,
 }
 
+/// 进度条要显示的（比例, 文案）。
+///
+/// 一整批有五段：收集 → 预分配路径 → 逐文件改写 → 同步文件名 → 验证。
+/// 只显示第三段会"满格之后还干等"，所以阶段 4/5 各自报 `Msg::Stage`，文案跟着切：
+/// `改写中… 12 / 180` → `同步文件名… 40 / 180` → `验证产物… 90 / 180`。
+///
+/// 抽成纯函数是为了能脱窗测：这四个分支的顺序**不能调换**
+/// （`done >= total` 若排在 `total == 0` 前面，空批次一进去就是"正在收尾…"）。
+fn progress_of(job: &Job) -> (f32, String) {
+    match &job.stage {
+        Some((name, i, t)) if *t > 0 => (
+            (*i as f32 / *t as f32).clamp(0.0, 1.0),
+            format!("{name}… {i} / {t}"),
+        ),
+        // 还在收集：连总数都没定下来
+        _ if job.total == 0 => (0.0, "正在收集待处理文件…".to_string()),
+        // 阶段 3 报完了、但阶段 4/5 的第一条消息还没到（或这两段本来就不跑）
+        _ if job.done >= job.total => (1.0, "正在收尾…".to_string()),
+        _ => (
+            (job.done as f32 / job.total as f32).clamp(0.0, 1.0),
+            format!("改写中… {} / {} 个文件", job.done, job.total),
+        ),
+    }
+}
+
 /// 开窗时预先填好的参数。
 ///
 /// 用途有二：① `--selftest` 共用同一套"装载"逻辑；
@@ -1578,24 +1603,11 @@ impl App {
             //   改写中… 12 / 180 → 同步文件名… 40 / 180 → 验证产物… 90 / 180
             if let Some(job) = &self.job {
                 ui.add_space(4.0);
-                let (frac, text) = match &job.stage {
-                    Some((name, i, t)) if *t > 0 => (
-                        (*i as f32 / *t as f32).clamp(0.0, 1.0),
-                        format!("{name}… {i} / {t}"),
-                    ),
-                    _ if job.total == 0 => (0.0, "正在收集待处理文件…".to_string()),
-                    // 阶段 3 报完了、但阶段 4/5 的第一条消息还没到（或这两段本来就不跑）
-                    _ if job.done >= job.total => (1.0, "正在收尾…".to_string()),
-                    _ => (
-                        (job.done as f32 / job.total as f32).clamp(0.0, 1.0),
-                        format!("改写中… {} / {} 个文件", job.done, job.total),
-                    ),
-                };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(RichText::new(text).small())
-                        .desired_width(320.0),
-                );
+                let (frac, text) = progress_of(job);
+                // 与「页眉替换」页共用一个组件（`ds::ProgressBar`：标签在上、细条满宽）。
+                // 原先是 egui 自带的那个（文字压在条内、定宽 320 px）——同一个程序里
+                // 两条进度条长得不一样，看着像两个不同的任务。
+                ui.add(ds::ProgressBar::new(frac).label(&text));
             }
             if let Some((msg, ok)) = &self.toast {
                 ui.add_space(4.0);
@@ -4609,5 +4621,70 @@ mod tests {
         );
         let kb: f64 = row[2].parse().expect("大小列应是数字");
         assert!((kb - 3.0).abs() < 0.01, "大小应现读磁盘，实际 {kb}");
+    }
+
+    // ═══════════════════ 进度条文案 ═══════════════════
+
+    /// 造一个只用来算进度文案的任务（不跑后台线程，通道那头立刻丢弃）。
+    fn 假任务(total: usize, done: usize, stage: Option<(&str, usize, usize)>) -> Job {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        Job {
+            rx,
+            handle: None,
+            total,
+            done,
+            stage: stage.map(|(n, i, t)| (n.to_string(), i, t)),
+            started: std::time::Instant::now(),
+            rules: vec![],
+            opts: Options::default(),
+            paths: vec![],
+            dry: false,
+            report_path: PathBuf::new(),
+            log_path: PathBuf::new(),
+        }
+    }
+
+    /// 四个分支各归各位：收集 / 改写中 / 阶段 4-5 / 收尾。
+    #[test]
+    fn 进度文案跟着阶段切() {
+        let (f, t) = progress_of(&假任务(0, 0, None));
+        assert_eq!((f, t.as_str()), (0.0, "正在收集待处理文件…"));
+
+        let (f, t) = progress_of(&假任务(180, 12, None));
+        assert_eq!(t, "改写中… 12 / 180 个文件");
+        assert!((f - 12.0 / 180.0).abs() < 1e-6);
+
+        let (f, t) = progress_of(&假任务(180, 180, Some(("同步文件名", 40, 180))));
+        assert_eq!(t, "同步文件名… 40 / 180");
+        assert!((f - 40.0 / 180.0).abs() < 1e-6);
+
+        let (f, t) = progress_of(&假任务(180, 180, Some(("验证产物", 90, 180))));
+        assert_eq!(t, "验证产物… 90 / 180");
+        assert!((f - 90.0 / 180.0).abs() < 1e-6);
+    }
+
+    /// **分支顺序守卫**：空批次必须停在「正在收集」，不能一进去就喊「正在收尾」。
+    ///
+    /// `total == 0` 时 `done >= total` 也成立（0 >= 0）——两条判断谁在前面，
+    /// 决定空目录是"正在找文件"还是"马上就好"。后者会让人一直等一个已经结束的任务。
+    /// 同理，阶段消息的 `i > t` 也要钳到 1.0，否则进度条会画到框外。
+    #[test]
+    fn 空批次不喊收尾_比例不出界() {
+        let (f, t) = progress_of(&假任务(0, 0, None));
+        assert!(t.contains("收集"), "空批次应显示收集，实际「{t}」");
+        assert_eq!(f, 0.0);
+
+        let (f, _) = progress_of(&假任务(0, 0, Some(("验证产物", 0, 0))));
+        assert_eq!(f, 0.0, "总数 0 的阶段消息不该算出 NaN");
+
+        let (f, _) = progress_of(&假任务(5, 5, Some(("验证产物", 9, 5))));
+        assert_eq!(f, 1.0, "分子大于分母要钳到 1.0");
+    }
+
+    /// 阶段 3 数完但阶段 4/5 还没来消息时，显示「正在收尾」而不是停在满格无文案。
+    #[test]
+    fn 满格之后显示收尾() {
+        let (f, t) = progress_of(&假任务(180, 180, None));
+        assert_eq!((f, t.as_str()), (1.0, "正在收尾…"));
     }
 }
