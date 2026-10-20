@@ -24,6 +24,7 @@
 //! | [`verify`] | 格式保全关卡 1+2、残留自检、批量验证 |
 //! | [`report`] | 归档级 Excel 报告（封面 + 汇总 + 明细 + 文件清单 + 规则快照） |
 //! | [`probe`] | 侦察：从目录里扫出候选项目编号与客户名 |
+//! | [`par`] | 零依赖并行映射：按索引并行、结果按索引归位 |
 //! | [`pipeline`] | 流水线：收集 → 改写 → 改名 → 验证 → 汇总，CLI 与 GUI 共用 |
 //! | [`cli`] | 命令行参数定义（GUI 不依赖它） |
 
@@ -32,6 +33,7 @@ pub mod docx;
 pub mod engine;
 pub mod hdr;
 pub mod naming;
+pub mod par;
 pub mod pipeline;
 pub mod probe;
 pub mod report;

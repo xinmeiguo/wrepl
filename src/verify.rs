@@ -22,6 +22,7 @@
 use crate::docx::package::{self, PartKind};
 use crate::docx::scan;
 use crate::engine;
+use crate::par::parallel_map;
 use crate::rules::Rule;
 use anyhow::{Context, Result};
 use quick_xml::events::{BytesStart, Event};
@@ -1149,17 +1150,23 @@ pub fn verify_pairs(pairs: &[(PathBuf, PathBuf)]) -> Vec<PairVerdict> {
 /// 因此：同一模板只改文字、甚至把文件改了名，指纹仍然**完全不变**。
 /// 这正是「产物已改名」时仍能把原件与产物正确配对的依据。
 pub fn structure_signature(path: &Path) -> Result<String> {
-    let pa = package::inspect(path).with_context(|| format!("读 {} 失败", path.display()))?;
-    let mut items: Vec<(String, String)> = Vec::with_capacity(pa.len());
+    // 一次开容器，边读边算。
+    //
+    // 原实现是 `inspect()`（解压全包 + 逐 part 算 SHA256）打头，随后每个
+    // **文本** part 又各 `read_part` 一遍 —— 一个文件开 N+1 次 zip、
+    // 重解 N+1 遍中央目录。2026-10-20 合成一次。
+    //
+    // 非文本 part 的 SHA256 由这里自己算，与 `inspect` 的口径相同
+    // （都是对**解压后**的字节求 sha256，不是压缩字节）。
+    let parts = package::read_parts_where(path, |_, _| true)
+        .with_context(|| format!("读 {} 失败", path.display()))?;
 
-    for x in &pa {
-        let fp = if x.kind.is_text_bearing() {
-            match package::read_part(path, &x.name).and_then(|raw| {
-                std::str::from_utf8(&raw)
-                    .map(|s| s.to_string())
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            }) {
-                Ok(s) => match skeleton(&s) {
+    let mut items: Vec<(String, String)> = Vec::with_capacity(parts.len());
+    for (name, kind, bytes) in parts {
+        let sha = || hex::encode(Sha256::digest(&bytes));
+        let fp = if kind.is_text_bearing() {
+            match std::str::from_utf8(&bytes) {
+                Ok(s) => match skeleton(s) {
                     Ok((toks, carriers)) => {
                         let mut h = Sha256::new();
                         for i in 0..toks.len() {
@@ -1173,14 +1180,15 @@ pub fn structure_signature(path: &Path) -> Result<String> {
                         hex::encode(h.finalize())
                     }
                     // 骨架解析失败：退化为字节指纹（宁可配不上，也不误配）
-                    Err(_) => format!("!skel!{}", x.sha256),
+                    Err(_) => format!("!skel!{}", sha()),
                 },
-                Err(_) => format!("!utf8!{}", x.sha256),
+                // 名字像是文本 part、内容却不是 UTF-8：同样退化为字节指纹
+                Err(_) => format!("!utf8!{}", sha()),
             }
         } else {
-            x.sha256.clone()
+            sha()
         };
-        items.push((x.name.clone(), fp));
+        items.push((name, fp));
     }
 
     items.sort();
@@ -1281,22 +1289,29 @@ pub fn pair_dirs(dir_a: &Path, dir_b: &Path) -> Result<BatchPairing> {
     }
 
     // 指纹 → 名单（指纹算不出来的记为 None，绝不参与配对）
+    //
+    // 2026-10-20 起按文件并行：算指纹要整包解压 + 解析骨架，是这条路上唯一的
+    // 重活，而每个文件的指纹与其它文件完全无关。合并仍**按原顺序**回填，
+    // 所以 `ambiguous` 里的说明次序与串行版一致。
+    let sigs_a = parallel_map(&rest_a, 0, |_, (_, p)| structure_signature(p));
     let mut sig_a: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
-    for (rel, p) in &rest_a {
-        if let Ok(s) = structure_signature(p) {
-            sig_a.entry(s).or_default().push((rel.clone(), p.clone()));
-        } else {
-            rep.ambiguous
-                .push(format!("原件指纹读取失败（不参与配对）：{rel}"));
+    for ((rel, p), sig) in rest_a.iter().zip(sigs_a) {
+        match sig {
+            Ok(s) => sig_a.entry(s).or_default().push((rel.clone(), p.clone())),
+            Err(_) => rep
+                .ambiguous
+                .push(format!("原件指纹读取失败（不参与配对）：{rel}")),
         }
     }
+
+    let sigs_b = parallel_map(&rest_b, 0, |_, (_, p)| structure_signature(p));
     let mut sig_b: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
-    for (rel, p) in &rest_b {
-        if let Ok(s) = structure_signature(p) {
-            sig_b.entry(s).or_default().push((rel.clone(), p.clone()));
-        } else {
-            rep.ambiguous
-                .push(format!("产物指纹读取失败（不参与配对）：{rel}"));
+    for ((rel, p), sig) in rest_b.iter().zip(sigs_b) {
+        match sig {
+            Ok(s) => sig_b.entry(s).or_default().push((rel.clone(), p.clone())),
+            Err(_) => rep
+                .ambiguous
+                .push(format!("产物指纹读取失败（不参与配对）：{rel}")),
         }
     }
 
@@ -1414,6 +1429,120 @@ mod tests {
 
     fn doc_xml() -> &'static [u8] {
         br#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>abc</w:t></w:r></w:p></w:body></w:document>"#
+    }
+
+    // ═════════════════ 结构指纹：单次开容器的口径 ═════════════════
+
+    /// **重构前的实现，只存在于测试里**，作为参照。
+    ///
+    /// `structure_signature` 2026-10-20 从「`inspect()` + 每个文本 part 再
+    /// `read_part`」改成「一次 `read_parts_where`」。这类重构最危险的地方不是
+    /// 变慢或崩溃 —— 而是**指纹悄悄换了口径**：批量验证仍能配上对（两边一起变），
+    /// 只有跨版本归档时才会发现"同一份文件两版指纹不同"。
+    fn signature_legacy(path: &Path) -> Result<String> {
+        let pa = package::inspect(path)?;
+        let mut items: Vec<(String, String)> = Vec::with_capacity(pa.len());
+        for x in &pa {
+            let fp = if x.kind.is_text_bearing() {
+                match package::read_part(path, &x.name).and_then(|raw| {
+                    std::str::from_utf8(&raw)
+                        .map(|s| s.to_string())
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                }) {
+                    Ok(s) => match skeleton(&s) {
+                        Ok((toks, carriers)) => {
+                            let mut h = Sha256::new();
+                            for i in 0..toks.len() {
+                                h.update(toks.get(i));
+                                h.update(b"\n");
+                            }
+                            h.update(
+                                format!("|c/{}/{}/{}", carriers[0], carriers[1], carriers[2])
+                                    .as_bytes(),
+                            );
+                            hex::encode(h.finalize())
+                        }
+                        Err(_) => format!("!skel!{}", x.sha256),
+                    },
+                    Err(_) => format!("!utf8!{}", x.sha256),
+                }
+            } else {
+                x.sha256.clone()
+            };
+            items.push((x.name.clone(), fp));
+        }
+        items.sort();
+        let mut h = Sha256::new();
+        for (n, fp) in &items {
+            h.update(n.as_bytes());
+            h.update(b"=");
+            h.update(fp.as_bytes());
+            h.update(b"\n");
+        }
+        Ok(hex::encode(h.finalize()))
+    }
+
+    /// ★ 新实现的指纹必须与旧口径**逐字相同**。
+    ///
+    /// 这个包故意把三条分支一次走全：
+    /// - `word/document.xml` —— 正常文本 part，走骨架哈希；
+    /// - `word/media/image1.bin` —— 非文本 part，走字节 SHA256；
+    /// - `word/header1.xml` —— 名字是文本 part、内容却不是 UTF-8，走 `!utf8!` 退化。
+    #[test]
+    fn structure_signature_matches_legacy_recipe() {
+        let p = tmp_path("sig-legacy");
+        let bytes = build_zip(&[
+            ("word/document.xml", doc_xml(), CompressionMethod::Deflated),
+            (
+                "word/media/image1.bin",
+                &[0u8, 159, 146, 150, 255, 1, 2, 3],
+                CompressionMethod::Deflated,
+            ),
+            (
+                "word/header1.xml",
+                &[0xffu8, 0xfe, 0x00, 0x41],
+                CompressionMethod::Deflated,
+            ),
+        ]);
+        std::fs::write(&p, bytes).unwrap();
+
+        let new = structure_signature(&p).expect("新实现");
+        let old = signature_legacy(&p).expect("旧口径");
+        assert_eq!(new, old, "重构改变了结构指纹的口径");
+    }
+
+    /// 阴性对照：指纹对"只改文字"必须不变、对"改了结构"必须变。
+    /// 没有这条，上面那条等价测试可能因为"两边都算错"而通过。
+    #[test]
+    fn structure_signature_ignores_text_changes() {
+        let mk = |tag: &str, text: &str, bold: bool| {
+            let p = tmp_path(tag);
+            let rpr = if bold { "<w:rPr><w:b/></w:rPr>" } else { "" };
+            let xml = format!(
+                r#"<w:document xmlns:w="x"><w:body><w:p><w:r>{rpr}<w:t>{text}</w:t></w:r></w:p></w:body></w:document>"#
+            );
+            std::fs::write(
+                &p,
+                build_zip(&[("word/document.xml", xml.as_bytes(), CompressionMethod::Deflated)]),
+            )
+            .unwrap();
+            p
+        };
+
+        let a = mk("sig-a", "甲", false);
+        let b = mk("sig-b", "乙丙丁", false);
+        let c = mk("sig-c", "甲", true);
+
+        assert_eq!(
+            structure_signature(&a).unwrap(),
+            structure_signature(&b).unwrap(),
+            "只改文字时指纹必须相同"
+        );
+        assert_ne!(
+            structure_signature(&a).unwrap(),
+            structure_signature(&c).unwrap(),
+            "加粗后指纹必须变化"
+        );
     }
 
     /// ★ 底线：左侧快照取自"改写前"的内存字节，磁盘上已经是改写后的内容 ——

@@ -54,7 +54,7 @@
 |---|---|---|
 | §2.2 | 界面「预演」入口 | **等你拍板** |
 | §2.3 | 增量导出 | **已否决**（2026-10-19） |
-| §7 | 全项目扫描剩下的 23 条（性能 / 架构 / 边界） | 按优先级排好了，**等你挑** |
+| §7 | 全项目扫描剩下的 22 条（性能 / 架构 / 边界） | 按优先级排好了，**等你挑** |
 | §4 | 五项品味遗留 + `PERFORMANCE.md` §4 三项 | 已决定先不动 |
 | §5 | 测试覆盖缺口、版本语义 | 不急，迟早要还 |
 
@@ -371,9 +371,16 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 
 ### 7.1 真实痛点（有明确收益，但要动设计）
 
+> **「批量验证 / 侦察并行化 + 单次开容器」已于 2026-10-20 落地**，明细见
+> `CHANGELOG.md`。实测：`probe` 快 **1.96×**、`verify --batch` 快 **1.69×**，
+> 输出逐字相同（`diff` 比过）。
+>
+> ⚠ 顺带更正当初的估计：这里原写"50 文件省 5–10 s"，**估高了**。真实语料单件
+> 约 40 ms，50 个文件的上限也就 2 s 左右。实际是 **26 文件省 0.5–0.75 s**，
+> 收益随文件数线性放大，不是数量级。
+
 | 项 | 位置 | 收益 / 代价 |
 |---|---|---|
-| **批量验证 / 侦察并行化 + 单次开容器** | `probe.rs:312`、`verify.rs:1246` | 这两处都是 `inspect()` + 每个 part 再 `read_part` —— **N+1 次开容器**；`pair_dirs` / `probe_dir` 还全串行。改 `read_parts_where` + `parallel_map`：50 文件批量验证省 5–10s。**纯 Rust、无 COM、用户高频路径**，是这份清单里收益最大的单项 |
 | **报告行构造下沉到 `report` 模块** | `main.rs:402-606` vs `app.rs:2846-3005` | CLI 与 GUI 各写一份 `FileRow` / `HitRow` / `RuleRow` / `ReportMeta`；`short` / `short_sha` 同函数两名；verdict 文案已漂移（CLI 多 `name_warn` 一档）。下沉同时消三条重复 |
 | **GUI 错误类型统一成 `anyhow::Result`** | `app.rs` 6 处、`picker.rs:1842`、`printers.rs:56`、`services.rs:83` | GUI 侧整片 `Result<_, String>`，边界处一堆 `map_err(|e| format!("…{e:#}"))`。统一后只在 toast / 日志那一层转 String。**注意：`{e:#}` 本身是对的**（anyhow 链式 Display），别改成 `{e}` |
 | **取消信号 + 关窗 join** | `app.rs:186` `Job { rx, handle }` | 执行中按钮只能变「执行中…」；关窗时 `JoinHandle` drop 不 join，后台线程 + Word 进程变孤儿。加 `Arc<AtomicBool>`，worker 在**每个文件边界**检查；eframe `on_exit` 发信号 + join |

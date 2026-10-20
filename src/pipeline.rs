@@ -16,6 +16,7 @@
 use crate::docx::package;
 use crate::engine::{self, Hit};
 use crate::naming;
+use crate::par::{parallel_map, resolve_threads};
 use crate::report::{NameRow, VerifyRow};
 use crate::rules::Rule;
 use crate::verify;
@@ -23,7 +24,6 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 被跳过的文件及原因（进报告，方便归档时说明"这个为什么没处理"）。
@@ -334,91 +334,9 @@ pub fn run(
 
 // ─────────────────────────── 并行 ───────────────────────────
 
-/// 实际使用的线程数：`requested == 0` 表示「自动」，取本机可用并行度。
-///
-/// ## 默认不设人为上限（这是一个**权衡后的选择**，不是漏了）
-///
-/// 并行改写是整批里最重的一段，把默认并发压到 8 之类会让大文档批明显变慢；
-/// 而真实 docx 尺寸（几 MB/件）下，高并发带来的内存峰值并不构成问题。
-/// 真撞上「超大文档 × 高核数」，用 `--threads N` 手动压下来即可。
-///
-/// 每个 worker 的内存账（想知道上限在哪时看这里）：一份**原件字节**
-/// （`Arc<Vec<u8>>`，同一批内共享同一份，不是每线程一份）
-/// + 该文件全部 part 的解压副本 + 改写产物（`PartPlan::new_bytes`，
-/// 一个字都没动的 part 不产 byte）。量级就是"并发度 × 单文件解压后大小"。
-fn resolve_threads(requested: usize, jobs: usize) -> usize {
-    let n = if requested > 0 {
-        requested
-    } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    };
-    n.max(1).min(jobs.max(1))
-}
-
-/// 零依赖的并行映射：把 `items` 按索引分发给若干工作线程，**结果按原顺序返回**。
-///
-/// ## 为什么手写而不是 rayon
-///
-/// 离线构建环境里没有 rayon / crossbeam 的缓存，也不值得为一个 `par_iter`
-/// 引入新的依赖树。这里要的恰好就是"按索引并行、按索引归位"，
-/// 标准库的 `thread::scope` + 原子计数器就够。
-///
-/// ## 三条必须守住的
-///
-/// 1. **结果顺序 = 输入顺序**。报告行序若随线程调度抖动，同一批文件两次跑出
-///    两份不同的报告，归档时无法解释。所以结果落在与下标一一对应的格子里，
-///    收尾时按顺序取出。
-/// 2. **单个 item 失败不中断整批**。失败由 `f` 自己包成结果值
-///    （[`Outcome::errored`] 的 `ERROR` 状态），并行层不感知错误。
-/// 3. `threads == 1` 时**不启线程**，走纯串行路径。这既是排查
-///    "是不是并行的锅"的第一手段，也是并行版与串行版做等价对照的开关。
-///
-/// ## 分配策略
-///
-/// 用**原子取号**（动态负载均衡）而不是预先把文件平均切给各线程：
-/// docx 大小差别很大（同一交付包里 100 KB 与 5 MB 混在一起），
-/// 均分会让线程之间进度差出好几倍，取号则谁空谁拿下一个。
-fn parallel_map<T, R, F>(items: &[T], requested: usize, f: F) -> Vec<R>
-where
-    T: Sync,
-    R: Send,
-    F: Fn(usize, &T) -> R + Sync,
-{
-    let n = items.len();
-    let workers = resolve_threads(requested, n);
-    if workers <= 1 || n <= 1 {
-        return (0..n).map(|i| f(i, &items[i])).collect();
-    }
-
-    let next = AtomicUsize::new(0);
-    // 每格一把锁：一个文件算完才落一次，锁竞争可以忽略。
-    let slots: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
-
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    let r = f(i, &items[i]);
-                    // 锁中毒（某个线程 panic）也要把值放进去，否则收尾取不到
-                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-                }
-            });
-        }
-    });
-
-    // 到这里所有工作线程都已 join，每格必然被填过一次。
-    slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
-        .map(|o| o.expect("每个索引恰好被处理一次"))
-        .collect()
-}
+// `parallel_map` / `resolve_threads` 2026-10-20 搬到 [`crate::par`] ——
+// 批量验证（`verify::pair_dirs`）与侦察（`probe::probe_dir`）也要按文件并行，
+// 复制第二份的代价是并发上限与失败语义各走各的。这里只留引用。
 
 // ─────────────────────────── 目标收集 ───────────────────────────
 

@@ -235,8 +235,9 @@ cd /d/test/wrepl
 # ① 类型检查 + 警告数
 cargo check --features gui --offline
 
-# ② 单元测试
-cargo test --features gui --offline --bin wrepl-gui      # 期望 78 passed / 0 failed
+# ② 单元测试（★ 两个都要跑，这是两套不同的测试集）
+cargo test --features gui --offline --lib                 # 期望 81 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui       # 期望 78 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
