@@ -304,8 +304,9 @@ pub fn run_with_cancel(
 
     let (files, skipped) = collect_targets(paths, opts)?;
     let threads_used = resolve_threads(opts.threads, files.len());
-    // 完整镜像的自证要靠整文件 SHA 对照，所以这里**强制**打开，不指望调用方记得设。
-    let want_sha = opts.file_sha || opts.mirror;
+    // 八条开关先算一次，之后每个文件共用同一份拷贝（推导规则见
+    // `ProcessFlags::from_options`，包括"镜像强制开 SHA"那条）。
+    let flags = ProcessFlags::from_options(opts);
     let mut res = RunResult {
         outcomes: Vec::with_capacity(files.len()),
         skipped,
@@ -343,19 +344,7 @@ pub fn run_with_cancel(
         if cancel.is_cancelled() {
             return Outcome::cancelled(src, rules);
         }
-        let o = match process_one(
-            src,
-            dsts[i].as_deref(),
-            rules,
-            opts.chain,
-            opts.dry_run,
-            opts.in_place,
-            opts.backup,
-            opts.longest_first,
-            opts.verify_after && !opts.dry_run,
-            opts.mirror && !opts.dry_run,
-            want_sha,
-        ) {
+        let o = match process_one(src, dsts[i].as_deref(), rules, &flags) {
             Ok(o) => o,
             Err(e) => Outcome::errored(src, rules, format!("{e:#}")),
         };
@@ -621,32 +610,87 @@ pub fn file_sha(p: &Path) -> Result<String> {
     Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
+/// 处理单个文件的开关集合。
+///
+/// ## 为什么是结构体而不是一串 `bool`
+///
+/// 这八条里**六个是 `bool`**，原来直接摆在 `process_one` 的形参表上（一共 11 个
+/// 位置参数）。`false, true, true, false, …` 这样的调用点，写的人当时知道谁是谁，
+/// 后面来改的人不看签名根本分不出来 —— 少写一个、或把 `want_verify` 和 `mirror`
+/// 调个头，**编译器一声不响，行为却全变了**（一个该验的没验、一个该镜像的没镜像）。
+/// 改成具名字段后，"顺序"这个概念就不存在了。
+///
+/// 故意 `Copy`：并行那层要把同一份开关发给每个工作线程，拷八个 `bool` 比 `Arc`
+/// 便宜，也不会让 `process_one` 平白多一层生命周期。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessFlags {
+    /// 链式模式（见 [`Options::chain`]）。
+    pub chain: bool,
+    /// 预演：只算不写。
+    pub dry: bool,
+    /// 就地替换源文件（见 [`Options::in_place`]）。
+    pub in_place: bool,
+    /// 就地替换时保留 `.docx.bak`（见 [`Options::backup`]）。
+    pub backup: bool,
+    /// 区间冲突的裁决方式（见 [`Options::longest_first`]）。
+    pub longest_first: bool,
+    /// 只在**就地替换**下有意义：决定要不要在覆盖源文件之前把验证基准
+    /// （[`verify::PkgSnap`]）扣下来。写副本模式无视它——那条路径的原件一直在磁盘上，
+    /// 验证阶段按路径读就行。
+    pub want_verify: bool,
+    /// 只在**写副本**下有意义（见 [`Options::mirror`]）：一处都没改动时，
+    /// 是原样复制一份到输出目录（完整镜像），还是什么都不写（默认）。
+    pub mirror: bool,
+    /// 要不要算文件级 SHA256（见 [`Options::file_sha`]）。
+    /// 关掉时 [`Outcome::sha_before`] / [`Outcome::sha_after`] 都是空串 ——
+    /// 调用方只有在**确实要写报告**或**开了完整镜像**时才该打开它。
+    pub want_sha: bool,
+}
+
+impl ProcessFlags {
+    /// 从一批的 [`Options`] 推出「处理单个文件」要用的开关。
+    ///
+    /// 两条推导**只在这里算一次**，别让每个调用点各自 `&& !dry_run`：
+    ///
+    /// - 预演不落盘，所以 `want_verify` / `mirror` 一律失效；
+    /// - 开了完整镜像时 `want_sha` **强制**打开 —— 镜像"证明复制无损"靠的就是整文件
+    ///   SHA 对照，不能指望调用方记得同时把 `file_sha` 也设上。
+    pub fn from_options(opts: &Options) -> Self {
+        Self {
+            chain: opts.chain,
+            dry: opts.dry_run,
+            in_place: opts.in_place,
+            backup: opts.backup,
+            longest_first: opts.longest_first,
+            want_verify: opts.verify_after && !opts.dry_run,
+            mirror: opts.mirror && !opts.dry_run,
+            want_sha: opts.file_sha || opts.mirror,
+        }
+    }
+}
+
 /// 处理单个文件。
 ///
-/// `want_verify` 只在**就地替换**下有意义：它决定要不要在覆盖源文件之前
-/// 把验证基准（[`verify::PkgSnap`]）扣下来。写副本模式无视它——那条路径的原件
-/// 一直在磁盘上，验证阶段按路径读就行。
-///
-/// `mirror` 也只在**写副本**下有意义（见 [`Options::mirror`]）：一处都没改动时，
-/// 是原样复制一份到输出目录（完整镜像），还是什么都不写（默认）。
-///
-/// `want_sha` 决定要不要算文件级 SHA256（见 [`Options::file_sha`]）。
-/// 关掉时 [`Outcome::sha_before`] / [`Outcome::sha_after`] 都是空串——
-/// 调用方只有在**确实要写报告**或**开了完整镜像**时才该打开它。
-#[allow(clippy::too_many_arguments)]
+/// `src` / `dst` / `rl` 留在形参上：三者类型各不相同（`&Path` / `Option<&Path>` /
+/// `&[Rule]`），本来就没法调错顺序；八个开关则收进 [`ProcessFlags`]，见那里的说明。
 pub fn process_one(
     src: &Path,
     dst: Option<&Path>,
     rl: &[Rule],
-    chain: bool,
-    dry: bool,
-    in_place: bool,
-    backup: bool,
-    longest_first: bool,
-    want_verify: bool,
-    mirror: bool,
-    want_sha: bool,
+    flags: &ProcessFlags,
 ) -> Result<Outcome> {
+    // ★ 立刻摊成局部变量：下面那两百行正文一个字都不用改。这样"具名字段"的好处
+    //   落在调用点上，又不给函数体引进一批 `flags.xxx` 的噪声。
+    let ProcessFlags {
+        chain,
+        dry,
+        in_place,
+        backup,
+        longest_first,
+        want_verify,
+        mirror,
+        want_sha,
+    } = *flags;
     let text_parts = package::read_text_parts(src)?;
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
     let mut hits: Vec<Hit> = Vec::new();
@@ -1441,5 +1485,68 @@ mod tests {
         assert!(!res.cancelled);
         assert_eq!(res.outcomes.len(), 1);
         assert!(res.outcomes.iter().all(|o| o.status != "CANCEL"));
+    }
+
+    // ─────────────────────── 单文件开关的推导 ───────────────────────
+    //
+    // 这三条钉的是**原来写在调用点上、没有任何测试**的两句推导
+    // （`verify_after && !dry_run`、`file_sha || mirror`）。收进
+    // [`ProcessFlags::from_options`] 之后它们有了名字，也就有了可测的位置。
+
+    #[test]
+    fn 预演时不落盘的开关一律失效() {
+        let opts = Options {
+            dry_run: true,
+            in_place: true,
+            verify_after: true,
+            mirror: true,
+            file_sha: true,
+            ..Default::default()
+        };
+        let f = ProcessFlags::from_options(&opts);
+        assert!(f.dry, "预演标记本身要留住");
+        assert!(!f.want_verify, "预演不覆盖原文件，扣验证基准纯属白干");
+        assert!(!f.mirror, "预演一趟什么都不该写出去");
+        // ★ 与上面两条**不同**：sha 仍然要算。报告里的「改前/改后」两列
+        //   就是预演的产出，关掉它等于把预演的全部意义拿掉。
+        assert!(f.want_sha, "预演照样要出改前/改后 SHA 给人看");
+    }
+
+    #[test]
+    fn 完整镜像强制打开文件SHA() {
+        let opts = Options {
+            mirror: true,
+            file_sha: false,
+            ..Default::default()
+        };
+        assert!(
+            ProcessFlags::from_options(&opts).want_sha,
+            "镜像要证明复制无损，靠的就是整文件 SHA 对照"
+        );
+        // 反面：没开镜像、也没主动要，就不该白算两遍 SHA（一个 8 MB 的包约 80 ms）。
+        let plain = Options::default();
+        assert!(!ProcessFlags::from_options(&plain).want_sha);
+    }
+
+    /// 开关逐条对应 `Options`，不做任何"聪明"的额外推导。
+    ///
+    /// 这条是**反向保护**：以后若要再往 `from_options` 里塞推导，得先想清楚
+    /// 会不会把一个本该原样透传的字段悄悄改掉。
+    #[test]
+    fn 其余开关原样透传() {
+        let opts = Options {
+            chain: true,
+            in_place: true,
+            backup: true,
+            longest_first: true,
+            ..Default::default()
+        };
+        let f = ProcessFlags::from_options(&opts);
+        assert!(f.chain && f.in_place && f.backup && f.longest_first);
+        let none = ProcessFlags::from_options(&Options::default());
+        assert!(
+            !(none.chain || none.dry || none.in_place || none.backup || none.longest_first),
+            "默认值必须全关"
+        );
     }
 }
