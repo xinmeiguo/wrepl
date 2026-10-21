@@ -15,6 +15,10 @@
 //! · **局域网 UNC**（`\\server\share\...`）—— 地址栏直接粘，`std::fs` 照样读
 //! · **只浏览**（[`Mode::Browse`]）—— 「打开源目录 / 打开报告」两个入口用它：
 //!   不看什么都不选也能开，省掉一个资源管理器窗口
+//! · **选文件夹**（[`Mode::Files`] 下选中目录）—— 「选择文档」那两个入口靠它
+//!   一次收进整个文件夹：用户在列表里点中一个目录，底部按钮变成「加入此文件夹」，
+//!   确认后把这个**目录路径**交出去，由调用方递归展开（见 `WordTool::set_docs`）。
+//!   面板自己不做递归 —— 它不知道调用方只收 `.doc/.docx`，也不能在绘制路径上做 IO。
 //!
 //! ## 外壳：一个真窗口（第 5a 步）
 //!
@@ -113,6 +117,13 @@ pub enum Mode {
     /// 选一个**文件夹**（返回当前所在目录，或选中的那一个目录）。
     Folder,
     /// 选**若干文件**（返回选中的那些）。
+    ///
+    /// **选中的全是目录时也认**：返回目录本身，由调用方决定怎么展开
+    /// （页眉替换 / 打印导出两页靠这条把"整个文件夹"一次收进文档列表，
+    /// 见 `WordTool::set_docs`）。按钮文案跟着变成「加入此文件夹」，
+    /// 让人一眼看出点下去不是"打开"，而是"把里面的东西一并收进来"。
+    ///
+    /// 双击目录仍然是**进目录浏览** —— 想选它，单击选中再点底部按钮。
     Files,
     /// **另存为**（返回 `当前目录 / 文件名框内容`）。
     Save,
@@ -137,6 +148,9 @@ pub enum Outcome {
     /// 选好了。`Folder` / `Save` 一定是 1 个路径，`Files` 是 N 个，
     /// `Browse` 则是"用户在面板里选中或双击的那些**文件**"（目录不算数 ——
     /// 浏览目录靠双击进去，不是靠这个返回值）。
+    ///
+    /// ★ `Files` 的 N 个**可能含目录**：选中项里一个文件都没有时，
+    /// 目录原样交出去（见 [`Mode::Files`]）。
     Picked(Vec<PathBuf>),
     /// 用户点了右下角的「...」——调用方改用 `rfd` 原生对话框。
     Fallback,
@@ -885,6 +899,22 @@ impl Picker {
                 if !files.is_empty() {
                     return Some(files);
                 }
+                // 没选文件、但选中了目录 → 把**目录**交出去。
+                //
+                // 这条是"选文件夹"的唯一入口：面板只负责"你指的是哪个文件夹"，
+                // 展开成文档是调用方的事 —— 面板不知道 `.doc/.docx` 之外还该收什么，
+                // 也不该在这里做递归 IO（绘制路径上不许有 IO，见模块头第 4 条）。
+                let dirs: Vec<PathBuf> = self
+                    .sel
+                    .iter()
+                    .filter_map(|&v| self.view.get(v))
+                    .filter_map(|&i| entries.get(i))
+                    .filter(|e| e.is_dir)
+                    .map(|e| self.cwd.join(&e.name))
+                    .collect();
+                if !dirs.is_empty() {
+                    return Some(dirs);
+                }
                 // 一个都没选，但文件名框里写了东西 → 认它（与系统对话框一致）
                 let typed = self.file_name.trim();
                 if typed.is_empty() {
@@ -927,6 +957,24 @@ impl Picker {
     }
 
     // ─────────────────────────── 界面 ───────────────────────────
+
+    /// 选中的**全是目录**（且至少有一个）吗？
+    ///
+    /// 只用来决定按钮文案：「加入此文件夹」vs「打开」。**不参与能不能确认**
+    /// —— 那是 [`Self::confirm`] 的事，两者各算各的会打架（文案说"加入"、
+    /// 按钮却灰着）。
+    fn sel_all_dirs(&self, entries: &[Entry]) -> bool {
+        let mut any = false;
+        for &v in &self.sel {
+            let Some(&i) = self.view.get(v) else { continue };
+            let Some(e) = entries.get(i) else { continue };
+            if !e.is_dir {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
 
     fn body(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context, entries: &[Entry]) -> Option<Act> {
         let mut act: Option<Act> = None;
@@ -1778,6 +1826,8 @@ impl Picker {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ok_label = match self.mode {
                     Mode::Folder => "选择此文件夹",
+                    // 只选中了文件夹 → 说清点下去是"收进来"而不是"打开"。
+                    Mode::Files if self.sel_all_dirs(entries) => "加入此文件夹",
                     Mode::Files => "打开",
                     Mode::Save => "保存",
                     // 浏览模式：选中什么就打开什么（没选 = 置灰）。
@@ -2895,12 +2945,36 @@ mod tests {
             Some(vec![PathBuf::from(r"C:\proj\a.docx"), PathBuf::from(r"C:\proj\b.docx")])
         );
 
-        // ④ 选文件：一个都没选、文件名框也空 → 没什么可确认（按钮置灰）
+        // ④ 选文件：**只选中一个目录** → 把目录交出去（"选文件夹"就是这条路）
+        p.sel.clear();
+        p.view = vec![0, 1, 2];
+        p.sel.insert(2);
+        p.file_name = String::new();
+        assert_eq!(
+            p.confirm(&p.all),
+            Some(vec![PathBuf::from(r"C:\proj\子目录")]),
+            "没有文件时目录要能选"
+        );
+        assert!(
+            p.sel_all_dirs(&p.all),
+            "只选中目录 → 按钮文案要变成「加入此文件夹」"
+        );
+
+        // ⑤ 选文件：文件与目录混选 → 只返回文件（目录一律让路）
+        p.sel.insert(0);
+        p.sel.insert(2);
+        assert_eq!(
+            p.confirm(&p.all),
+            Some(vec![PathBuf::from(r"C:\proj\a.docx")])
+        );
+        assert!(!p.sel_all_dirs(&p.all), "混选时按钮仍是「打开」");
+
+        // ⑥ 选文件：一个都没选、文件名框也空 → 没什么可确认（按钮置灰）
         p.sel.clear();
         p.file_name = String::new();
         assert_eq!(p.confirm(&p.all), None);
 
-        // ⑤ 另存为：不要求文件已存在，直接拼路径
+        // ⑦ 另存为：不要求文件已存在，直接拼路径
         let mut p = Picker::new();
         p.mode = Mode::Save;
         p.cwd = cwd.clone();

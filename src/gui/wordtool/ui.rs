@@ -287,11 +287,56 @@ impl WordTool {
     }
 
     /// 自绘选择器选完文档之后，由 `App` 回填。`what` 决定落到哪一页的列表。
-    pub fn set_docs(&mut self, what: PickDoc, docs: Vec<String>) {
+    ///
+    /// ## 两种语义（`paths` 里有没有目录）
+    ///
+    /// * **全是文件** → **覆盖**。与系统对话框一致：这一趟选的什么，列表就是什么。
+    /// * **含目录** → **追加**（按路径去重）。一份文件夹是"再收一批"，
+    ///   覆盖会把刚挑好的那几个无声道丢 —— 这也是用户最容易踩的坑。
+    ///   真的要重来，列表旁边就有「清空」。
+    ///
+    /// 目录一律**递归展开**成 `.doc` / `.docx`（见 [`collect_docs`]）。展开放在
+    /// 这里而不是选择器里：面板不知道这一页只收 Word 文档，也不该在绘制路径上做 IO
+    /// （见 `picker.rs` 模块头第 4 条）。
+    pub fn set_docs(&mut self, what: PickDoc, paths: Vec<String>) {
+        if matches!(what, PickDoc::HeaderImage) {
+            return;
+        }
+        let (dirs, files): (Vec<String>, Vec<String>) = paths
+            .into_iter()
+            .partition(|p| std::path::Path::new(p).is_dir());
+
+        // 纯文件 = 覆盖；含目录 = 在现有列表上追加。
+        let out = if dirs.is_empty() {
+            files
+        } else {
+            let mut cur = if what == PickDoc::Header {
+                self.hdr_docs.clone()
+            } else {
+                self.print_docs.clone()
+            };
+            for f in files {
+                push_doc(&mut cur, f);
+            }
+            // 日志先攒着 —— `cur` 借用期间不能再借 `self` 给 `log`。
+            let mut msgs = Vec::new();
+            for d in dirs {
+                let before = cur.len();
+                let n = collect_docs(std::path::Path::new(&d), &mut cur, 0);
+                msgs.push(format!(
+                    "加入文件夹 {d}：收进 {n} 个文档（列表 {before} → {}）",
+                    cur.len()
+                ));
+            }
+            for m in msgs {
+                self.log(m);
+            }
+            cur
+        };
+
         match what {
-            PickDoc::Header => self.hdr_docs = docs,
-            PickDoc::Print => self.print_docs = docs,
-            // 图片是**单值**，走 [`WordTool::set_image`]；这里收不到它。
+            PickDoc::Header => self.hdr_docs = out,
+            PickDoc::Print => self.print_docs = out,
             PickDoc::HeaderImage => {}
         }
     }
@@ -651,6 +696,10 @@ impl WordTool {
                             .leading(ds::Icon::FolderOpen)
                             .disabled(busy),
                     )
+                    // 面板里**选中文件夹**再确认也可以：会把它里面的 .doc/.docx
+                    // 递归收进来（那时底部按钮写成「加入此文件夹」）。这行提示是
+                    // 唯一告诉人"能这么干"的地方 —— 光看按钮名看不出来。
+                    .on_hover_text("可多选文件；选中文件夹则把它里面的 .doc / .docx 一起加入")
                     .clicked()
                 {
                     self.want_pick = Some(PickDoc::Header);
@@ -856,6 +905,10 @@ impl WordTool {
                             .leading(ds::Icon::FolderOpen)
                             .disabled(busy),
                     )
+                    // 面板里**选中文件夹**再确认也可以：会把它里面的 .doc/.docx
+                    // 递归收进来（那时底部按钮写成「加入此文件夹」）。这行提示是
+                    // 唯一告诉人"能这么干"的地方 —— 光看按钮名看不出来。
+                    .on_hover_text("可多选文件；选中文件夹则把它里面的 .doc / .docx 一起加入")
                     .clicked()
                 {
                     self.want_pick = Some(PickDoc::Print);
@@ -1515,6 +1568,79 @@ fn hint(ui: &mut egui::Ui, s: &str) {
 }
 
 /// 「标题 + 按钮」那一行，右侧挂「已选 N 个」（两页的文档卡片共用）。
+/// 递归撑开的上限：目录层数与文档总条数。
+///
+/// 防的是"手一滑选中了盘符根目录"：`C:\` 底下几万个文件，一路递归下去
+/// 界面会卡住好几分钟，而且列表也没法看。到顶就停，不报错 ——
+/// 用户从「已选 N 个」和日志里的条数能看出是被截断了。
+const MAX_DIR_DEPTH: usize = 24;
+const MAX_DOCS: usize = 5000;
+
+/// 把 `p` 并进 `list`，**按路径去重**（Windows 路径不区分大小写，比较时一起小写）。
+fn push_doc(list: &mut Vec<String>, p: String) {
+    if list.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+        return;
+    }
+    if list.len() >= MAX_DOCS {
+        return;
+    }
+    list.push(p);
+}
+
+/// 递归收集 `dir` 里的 Word 文档，追加进 `out`；返回本次收进的条数。
+///
+/// **只收 `.doc` / `.docx`**（与「选择文档」面板的筛选一致 —— 选中文件夹时
+/// 拿不到面板那层筛选，只能在这儿认一遍）。
+///
+/// 三条容易漏的：
+/// * **`~$` 开头的要跳过** —— 那是 Word / WPS 打开文档时留的锁文件，
+///   大小只有几十字节，混进列表后会在进 Word 时抛"文档已损坏"。
+/// * **顺序要排** —— `read_dir` 不保证顺序，两次选同一个文件夹得到两个顺序，
+///   核对产物时会以为出了错。
+/// * **用 `file_type()` 不用 `is_dir()`** —— 前者读目录项自带的类型，后者要
+///   再查一次；顺带把符号链接（`is_symlink()`）挡在外面，不会顺着环爬。
+fn collect_docs(dir: &std::path::Path, out: &mut Vec<String>, depth: usize) -> usize {
+    if depth >= MAX_DIR_DEPTH || out.len() >= MAX_DOCS {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        // 没权限 / 目录刚被删：这一层当没有，不牵连别处（整棵树照收）。
+        return 0;
+    };
+    let mut items: Vec<(std::ffi::OsString, bool)> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        // 符号链接按"不是目录"处理 → 下面扩展名不匹配就跳过，天然防环。
+        items.push((e.file_name(), ft.is_dir()));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut n = 0;
+    for (name, is_dir) in items {
+        if out.len() >= MAX_DOCS {
+            break;
+        }
+        let p = dir.join(&name);
+        if is_dir {
+            n += collect_docs(&p, out, depth + 1);
+            continue;
+        }
+        let lower = name.to_string_lossy().to_ascii_lowercase();
+        if lower.starts_with("~$") {
+            continue;
+        }
+        if !(lower.ends_with(".doc") || lower.ends_with(".docx")) {
+            continue;
+        }
+        let before = out.len();
+        push_doc(out, p.display().to_string());
+        if out.len() > before {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn doc_header(ui: &mut egui::Ui, title: &str, count: usize, buttons: impl FnOnce(&mut egui::Ui)) {
     let pal = ds::palette_of(ui.ctx());
     ui.horizontal(|ui| {
@@ -1779,5 +1905,84 @@ mod tests {
         assert!(!wt.print_can_run(EngineProbe::Word));
         wt.page_range = "3-7".into();
         assert!(wt.print_can_run(EngineProbe::Word));
+    }
+
+    /// 造一棵临时目录树，返回根目录。**目录名带 PID + 时间戳**，
+    /// 跑几遍也不会互相看见（本机删除会被安全层拦，所以不靠"先清一遍"）。
+    ///
+    /// ★ 不用 `std::env::temp_dir()`：本机 `%TEMP%` 在 C 盘，C 盘禁止非系统
+    ///   进程写入（`verify.rs` 的 `tmp_path` 踩过同一个坑）。测试二进制住在
+    ///   `target/<profile>/deps/` 下，那个目录一定可写。
+    fn tmp_tree(tag: &str) -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("取测试可执行文件路径");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(exe.as_path())
+            .join(format!("wrepl-wt-{tag}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("建测试目录");
+        root
+    }
+
+    fn touch(p: &std::path::Path) {
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).expect("建父目录");
+        }
+        std::fs::write(p, b"x").expect("写测试文件");
+    }
+
+    /// 选文件夹 = 递归收 `.doc/.docx`，并且**追加**（不覆盖已挑好的）。
+    #[test]
+    fn 选文件夹会递归收文档并且是追加() {
+        let root = tmp_tree("docs");
+        touch(&root.join("a.docx"));
+        touch(&root.join("b.DOC")); // 老交付包里的 .doc，扩展名大小写也不该漏
+        touch(&root.join("~$a.docx")); // Word 锁文件
+        touch(&root.join("说明.txt")); // 别的格式
+        touch(&root.join("01-URS").join("c.docx"));
+        touch(&root.join("01-URS").join("deep").join("d.docx")); // 第二层
+
+        let mut wt = WordTool::new();
+        wt.hdr_docs = vec!["已有的.docx".into()];
+        wt.set_docs(PickDoc::Header, vec![root.display().to_string()]);
+
+        assert_eq!(wt.hdr_docs.len(), 5, "{:#?}", wt.hdr_docs);
+        assert_eq!(wt.hdr_docs[0], "已有的.docx", "含目录时是追加，不能覆盖");
+        assert!(
+            !wt.hdr_docs.iter().any(|p| p.contains("~$")),
+            "Word 锁文件不能进列表：{}",
+            wt.hdr_docs.join(" | ")
+        );
+        assert!(!wt.hdr_docs.iter().any(|p| p.ends_with(".txt")));
+        assert!(
+            wt.hdr_docs.iter().any(|p| p.ends_with("deep\\d.docx") || p.ends_with("deep/d.docx")),
+            "要递归进子目录：{}",
+            wt.hdr_docs.join(" | ")
+        );
+
+        // 同一棵树再选一次：按路径去重，列表不再长
+        wt.set_docs(PickDoc::Header, vec![root.display().to_string()]);
+        assert_eq!(wt.hdr_docs.len(), 5, "重复加入同一文件夹不该翻倍");
+
+        // 打印页走的是同一套逻辑，落到自己的列表上
+        wt.set_docs(PickDoc::Print, vec![root.display().to_string()]);
+        assert_eq!(wt.print_docs.len(), 4, "打印页是空列表起步，收到 4 个");
+        assert!(wt.hdr_docs.len() == 5, "两页的列表各管各的");
+    }
+
+    /// 纯文件仍然是**覆盖**（与系统对话框一致 —— 改这里会让"重选"变成"越选越多"）。
+    #[test]
+    fn 纯文件仍然是覆盖() {
+        let mut wt = WordTool::new();
+        wt.hdr_docs = vec!["旧.docx".into()];
+        wt.set_docs(
+            PickDoc::Header,
+            vec!["新1.docx".into(), "新2.docx".into()],
+        );
+        assert_eq!(wt.hdr_docs, vec!["新1.docx", "新2.docx"]);
     }
 }
