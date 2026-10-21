@@ -83,7 +83,7 @@ wrepl.exe apply "要处理的文件夹" --rules-file "规则.txt" --verify-after
    或换一个不受管控的目录（如 `D:\wrepl\`）再试。
 5. **看日志** —— `%LOCALAPPDATA%\wrepl\wrepl-gui.log`。在资源管理器地址栏粘
    `%LOCALAPPDATA%\wrepl` 就能打开那个目录。
-   - 有 `======== wrepl-gui v0.8.2 启动 ========` → 进程真的起来过，日志末尾会写清结局；
+   - 有 `======== wrepl-gui v0.8.3 启动 ========` → 进程真的起来过，日志末尾会写清结局；
    - **日志文件根本不存在** → 进程压根没被启动，问题在 2/3/4 这三条上。
 6. **在命令行里跑**，直接看报错：
 
@@ -415,6 +415,12 @@ cargo build --release --features gui
 
 # 产物都在 target/release/：wrepl.exe / wrepl-gui.exe
 ```
+
+两个 exe 都带**熊猫图标与版本信息**（资源管理器、任务栏、文件属性里能看到）：
+图标是 `assets/wrepl.ico`，由 `build.rs` 编进资源节；版本信息里的版本号从
+`Cargo.toml` 现取，不用手改。想重新生成图标就 `python assets/make_icon.py`
+（需要 Pillow）。Windows 上的资源编译器：GNU 工具链用 `windres`，
+MSVC 用 Windows SDK 的 `rc.exe`（`build.rs` 会自己找）。
 
 - 需要 **Rust ≥ 1.85**（`edition 2024`）；官方 CI 用 `stable`。
 - 仓库里**故意没有** `rust-toolchain.toml`（见 `.gitignore`）：开发机上那份锁的是

@@ -39,6 +39,27 @@ mod wordtool;
 
 use eframe::egui;
 
+/// 窗口 / 任务栏图标：64×64 **裸 RGBA**，前面顶 8 字节头（宽、高，u32 小端）。
+///
+/// 为什么不内嵌 PNG：那要多拉一个解码器依赖，而 64×64×4 只有 16 KB
+/// —— 一个 crate 的体积和编译时间远比这贵。生成方式见 `assets/make_icon.py`。
+///
+/// ★ exe 的图标是**另外一份**（`assets/wrepl.ico`，由 `build.rs` 编进资源节）。
+/// 两份都得有：资源管理器 / 桌面快捷方式 / 开始菜单看的是 exe 那份；窗口标题栏
+/// 与任务栏按钮看的是这份。只做前者时，任务栏偶尔会退回系统默认图标。
+const ICON_RGBA: &[u8] = include_bytes!("../../assets/wrepl-64.rgba");
+
+/// 把内嵌的图标数据拆成 egui 要的形状。
+fn window_icon() -> egui::IconData {
+    let w = u32::from_le_bytes([ICON_RGBA[0], ICON_RGBA[1], ICON_RGBA[2], ICON_RGBA[3]]);
+    let h = u32::from_le_bytes([ICON_RGBA[4], ICON_RGBA[5], ICON_RGBA[6], ICON_RGBA[7]]);
+    egui::IconData {
+        rgba: ICON_RGBA[8..].to_vec(),
+        width: w,
+        height: h,
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // 第一件事就是装日志与 panic 钩子：后面任何一步出问题都要有记录。
     // （图形子系统没有控制台，否则用户只能看到窗口凭空消失，见 `diag`。）
@@ -64,7 +85,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("wrepl —— Word 批量替换")
             .with_inner_size([1180.0, 820.0])
-            .with_min_inner_size([940.0, 640.0]),
+            .with_min_inner_size([940.0, 640.0])
+            .with_icon(std::sync::Arc::new(window_icon())),
         ..Default::default()
     };
 
@@ -202,5 +224,26 @@ mod tests {
         // 拿一个跟图形无关的失败做对照，确认 `_ => false` 那条早退分支是对的。
         let e = eframe::Error::AppCreation(Box::new(std::io::Error::other("boom")));
         assert!(!是缺_opengl(&e), "非 OpenGL 变体不该被认成显卡问题");
+    }
+
+    /// 窗口图标的内嵌数据必须自洽：头里写的宽高要跟后面的字节数对得上。
+    ///
+    /// 这条测试盯的是**换图标时的常见错误** —— 只换了 .ico 忘了重跑
+    /// `assets/make_icon.py` 生成 .rgba，或者改小了尺寸没改头。
+    /// 真错了的表现是标题栏图标一片雪花，而没人会去看那里。
+    #[test]
+    fn 窗口图标数据自洽() {
+        let i = window_icon();
+        assert_eq!(i.width, i.height, "图标得是正方形");
+        assert!(i.width >= 32, "太小的图标在高 DPI 下会糊：{}", i.width);        assert_eq!(
+            i.rgba.len(),
+            (i.width * i.height * 4) as usize,
+            "RGBA 字节数与头里的宽高对不上，重跑 assets/make_icon.py"
+        );
+        // 不能是整片透明的空图（那种画出来什么都看不见）
+        assert!(
+            i.rgba.chunks_exact(4).any(|p| p[3] > 0),
+            "图标全透明，等于没图"
+        );
     }
 }
