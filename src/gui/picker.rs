@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use eframe::egui;
 use egui::{Align2, Color32, FontId, RichText, Sense, Vec2};
 
@@ -236,7 +237,7 @@ struct Drive {
 
 /// 一次后台读取。
 struct Load {
-    rx: mpsc::Receiver<(u64, Result<(PathBuf, Vec<Entry>), String>)>,
+    rx: mpsc::Receiver<(u64, anyhow::Result<(PathBuf, Vec<Entry>)>)>,
     /// 本次请求的序号；回来时对不上就丢弃（用户连点几下时只认最后一次）。
     seq: u64,
     dir: PathBuf,
@@ -661,8 +662,9 @@ impl Picker {
                     }
                     Err(e) => {
                         // 读不到就停在原地，把原因说清楚（权限 / 网络 / 路径不存在）
-                        crate::diag::log(format!("读取失败：{e}"));
-                        self.err = Some(e);
+                        let msg = format!("{e:#}");
+                        crate::diag::log(format!("读取失败：{msg}"));
+                        self.err = Some(msg);
                         // 回到"真的在这儿"的位置：`navigate` 是乐观更新的，失败就得撤。
                         self.set_loc(&self.cwd.clone());
                     }
@@ -1838,8 +1840,8 @@ impl Picker {
 
 // ─────────────────────── 读目录（跑在后台线程里）───────────────────────
 
-fn read_dir_entries(dir: &Path) -> Result<(PathBuf, Vec<Entry>), String> {
-    let rd = std::fs::read_dir(dir).map_err(|e| format!("{} —— {e}", dir.display()))?;
+fn read_dir_entries(dir: &Path) -> anyhow::Result<(PathBuf, Vec<Entry>)> {
+    let rd = std::fs::read_dir(dir).with_context(|| dir.display().to_string())?;
     let mut v = Vec::new();
     for item in rd {
         let Ok(de) = item else { continue }; // 单个条目读不到就跳过，不因一行坏掉整目录

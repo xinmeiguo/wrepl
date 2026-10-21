@@ -351,7 +351,7 @@ impl WordTool {
             }
             Err(e) => {
                 self.printers.clear();
-                self.printers_err = Some(e);
+                self.printers_err = Some(format!("{e:#}"));
                 self.printer_pick = 0;
             }
         }
@@ -916,7 +916,10 @@ impl WordTool {
             // 输入框下面，**绝不弹窗、也不静默按"全部"跑**。
             let pages_err = match sink {
                 Sink::Printer => None,
-                Sink::Pdf => services::parse_pdf_pages(&self.page_range).err(),
+                // 错误链摊成一行给输入框下面的红字：这里就是"转成 String"的那一层
+                Sink::Pdf => services::parse_pdf_pages(&self.page_range)
+                    .err()
+                    .map(|e| format!("{e:#}")),
             };
             let hint_txt = match sink {
                 Sink::Printer => "留空 = 全部；也可写 1-3,5,7-9",
@@ -1052,7 +1055,7 @@ impl WordTool {
         let pages = match services::parse_pdf_pages(&self.page_range) {
             Ok(p) => p,
             Err(e) => {
-                self.log(format!("页码范围不能用，已停止：{e}"));
+                self.log(format!("页码范围不能用，已停止：{e:#}"));
                 return;
             }
         };
@@ -1080,7 +1083,7 @@ impl WordTool {
         let pages = match services::parse_pdf_pages(&self.page_range) {
             Ok(p) => p,
             Err(e) => {
-                self.log(format!("页码范围不能用，已停止：{e}"));
+                self.log(format!("页码范围不能用，已停止：{e:#}"));
                 return;
             }
         };

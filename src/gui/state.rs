@@ -27,6 +27,7 @@
 //! 目录被移走），而"上次停在哪个目录"这件事已经由 `last-dir.txt` 负责；
 //! 也不存窗口大小位置 —— 那归窗口管理器，存了反而会让"上次是什么样"变成猜谜。
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -108,6 +109,9 @@ pub struct ReplaceState {
     pub backup: bool,
     pub recursive: bool,
     pub exclude: String,
+    /// 并行线程数，`0` = 自动。存下来是因为"网络盘上要锁成 2 线程"这种事
+    /// 每台机器都得设一次，重启就忘掉会很烦。
+    pub threads: usize,
 }
 
 impl Default for ReplaceState {
@@ -122,6 +126,7 @@ impl Default for ReplaceState {
             backup: false,
             recursive: false,
             exclude: String::new(),
+            threads: 0,
         }
     }
 }
@@ -179,15 +184,15 @@ pub fn load() -> Option<State> {
         }
         Err(e) => {
             // 坏文件**不删**：万一里面有用户手写的东西，留着让他自己看。
-            crate::diag::log(format!("界面状态读不出来（按默认值继续）：{e}"));
+            crate::diag::log(format!("界面状态读不出来（按默认值继续）：{e:#}"));
             None
         }
     }
 }
 
-/// 落盘。返回给人看的错误文本（调用方只记日志，不弹窗）。
-pub fn save(st: &State) -> Result<(), String> {
-    let p = path().ok_or_else(|| "取不到状态目录（LOCALAPPDATA）".to_string())?;
+/// 落盘。错误带着上下文，调用方只记日志（不弹窗）。
+pub fn save(st: &State) -> anyhow::Result<()> {
+    let p = path().context("取不到状态目录（LOCALAPPDATA）")?;
     save_to(&p, st)
 }
 
@@ -197,28 +202,29 @@ pub fn save(st: &State) -> Result<(), String> {
 ///
 /// 返回：`Ok(None)` = 文件不存在；`Ok(Some)` = 读到了；
 /// `Err` = 存在但读不出来（原因给人看）。
-fn read_state(p: &Path) -> Result<Option<State>, String> {
+fn read_state(p: &Path) -> anyhow::Result<Option<State>> {
     let raw = match std::fs::read_to_string(p) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}：{e}", p.display())),
+        Err(e) => return Err(e).with_context(|| p.display().to_string()),
     };
-    serde_json::from_str::<State>(&raw).map(Some).map_err(|e| e.to_string())
+    Ok(Some(
+        serde_json::from_str::<State>(&raw).with_context(|| format!("{} 不是有效的 JSON", p.display()))?,
+    ))
 }
 
 /// 先写 `state.json.tmp` 再改名。见模块头第 3 条。
-fn save_to(p: &Path, st: &State) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(st)
-        .map_err(|e| format!("状态序列化失败：{e}"))?;
+fn save_to(p: &Path, st: &State) -> anyhow::Result<()> {
+    let text = serde_json::to_string_pretty(st).context("状态序列化失败")?;
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, text.as_bytes())
-        .map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
+        .with_context(|| format!("写 {} 失败", tmp.display()))?;
     // Windows 上 `rename` 目标已存在时是**覆盖**（内部走 MOVEFILE_REPLACE_EXISTING），
     // 所以这里不需要先删旧文件 —— 少一步，也少一个"删掉了但没写进去"的窗口。
-    std::fs::rename(&tmp, p).map_err(|e| format!("替换 {} 失败：{e}", p.display()))
+    std::fs::rename(&tmp, p).with_context(|| format!("替换 {} 失败", p.display()))
 }
 
 #[cfg(test)]

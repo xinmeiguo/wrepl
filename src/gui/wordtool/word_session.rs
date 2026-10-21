@@ -294,7 +294,7 @@ where
         //   zip 级损坏（截断、改名的 .doc、空文件）是这类弹框的主力，我们能拦就拦。
         if let Err(why) = preflight(path) {
             fail += 1;
-            log(format!("跳过（文档本身打不开）：{path}（{why}）"));
+            log(format!("跳过（文档本身打不开）：{path}（{why:#}）"));
             continue;
         }
         unsafe {
@@ -363,13 +363,12 @@ where
 ///
 /// 剩下的那部分（zip 完好但 XML 坏了）拦不住。真正的兜底是**取消按钮**：
 /// 用户看到卡住能自己停，而不是只能杀进程。
-fn preflight(path: &str) -> Result<(), String> {
-    let names = wrepl::docx::package::part_names(std::path::Path::new(path))
-        .map_err(|e| format!("{e:#}"))?;
+fn preflight(path: &str) -> anyhow::Result<()> {
+    let names = wrepl::docx::package::part_names(std::path::Path::new(path))?;
     if names.iter().any(|n| n == "[Content_Types].xml") {
         Ok(())
     } else {
-        Err("缺 [Content_Types].xml，不是有效的 docx".to_string())
+        anyhow::bail!("缺 [Content_Types].xml，不是有效的 docx");
     }
 }
 
@@ -403,7 +402,10 @@ mod tests {
         let p = scratch("broken.docx");
         std::fs::write(&p, b"not a zip at all").expect("写测试文件");
 
-        let err = preflight(&p.display().to_string()).expect_err("非 zip 应当被拦下");
+        let err = format!(
+            "{:#}",
+            preflight(&p.display().to_string()).expect_err("非 zip 应当被拦下")
+        );
         assert!(!err.is_empty(), "拦下时要给出能看懂的原因");
     }
 

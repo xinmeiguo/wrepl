@@ -451,6 +451,28 @@ pub fn debug_page_mode() -> Option<String> {
     Some(v)
 }
 
+/// `WREPL_DEBUG_TOOL=kind|A|B|OUT` —— 启动就把「诊断工具」页的槽位填好。
+///
+/// 为什么需要：`capture_page.py` 点得中导航项与卡片按钮，但**点不中自绘选择器**
+/// 里那一长串路径（要滚动 + 双击 + 确认，一串合成鼠标事件里错一步就前功尽弃）。
+/// 让程序自己把参数摆好，截图脚本只需按一下「运行」，拍到的就是真实结果区。
+///
+/// 返回 `(kind 小写名, A, B, OUT)`；没设或格式不对返回 `None`（不报错、不影响开窗）。
+pub fn debug_tool_args() -> Option<(String, String, String, String)> {
+    let v = std::env::var("WREPL_DEBUG_TOOL").ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    // 只按 `|` 切 4 段：Windows 路径里可能有 `:` 和 `\`，不能拿它们当分隔符。
+    let mut it = v.splitn(4, '|');
+    let kind = it.next()?.trim().to_ascii_lowercase();
+    let a = it.next().unwrap_or("").trim().to_string();
+    let b = it.next().unwrap_or("").trim().to_string();
+    let out = it.next().unwrap_or("").trim().to_string();
+    Some((kind, a, b, out))
+}
+
 /// `WREPL_DEBUG_DROP=hover|drop` —— 复现拖放的两态。
 ///
 /// `hover` = 悬着东西不松手（整窗遮罩那一条路）；`drop` = 直接落地（走

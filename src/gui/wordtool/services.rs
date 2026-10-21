@@ -7,6 +7,7 @@ use super::com::{Disp, DispResult, var_bool, var_bstr, var_i4};
 use super::engine::WordKind;
 use super::wd;
 use super::word_session::{run_on_documents, run_on_documents_printing};
+use anyhow::bail;
 use std::path::{Path, PathBuf};
 use windows::Win32::System::Variant::VARIANT;
 use wrepl::cancel::Cancel;
@@ -83,22 +84,22 @@ impl PdfPages {
 ///
 /// 认 `3`、`3-7`，也认全角连字符与 `~`（用户在中文输入法下很容易打出这两个）。
 /// 不认逗号 / 分号 / 顿号 —— 见 [`PdfPages`] 上的说明。
-pub fn parse_pdf_pages(raw: &str) -> Result<PdfPages, String> {
+pub fn parse_pdf_pages(raw: &str) -> anyhow::Result<PdfPages> {
     let s = raw.trim();
     if s.is_empty() {
         return Ok(PdfPages::All);
     }
     if s.contains([',', '，', ';', '；', '、']) {
-        return Err("导出 PDF 一次只能导一段连续页码 —— 要分段请删掉逗号，分几次导出".to_string());
+        bail!("导出 PDF 一次只能导一段连续页码 —— 要分段请删掉逗号，分几次导出");
     }
     let norm = s.replace(['－', '—', '–', '~', '～'], "-");
     let parts: Vec<&str> = norm.split('-').map(str::trim).collect();
-    let num = |t: &str| -> Result<u32, String> {
+    let num = |t: &str| -> anyhow::Result<u32> {
         let v: u32 = t
             .parse()
-            .map_err(|_| format!("「{raw}」读不出页码（要写成 5 或 3-7）"))?;
+            .map_err(|_| anyhow::anyhow!("「{raw}」读不出页码（要写成 5 或 3-7）"))?;
         if v == 0 {
-            return Err(format!("页码从 1 开始，「{raw}」里出现了 0"));
+            bail!("页码从 1 开始，「{raw}」里出现了 0");
         }
         Ok(v)
     };
@@ -110,11 +111,11 @@ pub fn parse_pdf_pages(raw: &str) -> Result<PdfPages, String> {
         [a, b] => {
             let (a, b) = (num(a)?, num(b)?);
             if a > b {
-                return Err(format!("起止页写反了：「{raw}」（应当写成 小-大）"));
+                bail!("起止页写反了：「{raw}」（应当写成 小-大）");
             }
             Ok(PdfPages::FromTo(a, b))
         }
-        _ => Err(format!("「{raw}」读不出页码范围（要写成 5 或 3-7）")),
+        _ => bail!("「{raw}」读不出页码范围（要写成 5 或 3-7）"),
     }
 }
 
@@ -299,7 +300,7 @@ mod tests {
 
     #[test]
     fn pages_reject_multi_ranges_explicitly() {
-        let e = parse_pdf_pages("1-3,5").unwrap_err();
+        let e = format!("{:#}", parse_pdf_pages("1-3,5").unwrap_err());
         assert!(e.contains("连续"), "必须说清只能导一段：{e}");
         assert!(parse_pdf_pages("1，3").is_err(), "全角逗号也算多段");
         assert!(parse_pdf_pages("1;3").is_err());

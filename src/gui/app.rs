@@ -51,6 +51,7 @@
 //! 改变的是**这段时间里屏幕上有东西在动**。
 
 use crate::ds;
+use anyhow::{Context, bail};
 use eframe::egui::{self, Color32, RichText};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -68,10 +69,10 @@ use wrepl::report;
 use crate::picker::{Mode, Outcome, Picker};
 use crate::wordtool::{HeaderMode, Sink};
 
-const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
-const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
-const ERR_C: Color32 = Color32::from_rgb(0xC0, 0x2B, 0x1D);
-const DIM_C: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
+pub(crate) const OK_C: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
+pub(crate) const WARN_C: Color32 = Color32::from_rgb(0xB5, 0x6A, 0x00);
+pub(crate) const ERR_C: Color32 = Color32::from_rgb(0xC0, 0x2B, 0x1D);
+pub(crate) const DIM_C: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
 
 /// 界面上的「选路径」入口。
 ///
@@ -107,6 +108,13 @@ enum PickFor {
     BrowseDir,
     /// 「打开报告」—— 同上，只是起点是报告文件所在的目录。
     BrowseReport,
+    /// 「诊断工具」页：A 栏 / B 栏 / 「导出建议规则」那个文件。
+    ///
+    /// 三栏共用一个枚举变体是不够的 —— 结果要落到不同的字段上，
+    /// 所以按槽位分开，跟别的入口一样"一个入口一个变体"。
+    ToolA,
+    ToolB,
+    ToolOut,
 }
 
 /// 界面里的一行规则。
@@ -142,6 +150,20 @@ impl Row {
             note: String::new(),
             hits: None,
         }
+    }
+
+    /// 作用域串 → 结构，给界面视图用。
+    ///
+    /// 写坏的串按「全部」算：这里只是画图，**报错是 `App::scope_of` 的活**
+    /// ——那里知道是第几条，能把行号说出来。一个"点开就报错、还不告诉你在哪"的
+    /// 弹层比一个宽松的默认值更糟。
+    fn scope_view(&self) -> Scope {
+        Scope::parse(self.scope.trim()).unwrap_or(Scope::ALL)
+    }
+
+    /// 结构 → 作用域串。`display()` 在六维全开时返回「全部」，其余按名拼接。
+    fn set_scope(&mut self, sc: Scope) {
+        self.scope = sc.display();
     }
 }
 
@@ -317,6 +339,12 @@ pub struct App {
     mirror: bool,
     recursive: bool,
     exclude: String,
+    /// 并行线程数，**0 = 自动**（本机几个核就用几个，与从前的行为一致）。
+    ///
+    /// 当初刻意不做成选项（"几个线程是机器的事"），但命令行有 `--threads`、
+    /// 界面没有，等于同一个工具两种能力。放出来的位置是「更多运行参数」折叠区
+    /// ——不打扰常规流程，需要的人找得到。
+    threads: usize,
 
     // 规则
     rows: Vec<Row>,
@@ -395,6 +423,8 @@ pub struct App {
     page: Page,
     /// 页眉替换与打印与导出的状态 + 任务（页眉替换纯 Rust，打印 / 导出走 Word COM）。
     wt: crate::wordtool::WordTool,
+    /// 「诊断工具」页的全部状态（工具选择 / 参数 / 结果 / 后台线程）。
+    tools: crate::toolpage::ToolPage,
 
     // ── 状态持久化（见 `crate::state`）──
     /// **要不要读写 `%LOCALAPPDATA%\wrepl\state.json`。**
@@ -433,6 +463,8 @@ enum Page {
     Header,
     /// 打印与导出
     Print,
+    /// 诊断工具：命令行那六个只看不改的子命令（见 `crate::toolpage`）
+    Tools,
 }
 
 impl Default for App {
@@ -456,6 +488,7 @@ impl App {
             mirror: false,
             recursive: false,
             exclude: String::new(),
+            threads: 0,
             rows: Vec::new(),
             clear_armed: false,
             chain: false,
@@ -485,6 +518,7 @@ impl App {
             picker_for: None,
             page: Page::Replace,
             wt: crate::wordtool::WordTool::new(),
+            tools: crate::toolpage::ToolPage::new(),
             // 默认**不持久化**：`new()` 必须保持纯内存（见 `save_state` 的说明）。
             save_state: false,
             saved: None,
@@ -514,9 +548,9 @@ impl App {
             }
             None => {}
         }
-        // 同款诊断开关：`WREPL_DEBUG_PAGE=replace|header|header-image|print` 启动即落在那页。
-        // 加了「页眉替换 / 打印与导出」两页之后，截图与演示都需要让窗口一开就停在
-        // 指定页——合成鼠标事件进不来（同上），只能让程序自己切。不设则停在首页。
+        // 同款诊断开关：`WREPL_DEBUG_PAGE=replace|header|header-image|print|tools`
+        // 启动即落在那页。截图与演示都需要让窗口一开就停在指定页——合成鼠标
+        // 事件进不来（同上），只能让程序自己切。不设则停在首页。
         match crate::diag::debug_page_mode().as_deref() {
             Some("replace") => app.page = Page::Replace,
             Some("header") => app.page = Page::Header,
@@ -525,10 +559,33 @@ impl App {
                 app.wt.hdr_mode = HeaderMode::Image;
             }
             Some("print") => app.page = Page::Print,
+            Some("tools") => app.page = Page::Tools,
             Some(other) => {
                 crate::diag::log(format!("[诊断] 未知的 WREPL_DEBUG_PAGE={other:?}，忽略"))
             }
             None => {}
+        }
+        // 同款诊断开关：`WREPL_DEBUG_TOOL=kind|A|B|OUT` 把「诊断工具」页的参数摆好。
+        // 截图脚本点不中自绘选择器里那一长串路径，只能让程序自己填（见 diag 的说明）。
+        if let Some((kind, a, b, out)) = crate::diag::debug_tool_args() {
+            match app.tools.set_kind_by_name(&kind) {
+                Ok(()) => {
+                    app.tools.a = a;
+                    app.tools.b = b;
+                    app.tools.out = out;
+                    app.page = Page::Tools;
+                }
+                Err(e) => crate::diag::log(format!("[诊断] {e}，忽略")),
+            }
+        }
+        // `WREPL_DEBUG_TOOL_RUN=1`：开窗就替人按一下「运行」。
+        //
+        // 为什么不能让截图脚本按：本机合成鼠标点得到导航项、**点不到卡片里的按钮**
+        // （实测），而 `Ctrl+Enter` 也要前台焦点、脚本抢不到。截图要拍到"跑出结果"
+        // 的形态，只能让程序自己动手 —— 同 `WREPL_DEBUG_CLICK` / `WREPL_DEBUG_DROP`
+        // 那两处的取向。不设这个变量时下面一行都不执行。
+        if std::env::var("WREPL_DEBUG_TOOL_RUN").is_ok() && app.page == Page::Tools {
+            app.tools.start_now();
         }
         app
     }
@@ -552,7 +609,7 @@ impl App {
         if let Some(f) = &p.rules_file {
             match app.load_rules_file(f) {
                 Ok(n) => app.push_log(format!("已从规则文件读入 {n} 条规则：{f}")),
-                Err(e) => app.error = Some(e),
+                Err(e) => app.error = Some(format!("{e:#}")),
             }
         }
         app
@@ -612,6 +669,7 @@ impl App {
         self.backup = st.replace.backup;
         self.recursive = st.replace.recursive;
         self.exclude = st.replace.exclude.clone();
+        self.threads = st.replace.threads;
 
         self.wt.sink = if st.print.is_pdf() {
             crate::wordtool::Sink::Pdf
@@ -651,6 +709,7 @@ impl App {
                 backup: self.backup,
                 recursive: self.recursive,
                 exclude: self.exclude.clone(),
+                threads: self.threads,
             },
             print: crate::state::PrintState {
                 sink: match self.wt.sink {
@@ -713,7 +772,7 @@ impl App {
                 // 不弹 toast：这是一份便利状态，写不上不该打断任何正事
                 // （同 `diag::save_last_dir` 的取向）。而且下个 2 秒还会再试。
                 if !self.state_err_logged {
-                    crate::diag::log(format!("界面状态写不进去（不影响正事，稍后重试）：{e}"));
+                    crate::diag::log(format!("界面状态写不进去（不影响正事，稍后重试）：{e:#}"));
                     self.state_err_logged = true;
                 }
                 false
@@ -728,10 +787,10 @@ impl App {
     ///
     /// 返回**实际装进表里的条数**（不是文件里的行数）：标着「禁用」或
     /// 「使用通配符」的行界面上没地方显示，不会装进来，跳了几条看日志。
-    pub fn load_rules_file(&mut self, path: &str) -> Result<usize, String> {
+    pub fn load_rules_file(&mut self, path: &str) -> anyhow::Result<usize> {
         let defaults = Rule::new(0, "", "");
         let rs = rules::from_text_file(Path::new(path), &defaults, 1)
-            .map_err(|e| format!("规则文件读取失败：{e:#}"))?;
+            .context("规则文件读取失败")?;
         let mut st = LoadStat {
             added: 0,
             disabled: 0,
@@ -784,12 +843,12 @@ impl App {
     /// 装进去只会让人以为这条规则会跑。
     ///
     /// 返回 `(装入条数, 实际采用的工作表名)`。
-    pub fn load_rules_xlsx(&mut self, path: &str) -> Result<(usize, String), String> {
+    pub fn load_rules_xlsx(&mut self, path: &str) -> anyhow::Result<(usize, String)> {
         let p = Path::new(path);
         let defaults = Rule::new(0, "", "");
         let (rs, warns, sheet) =
             rules::from_xlsx_book(p, &self.xlsx_cols.for_read(), &defaults, 1)
-                .map_err(|e| format!("读 Excel 规则表失败：{e:#}"))?;
+                .context("读 Excel 规则表失败")?;
 
         for w in &warns {
             self.push_log(format!("注意：{w}"));
@@ -828,7 +887,7 @@ impl App {
     /// 列布局由 「规则」区的「Excel 列」决定：前两列恒为 查找内容 / 替换为，
     /// 其后是勾选的可选列。**没有序号列** —— 行序本身就是序号。
     /// 渲染走内核的 `rules::xlsx_row`，与 `rules template` 生成的模板同一条路。
-    pub fn export_rules_xlsx(&self, path: &str) -> Result<usize, String> {
+    pub fn export_rules_xlsx(&self, path: &str) -> anyhow::Result<usize> {
         let layout = &self.xlsx_cols;
         let headers = layout.headers();
 
@@ -856,11 +915,11 @@ impl App {
             );
         }
         if out.is_empty() {
-            return Err("规则表是空的，没有可导出的行".into());
+            bail!("规则表是空的，没有可导出的行");
         }
         let n = out.len();
         report::write_single_sheet(Path::new(path), "规则", &headers, out)
-            .map_err(|e| format!("写 Excel 失败：{e:#}"))?;
+            .context("写 Excel 失败")?;
         Ok(n)
     }
 
@@ -943,25 +1002,25 @@ impl App {
     /// 作用域串本身来自规则文件（界面上没有这一列，新建的行是 `全部`）；
     /// **「文件名」那一维由 「规则」区的「同步替换文件名」开关说了算**——
     /// 勾了才作用到文件名。这样规则文件里写没写「文件名」都不需要人去猜。
-    fn scope_of(&self, r: &Row, i: usize) -> Result<Scope, String> {
-        let mut sc = Scope::parse(r.scope.trim()).map_err(|e| {
+    fn scope_of(&self, r: &Row, i: usize) -> anyhow::Result<Scope> {
+        let mut sc = Scope::parse(r.scope.trim()).with_context(|| {
             format!(
-                "第 {} 条规则的「作用域」`{}` 无法解析（这一列在界面上没有，来自规则文件）：{e:#}",
+                "第 {} 条规则的「作用域」`{}` 无法解析：",
                 i + 1,
                 r.scope
             )
         })?;
         sc.filename = self.rename_files;
         if sc.is_empty() {
-            return Err(format!(
+            bail!(
                 "第 {} 条规则没有可用作用域：它只作用到「文件名」，但「同步替换文件名」没勾上",
                 i + 1
-            ));
+            );
         }
         Ok(sc)
     }
 
-    fn build_rules(&self) -> Result<Vec<Rule>, String> {
+    fn build_rules(&self) -> anyhow::Result<Vec<Rule>> {
         let mut out: Vec<Rule> = Vec::new();
         for (i, r) in self.rows.iter().enumerate() {
             if r.find.is_empty() {
@@ -977,7 +1036,7 @@ impl App {
             out.push(rule);
         }
         if out.is_empty() {
-            return Err("没有可用的规则：至少填一条「查找内容」".into());
+            bail!("没有可用的规则：至少填一条「查找内容」");
         }
         Ok(out)
     }
@@ -1016,10 +1075,9 @@ impl App {
             // 执行后自动验证是**执行本身的一部分**，不再是界面选项：
             // 两个关卡都在内存里比字节，不额外花时间，没有关掉的理由。
             verify_after: !dry,
-            // 界面固定用自动并行度：本机有几个核就用几个。
-            // 不在界面上做成选项——"几个线程"是机器的事，不是规则的事，
-            // 摆出来只会让人多一个不知道该怎么选的开关。
-            threads: 0,
+            // 0 = 自动（本机几个核就用几个）。界面在「更多运行参数」里可以改成
+            // 固定值 —— 网络盘 / 机械盘上并行读反而更慢时，这个旋钮就有用。
+            threads: self.threads,
             // 完整镜像只对写副本有意义（就地替换本就在原地）；预演不落盘，同样不生效。
             // 注意这里判 `in_place` 而不是 `out_dir`——`out_dir` 在同一条结构体字面量里
             // 已经先被移进字段，再读它就是 use-after-move。
@@ -1104,7 +1162,7 @@ impl App {
         let rule_list = match self.build_rules() {
             Ok(r) => r,
             Err(e) => {
-                self.error = Some(e);
+                self.error = Some(format!("{e:#}"));
                 return;
             }
         };
@@ -1421,7 +1479,9 @@ impl App {
             let rp_s = job.report_path.display().to_string();
             match write_report(&rp_s, &res, &job.rules, &job.paths, &job.opts) {
                 Ok(_) => self.push_log(format!("报告已写出：{rp_s}")),
-                Err(e) => self.error = Some(format!("报告写出失败：{e}")),
+                // 打出来的是 anyhow 的整条链（`{e:#}`），"写报告失败"这层上下文
+                // 已经在 `write_report` 里挂了，这里不再重复一遍
+                Err(e) => self.error = Some(format!("{e:#}")),
             }
 
             // 运行日志落盘：跟报告放在一起（写副本＝输出目录，就地替换＝源目录）
@@ -1596,6 +1656,9 @@ impl App {
                     (Page::Replace, "批量替换", ds::Icon::FileText),
                     (Page::Header, "页眉替换", ds::Icon::Edit),
                     (Page::Print, "打印与导出", ds::Icon::Package),
+                    // 命令行那六个只看不改的子命令（inspect / diff / probe …）。
+                    // 放在末位：它们是排障面，不是日常动作。
+                    (Page::Tools, "诊断工具", ds::Icon::Terminal),
                 ] {
                     if ui
                         .add(
@@ -1758,6 +1821,7 @@ impl App {
                     }
                     Page::Header => self.wt.ui_header(ui),
                     Page::Print => self.wt.ui_print(ui),
+                    Page::Tools => self.tools.ui(ui),
                 }
             });
         });
@@ -1775,6 +1839,21 @@ impl App {
                 crate::wordtool::PickDoc::Print => PickFor::PrintDocs,
                 crate::wordtool::PickDoc::HeaderImage => PickFor::HeaderImage,
             });
+        }
+
+        // 诊断工具页自己不调 `open_picker`（它拿不到 `&mut App`），只举旗子。
+        // 在这里消费掉：三个请求位与本页其它入口走**同一条**选路管线。
+        if self.tools.pick_a {
+            self.tools.pick_a = false;
+            self.open_picker(PickFor::ToolA);
+        }
+        if self.tools.pick_b {
+            self.tools.pick_b = false;
+            self.open_picker(PickFor::ToolB);
+        }
+        if self.tools.pick_out {
+            self.tools.pick_out = false;
+            self.open_picker(PickFor::ToolOut);
         }
 
         // 自绘文件选择器比确认框还要靠前（`Foreground` 面板 + 全屏遮罩），
@@ -1946,16 +2025,46 @@ impl App {
                      重复跑不会覆盖最初那版）。写副本时源文件本来就不动，无需备份。",
                 );
             });
-            // 「排除」输入框**不再显示**（2026-10-11 反馈）。
+            // 「更多运行参数」：排除通配符 + 线程数。
             //
-            // 它是"按文件名 glob 再多排掉一批"用的（例如 `*_bak*`），日常几乎用不到，
-            // 摆在「文件与输出」里反而让人怀疑"不填会漏掉什么"。
+            // 这两项 2026-10-11 那轮是**不给入口**的：排除框依反馈隐掉（"日常几乎
+            // 用不到，摆着让人怀疑不填会漏掉什么"），线程数干脆没做成选项
+            // （"几个线程是机器的事"）。但命令行一直有 `--exclude` / `--threads`
+            // ——同一个工具两种能力，本身就是个缺口。
             //
-            // ★ 隐掉这个入口**不影响**任何默认行为：
-            //   · Word 临时锁文件（`~$*.docx`）是 `pipeline::exclude_reason` 里的
-            //     **内置**规则，跟这个框无关 —— 执行结果里"跳过"那批照旧是它；
-            //   · 真要再加排除通配符，命令行版仍有 `--exclude`，`--preset` 也还认。
-            // 字段本身留在 `App` 上（`options_for` 仍会读它），随时可以把这个入口放回来。
+            // 处理办法是收进折叠区而不是摊平：默认收起，常规流程一眼扫过去不多两个
+            // 想不明白的字段；真要用（网络盘上并行读反而更慢、目录里混着 `*_bak*`
+            // 副本）时点开就有。
+            //
+            // ★ 收起时**不影响**任何默认行为：Word 临时锁文件（`~$*.docx`）是
+            //   `pipeline::exclude_reason` 里的**内置**规则，跟这个框无关。
+            egui::CollapsingHeader::new(RichText::new("更多运行参数").small().color(DIM_C))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ds::InputField::new(&mut self.exclude)
+                        .label("排除（文件名通配符，分号隔开）")
+                        .placeholder("例如  *_bak*;~$*")
+                        .desired_width(F)
+                        .show(ui);
+                    ui.add_space(ds::SPACING.s2);
+                    // 线程数：0 = 自动。选项与值一一对应（下标即值），
+                    // `SelectField` 只吃下标，省掉一层映射。
+                    let labels: Vec<String> = std::iter::once("自动（按核数）".to_string())
+                        .chain((1..=8).map(|n| format!("{n} 线程")))
+                        .collect();
+                    let cur_label = labels[self.threads.min(8)].clone();
+                    let opts: Vec<(usize, &str)> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (i, t.as_str()))
+                        .collect();
+                    // 状态文件被手改成 9 线程时夹回来：`show` 只认给定的那几个下标
+                    self.threads = self.threads.min(8);
+                    ds::SelectField::new("replace_threads")
+                        .label("线程数")
+                        .width(200.0)
+                        .show(ui, &mut self.threads, &cur_label, opts);
+                });
 
             // 选路径的动作放在布局之后执行：避免在借用 self 的闭包里嵌套借用。
             // 四个入口都走**同一个自绘面板**，靠 `PickFor` 区分结果落到哪个字段。
@@ -1992,8 +2101,10 @@ impl App {
             // 命中 / × 固定窄，剩下的宽度给两个输入列（约 52:48）。
             const W_HIT: f32 = 64.0;
             const W_DEL: f32 = 30.0;
+            // 「…」：这一行的四个属性（区分大小写 / 全字匹配 / 区分全半角 / 作用域）。
+            const W_MORE: f32 = 26.0;
             let gap = ui.spacing().item_spacing.x;
-            let free = (ui.available_width() - W_HIT - W_DEL - gap * 3.0).max(400.0);
+            let free = (ui.available_width() - W_HIT - W_DEL - W_MORE - gap * 4.0).max(400.0);
             let w_find = (free * 0.52).floor();
             let w_repl = (free - w_find).floor();
 
@@ -2160,9 +2271,12 @@ impl App {
                     ui.horizontal(|ui| {
                         // 撑满整行：否则底色横条只包住三列文字，看着不像表头
                         ui.set_min_width(ui.available_width());
-                        for (w, h) in
-                            [(w_find, "查找内容"), (w_repl, "替换为"), (W_HIT, "命中")]
-                        {
+                        for (w, h) in [
+                            (w_find, "查找内容"),
+                            (w_repl, "替换为"),
+                            (W_HIT, "命中"),
+                            (W_MORE, ""),
+                        ] {
                             fixed_cell(ui, w, 20.0, RichText::new(h).strong());
                         }
                     });
@@ -2250,6 +2364,22 @@ impl App {
                                             if !r.note.is_empty() {
                                                 resp.on_hover_text(&r.note);
                                             }
+                                            // 「…」：这一行的四个属性。它们长期只能从 Excel
+                                            // 往返调 —— 界面上有记号（比如"这条只改页眉"）
+                                            // 应该有，那就得能改。
+                                            let more = ui
+                                                .add_sized(
+                                                    [W_MORE, ui_scale::ROW_H],
+                                                    egui::Button::new("…").small(),
+                                                )
+                                                .on_hover_text(
+                                                    "这一条的高级属性：\n\
+                                                     区分大小写 / 全字匹配 / 区分全半角 / 作用域",
+                                                );
+                                            egui::Popup::menu(&more).show(|ui| {
+                                                ui.set_min_width(240.0);
+                                                row_attrs(ui, r);
+                                            });
                                             // 用 U+00D7（乘号）而不是 U+2715：后者在装入的
                                             // 中文字体里没有字形，实测渲染成豆腐块。
                                             if ui
@@ -2405,6 +2535,54 @@ impl App {
                     vec![],
                     String::new(),
                 ),
+                // ── 诊断工具页的三个槽位 ──
+                // A 是文件还是目录**由当前工具决定**（`Kind::a_is_dir`）：同一个按钮，
+                // 在「part 清单」下挑文件、在「项目侦察」下挑目录。标题也把工具名带上，
+                // 免得人以为是替上一件工具挑的。
+                PickFor::ToolA => {
+                    let dir = self.tools.kind.a_is_dir();
+                    (
+                        if dir { Mode::Folder } else { Mode::Files },
+                        if dir { "诊断工具 —— 选目录" } else { "诊断工具 —— 选文件" },
+                        first_path(&self.tools.a),
+                        if dir { vec![] } else { vec!["docx"] },
+                        String::new(),
+                    )
+                }
+                PickFor::ToolB => {
+                    match self.tools.kind.b_role() {
+                        // 写一个还不存在的文件 → 用「另存为」那一档
+                        Some(crate::toolpage::Role::OutFile) => (
+                            Mode::Save,
+                            "诊断工具 —— 输出文件",
+                            first_path(&self.tools.b),
+                            vec!["docx"],
+                            "透传产物.docx".to_string(),
+                        ),
+                        Some(crate::toolpage::Role::InDir) => (
+                            Mode::Folder,
+                            "诊断工具 —— 第二个目录",
+                            first_path(&self.tools.b),
+                            vec![],
+                            String::new(),
+                        ),
+                        // B 只要文件（或没有 B）：按"再挑一个文件"处理
+                        _ => (
+                            Mode::Files,
+                            "诊断工具 —— 第二个文件",
+                            first_path(&self.tools.b),
+                            vec!["docx"],
+                            String::new(),
+                        ),
+                    }
+                }
+                PickFor::ToolOut => (
+                    Mode::Save,
+                    "侦察 —— 建议规则写到哪",
+                    first_path(&self.tools.out),
+                    vec!["txt"],
+                    "侦察建议规则.txt".to_string(),
+                ),
             };
 
         self.picker_for = Some(what);
@@ -2497,6 +2675,22 @@ impl App {
                     self.open_file(&p.display().to_string());
                 }
             }
+            // 诊断工具页：三个槽位各填各的。空结果（面板里什么都没选就关了）不动原值。
+            PickFor::ToolA => {
+                if let Some(p) = paths.first() {
+                    self.tools.a = p.display().to_string();
+                }
+            }
+            PickFor::ToolB => {
+                if let Some(p) = paths.first() {
+                    self.tools.b = p.display().to_string();
+                }
+            }
+            PickFor::ToolOut => {
+                if let Some(p) = paths.first() {
+                    self.tools.out = p.display().to_string();
+                }
+            }
         }
     }
 
@@ -2535,6 +2729,16 @@ impl App {
                 Page::Replace => self.open_picker(PickFor::InputDir),
                 Page::Header => self.open_picker(PickFor::HeaderDocs),
                 Page::Print => self.open_picker(PickFor::PrintDocs),
+                // 诊断工具页的"起手动作"是挑 A 那栏（文件还是目录由当前工具定）。
+                Page::Tools => self.open_picker(PickFor::ToolA),
+            }
+            return;
+        }
+        // 诊断工具页只认 `Ctrl+Enter`（= 点「运行」）。`F5` 是"预演一整批替换"，
+        // 在这一页没有对应动作 —— 接了只会让人以为按错了没反应。
+        if self.page == Page::Tools {
+            if ctrl_enter {
+                self.tools.start_now();
             }
             return;
         }
@@ -2599,6 +2803,9 @@ impl App {
             // 交付包目录时静默吞进几百个文件，用户没要求。
             Page::Header => self.drop_into_docs(dropped, append, crate::wordtool::PickDoc::Header),
             Page::Print => self.drop_into_docs(dropped, append, crate::wordtool::PickDoc::Print),
+            // 诊断工具页：落到 A 栏，第二项落到 B 栏（`diff` 一次拖两个文件正好）。
+            // 不过滤后缀：`probe` / `verify` 要的是目录，`dump` 也认任意 docx。
+            Page::Tools => self.tools.drop_paths(&dropped),
         }
     }
 
@@ -2779,6 +2986,41 @@ impl App {
             // 那个逃生口（浏览模式不"选"东西，原生对话框没有对应动作可做）。
             // 这一支留在 match 里只为穷尽性 —— 走不到。
             PickFor::BrowseDir | PickFor::BrowseReport => None,
+            // 诊断工具页的三个槽位：A/B 是文件还是目录由当前工具定，
+            // 与 `open_picker` 里那一套分派保持一致（不然"..."点出来的
+            // 对话框会与面板挑的东西类型不同）。
+            PickFor::ToolA => {
+                if self.tools.kind.a_is_dir() {
+                    rfd::FileDialog::new().set_title("诊断工具 —— 选目录").pick_folder().map(|p| vec![p])
+                } else {
+                    rfd::FileDialog::new()
+                        .set_title("诊断工具 —— 选文件")
+                        .add_filter("Word 文档", &["docx"])
+                        .pick_files()
+                }
+            }
+            PickFor::ToolB => match self.tools.kind.b_role() {
+                Some(crate::toolpage::Role::OutFile) => rfd::FileDialog::new()
+                    .set_title("诊断工具 —— 输出文件")
+                    .add_filter("Word 文档", &["docx"])
+                    .set_file_name("透传产物.docx")
+                    .save_file()
+                    .map(|p| vec![p]),
+                Some(crate::toolpage::Role::InDir) => rfd::FileDialog::new()
+                    .set_title("诊断工具 —— 第二个目录")
+                    .pick_folder()
+                    .map(|p| vec![p]),
+                _ => rfd::FileDialog::new()
+                    .set_title("诊断工具 —— 第二个文件")
+                    .add_filter("Word 文档", &["docx"])
+                    .pick_files(),
+            },
+            PickFor::ToolOut => rfd::FileDialog::new()
+                .set_title("侦察 —— 建议规则写到哪")
+                .add_filter("文本规则文件", &["txt"])
+                .set_file_name("侦察建议规则.txt")
+                .save_file()
+                .map(|p| vec![p]),
         };
         if let Some(paths) = picked {
             self.apply_picked(what, paths);
@@ -2805,7 +3047,7 @@ impl App {
             }
             Err(e) => {
                 self.rows = kept;
-                self.error = Some(e);
+                self.error = Some(format!("{e:#}"));
             }
         }
     }
@@ -2818,7 +3060,7 @@ impl App {
                 ));
                 self.toast = Some((format!("已从 Excel 导入 {n} 条规则"), true));
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => self.error = Some(format!("{e:#}")),
         }
     }
 
@@ -2828,7 +3070,7 @@ impl App {
                 self.push_log(format!("已导出 {n} 条规则到：{s}"));
                 self.toast = Some((format!("已导出 {n} 条规则"), true));
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => self.error = Some(format!("{e:#}")),
         }
     }
 
@@ -3078,6 +3320,94 @@ fn fixed_cell(ui: &mut egui::Ui, w: f32, h: f32, text: RichText) -> egui::Respon
     resp
 }
 
+/// 规则行「…」弹层里的四个属性。
+///
+/// ## 为什么要它
+///
+/// `Row` 上能改的字段分成两类：查找内容 / 替换为（表格上有输入框），以及
+/// **区分大小写 / 全字匹配 / 区分全半角 / 作用域**——后四个此前只能靠 Excel 或
+/// 文本规则文件往返才能改。用户要在界面上说"这一条只改页眉"，过去得先把整张表
+/// 导出去、改完再导回来。
+///
+/// ## 作用域为什么只给五维
+///
+/// [`Scope`] 有六个维度，**「文件名」那一维不在这里**：它由「同步替换文件名」
+/// 总开关把关（见 `App::scope_of` 里那句 `sc.filename = self.rename_files`）。
+/// 在行里再放一个勾子和总开关打架，谁也说不清哪个说了算。
+fn row_attrs(ui: &mut egui::Ui, r: &mut Row) {
+    ui.add_space(2.0);
+    ui.label(RichText::new("匹配方式").small().color(DIM_C));
+    ui.add_space(2.0);
+    ui.add(ds::Checkbox::with_label(&mut r.case_sensitive, "区分大小写"))
+        .on_hover_text("默认不勾：`ABC` 也命中 `abc`");
+    ui.add(ds::Checkbox::with_label(&mut r.whole_word, "全字匹配"))
+        .on_hover_text("命中处两侧不能紧挨字母 / 数字（不是正则的 \\b，定义见 README）");
+    ui.add(ds::Checkbox::with_label(&mut r.kana_sensitive, "区分全半角"))
+        .on_hover_text(
+            "默认不勾：全角 `Ａ` 与半角 `A`、全角空格与半角空格算同一个字符。\n\
+             注意字段名是历史遗留（`kana_sensitive`），**与假名无关**。",
+        );
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(RichText::new("作用域").small().color(DIM_C));
+    ui.add_space(2.0);
+
+    // 串 → 视图。写坏的串按「全部」显示：真报错在 `App::scope_of`（那里知道是
+    // 第几条、能把行号说出来），这里只是画一个能改的视图——画不出来比宽松更糟。
+    let mut sc = r.scope_view();
+    let mut changed = false;
+    changed |= ui
+        .add(ds::Checkbox::with_label(&mut sc.body, "正文"))
+        .changed();
+    changed |= ui
+        .add(ds::Checkbox::with_label(&mut sc.header_footer, "页眉页脚"))
+        .changed();
+    changed |= ui
+        .add(ds::Checkbox::with_label(&mut sc.textbox, "文本框"))
+        .changed();
+    changed |= ui
+        .add(ds::Checkbox::with_label(&mut sc.footnote, "脚注"))
+        .changed();
+    changed |= ui
+        .add(ds::Checkbox::with_label(&mut sc.comment, "批注"))
+        .changed();
+    if changed {
+        r.set_scope(sc);
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.add(egui::Button::new("全选").small()).clicked() {
+            // 走 `scope_view` 再改，是为了保住原来那一位「文件名」——
+            // 直接把串写成「全部」会把它抹掉，导出 Excel 时那一列就变了。
+            let mut all = r.scope_view();
+            all.body = true;
+            all.header_footer = true;
+            all.textbox = true;
+            all.footnote = true;
+            all.comment = true;
+            r.set_scope(all);
+        }
+        if ui.add(egui::Button::new("只正文").small()).clicked() {
+            let mut body = r.scope_view();
+            body.body = true;
+            body.header_footer = false;
+            body.textbox = false;
+            body.footnote = false;
+            body.comment = false;
+            r.set_scope(body);
+        }
+    });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("「文件名」由「同步替换文件名」总开关决定")
+            .small()
+            .color(DIM_C),
+    );
+}
+
 fn chip(ui: &mut egui::Ui, label: &str, value: String, color: Color32) {
     ui.label(RichText::new(format!("{label} ")).small().color(DIM_C));
     ui.label(RichText::new(value).strong().color(color));
@@ -3173,11 +3503,11 @@ fn write_report(
     rules: &[Rule],
     inputs: &[PathBuf],
     opts: &Options,
-) -> Result<PathBuf, String> {
+) -> anyhow::Result<PathBuf> {
     let path = PathBuf::from(rp);
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败 {dir:?}：{e}"))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("建目录失败 {dir:?}"))?;
         }
     }
 
@@ -3245,7 +3575,7 @@ fn write_report(
         &res.name_rows,
         &res.verify_rows,
     )
-    .map_err(|e| format!("{e:#}"))?;
+    .context("写报告失败")?;
 
     Ok(path)
 }
@@ -3351,6 +3681,14 @@ pub fn selftest(args: &[String]) -> i32 {
     }
     println!("  布局 3 帧通过（无 panic）");
 
+    // 3.1) 「诊断工具」页也渲染一帧：它是 0.8.0 新加的一整页（工具选择 + 参数 +
+    //      结果区三张卡），排版代码里的 panic 只会在真画的时候才暴露。
+    //      参数全空 → 只画提示、不起线程，不碰磁盘。
+    app.page = Page::Tools;
+    let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
+    app.page = Page::Replace;
+    println!("  诊断工具页渲染通过（无 panic）");
+
     // 3.5) 规则的 Excel 往返：导出 → 读回。走的是界面上那两个按钮的同一条路
     //      （只是绕开了文件对话框），用来验证 xlsx 读写的接线。
     let xlsx = Path::new(&preset.output)
@@ -3367,12 +3705,12 @@ pub fn selftest(args: &[String]) -> i32 {
                 return 2;
             }
             Err(e) => {
-                println!("  ✗ 规则 Excel 读回失败：{e}");
+                println!("  ✗ 规则 Excel 读回失败：{e:#}");
                 return 2;
             }
         },
         Err(e) => {
-            println!("  ✗ 规则 Excel 导出失败：{e}");
+            println!("  ✗ 规则 Excel 导出失败：{e:#}");
             return 2;
         }
     }
@@ -4417,9 +4755,11 @@ mod tests {
         app.rename_files = false;
         app.rows = vec![Row::new("甲", "乙", "文件名")];
 
-        let err = app
-            .build_rules()
-            .expect_err("纯文件名作用域 + 没勾改名 = 没有可用作用域");
+        let err = format!(
+            "{:#}",
+            app.build_rules()
+                .expect_err("纯文件名作用域 + 没勾改名 = 没有可用作用域")
+        );
         assert!(err.contains("没有可用作用域"), "错误要说清原因：{err}");
         assert!(err.contains("第 1 条"), "错误要指出是第几条：{err}");
 
@@ -4434,7 +4774,7 @@ mod tests {
         let mut app = App::new();
         app.rows = vec![Row::new("甲", "乙", "正文,不存在的维度")];
 
-        let err = app.build_rules().expect_err("未知作用域应当报错");
+        let err = format!("{:#}", app.build_rules().expect_err("未知作用域应当报错"));
         assert!(err.contains("第 1 条"), "要指出是哪一条：{err}");
         assert!(err.contains("不存在的维度"), "要把写错的那个词带出来：{err}");
     }
@@ -4764,6 +5104,79 @@ mod tests {
         );
         let kb: f64 = row[2].parse().expect("大小列应是数字");
         assert!((kb - 3.0).abs() < 0.01, "大小应现读磁盘，实际 {kb}");
+    }
+
+    // ═══════════════════ 规则行属性（「…」弹层）═══════════════════
+
+    /// 作用域串在行上来回走一趟：读出结构、改掉、写回串。
+    ///
+    /// 「…」弹层就是靠这两个方法改行的 —— 它们坏了，界面上勾了也不生效，
+    /// 而且**看起来一切正常**（勾还在，下次导出才发现串没变）。
+    #[test]
+    fn 作用域在行上往返() {
+        let mut r = Row::new("甲", "乙", "正文,页眉页脚");
+        let sc = r.scope_view();
+        assert!(sc.body && sc.header_footer);
+        assert!(!sc.textbox && !sc.footnote && !sc.comment);
+
+        // 五个维度全开 → `display()` 给出「全部」（`filename` 由总开关管，
+        // 这里刻意不打开它，好让「全部」这个词的含义保持"文档内全部"）
+        r.set_scope(Scope {
+            body: true,
+            header_footer: true,
+            textbox: true,
+            footnote: true,
+            comment: true,
+            filename: false,
+        });
+        assert_eq!(r.scope, "正文,页眉页脚,文本框,脚注,批注");
+
+        r.set_scope(Scope::ALL);
+        assert_eq!(r.scope, "全部", "六维全开才是「全部」");
+    }
+
+    /// 写坏的作用域串按「全部」显示，**不 panic** —— 弹层必须画得出来。
+    #[test]
+    fn 作用域串写坏时按全部显示() {
+        let r = Row::new("甲", "乙", "正文,不存在的维度");
+        let sc = r.scope_view();
+        assert!(sc.body && sc.header_footer && sc.textbox);
+    }
+
+    /// 「…」弹层能真的画出来（这一条钉的是"排版不 panic"）。
+    ///
+    /// ★ 必须先 `ds::install`：egui 默认样式表里没有 `h3` 那几档自定义字号，
+    ///   设计系统的组件一画就 panic（踩过）。
+    #[test]
+    fn 规则行弹层能画出来() {
+        let ctx = egui::Context::default();
+        ds::install(&ctx);
+        let mut r = Row::new("冻干机", "清洗机", "全部");
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(400.0, 500.0),
+        ));
+        for _ in 0..2 {
+            let _ = ctx.run_ui(raw.clone(), |ui| row_attrs(ui, &mut r));
+        }
+        // 没交互 → 串不该被改动
+        assert_eq!(r.scope, "全部");
+        assert!(!r.case_sensitive);
+    }
+
+    /// 线程数要跟着状态一起存盘：网络盘上"锁成 2 线程"是每台机器设一次的事，
+    /// 重启就忘掉会很烦。
+    #[test]
+    fn 线程数跟着状态往返() {
+        let mut app = App::new();
+        app.threads = 3;
+        let st = app.snapshot_state();
+        assert_eq!(st.replace.threads, 3);
+
+        let mut back = App::new();
+        back.apply_state(&st);
+        assert_eq!(back.threads, 3);
     }
 
     // ═══════════════════ 进度条文案 ═══════════════════

@@ -3,9 +3,9 @@
 > **这个文件只记"还没做的"和"为什么先不做"。**
 > 做完的进 [`CHANGELOG.md`](../CHANGELOG.md)；过程、约束与验证链进 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。
 >
-> 最后更新：2026-10-21（**0.7.0 已发版**；增量导出已否决，见 §2.3；全项目扫描的
-> 剩余项见 §7，其中「行为不变」的 7 条已随 0.6.0 落地、§7.1 的四条已随 0.7.0 落地，
-> 见 `CHANGELOG.md`）
+> 最后更新：2026-10-21（**0.8.0 已发版**；增量导出已否决，见 §2.3；全项目扫描的
+> 剩余项见 §7，其中「行为不变」的 7 条已随 0.6.0 落地、§7.1 的六条已随 0.7.0 / 0.8.0
+> 全部清空，见 `CHANGELOG.md`）
 
 ## 0. 顺序不是按"重要性"排的，是按**依赖**排的
 
@@ -394,11 +394,18 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 > **「取消信号 + 关窗 join」于 2026-10-21 落地**（`src/cancel.rs` + 两处副本循环的
 > 文件边界检查 + 界面的「取消」按钮 + `on_exit` 有界 join），明细见
 > `CHANGELOG.md` 的「执行中取消 + 关窗收尾」一节。
+>
+> **§7.1 的最后两条也于 2026-10-21 随 0.8.0 落地**：
+>
+> - **GUI 错误类型统一成 `anyhow::Result`** —— `app.rs` 6 处 + `picker.rs` + `printers.rs`
+>   + `services.rs` + `word_session.rs` + `state.rs`，只在 toast / 日志那一层转 String。
+>   `com.rs` 的 `DispResult` **刻意留着**（COM 晚期绑定边界，混着 HRESULT 语义）。
+> - **CLI ↔ GUI 功能对齐** —— 六个只读子命令下沉到 `wrepl::tools` 并加了「诊断工具」页；
+>   规则行可改匹配方式与作用域；`--exclude` / `--threads` 进了「更多运行参数」折叠区。
+>   判据是**命令行输出逐字节不变**（六份基线全部 `cmp` 相同）。
+>
+> ⇒ §7.1 已清空。剩下的在 §7.2 / §7.3。
 
-| 项 | 位置 | 收益 / 代价 |
-|---|---|---|
-| **GUI 错误类型统一成 `anyhow::Result`** | `app.rs` 6 处、`picker.rs:1842`、`printers.rs:56`、`services.rs:83` | GUI 侧整片 `Result<_, String>`，边界处一堆 `map_err(|e| format!("…{e:#}"))`。统一后只在 toast / 日志那一层转 String。**注意：`{e:#}` 本身是对的**（anyhow 链式 Display），别改成 `{e}` |
-| **CLI ↔ GUI 功能对齐** | `cli.rs:84-207`、`app.rs:1851` | `Inspect/Passthrough/Diff/Dump/Probe/Verify --batch` GUI 无入口；规则表的 `区分大小写 / 全字匹配 / 区分全半角 / 作用域` 只能 Excel 往返调；`--exclude` / `--threads` 在界面上被隐掉 |
 
 ### 7.2 结构 / 维护性（改动量大，收益是"以后好改"）
 

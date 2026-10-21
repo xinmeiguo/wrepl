@@ -34,6 +34,7 @@ mod diag;
 mod ds;
 mod picker;
 mod state;
+mod toolpage;
 mod wordtool;
 
 use eframe::egui;

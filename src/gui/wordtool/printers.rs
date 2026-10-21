@@ -53,7 +53,7 @@ impl Printer {
 ///
 /// 返回**按名字排序**的列表；失败时返回原因（调用方把它显示在打印页上，
 /// 而不是让下拉框空着不说为什么）。
-pub fn list() -> Result<Vec<Printer>, String> {
+pub fn list() -> anyhow::Result<Vec<Printer>> {
     let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
 
     // ① 第一次调用只为拿「需要多少字节」；缓冲给空，必然以
@@ -85,7 +85,7 @@ pub fn list() -> Result<Vec<Printer>, String> {
                 &mut needed,
                 &mut returned,
             )
-            .map_err(|e| format!("读取打印机列表失败：{e}"))?;
+            .map_err(|e| anyhow::anyhow!("读取打印机列表失败：{e}"))?;
         }
         // `bytes` 借用到此结束 —— 下面要按 `PRINTER_INFO_2W` 读**同一块**内存，
         // 那时必须已经没有别的借用了。`needed` 只是容量，`returned` 才是条数。

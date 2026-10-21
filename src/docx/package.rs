@@ -164,7 +164,11 @@ pub fn physical_order<R: Read + std::io::Seek>(ar: &mut ZipArchive<R>) -> Result
 ///
 /// 这是 M1 的验收目标——**输出与输入的每个 part 原始字节完全一致**。
 /// 一个连"读进来再写出去"都不改字节的实现，后面才可能只改该改的地方。
-pub fn passthrough(src: &Path, dst: &Path) -> Result<()> {
+///
+/// 返回**过程提示**（一到两行），由调用方决定放哪儿：命令行插在报告当中，
+/// 图形界面显示在结果区。**不自己打 stderr** —— 图形界面没有控制台，
+/// 打出去就丢了；而"复原了几个记账字段"恰恰是它唯一能说明自己做了什么的证据。
+pub fn passthrough(src: &Path, dst: &Path) -> Result<Vec<String>> {
     if !src.exists() {
         bail!("输入文件不存在：{}", src.display());
     }
@@ -204,11 +208,16 @@ pub fn passthrough(src: &Path, dst: &Path) -> Result<()> {
     drop(bw); // 先落盘关文件，才能回头改中央目录
 
     // 复原 zip 记账字段（外部属性 / version made by）——目标：文件级 SHA 与原件一致
+    let mut notes = Vec::new();
     match restore_external_attrs(src, dst) {
-        Ok(n) => eprintln!("  · 已复原 {n} 个条目的 zip 记账字段（文件级 SHA 应与原件一致）"),
-        Err(e) => eprintln!("  · 提示：未能复原 zip 记账字段（{e}）——不影响 part 内容"),
+        Ok(n) => notes.push(format!(
+            "  · 已复原 {n} 个条目的 zip 记账字段（文件级 SHA 应与原件一致）"
+        )),
+        Err(e) => notes.push(format!(
+            "  · 提示：未能复原 zip 记账字段（{e}）——不影响 part 内容"
+        )),
     }
-    Ok(())
+    Ok(notes)
 }
 
 /// 读出指定 part 的**解压后原始字节**。

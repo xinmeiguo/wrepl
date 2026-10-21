@@ -236,8 +236,8 @@ cd /d/test/wrepl
 cargo check --features gui --offline
 
 # ② 单元测试（★ 两个都要跑，这是两套不同的测试集）
-cargo test --features gui --offline --lib                 # 期望 89 passed / 0 failed
-cargo test --features gui --offline --bin wrepl-gui       # 期望 97 passed / 0 failed
+cargo test --features gui --offline --lib                 # 期望 92 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui       # 期望 105 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
@@ -278,20 +278,20 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 拼进 Release 正文。所以：
 
 ```markdown
-## [0.7.0] - 2026-10-21
+## [0.8.0] - 2026-10-21
 
-> - 新增：界面状态自动保存 —— **规则表、主题、「打印与导出」设置（含选中的打印机）关窗不再丢**，落 `%LOCALAPPDATA%\wrepl\state.json`。
-> - 界面：批量替换的进度条换成与「页眉替换」**同一个组件**（细条 + 文案在上），不再用 egui 自带那个文字压在条里、定宽 320 px 的。
-> - 修复：界面导出的报告里，「被跳过文件的修改时间」一直是空串（命令行那份是好的）；两份实现已合成一份。
-> - 架构：报告行构造下沉到 `report` 模块，命令行与界面共用；`short` / `short_sha` 同函数两名一并消掉。
-> - 性能：「侦察目录」与批量验证改成**按文件并行**，且一个文件只开一次容器 —— 26 个真实交付包上侦察快 **1.96×**、批量验证快 **1.69×**，输出逐字相同。
+> - 新增：**「诊断工具」页** —— 命令行的 `inspect` / `passthrough` / `diff` / `dump` / `probe` / `verify --batch` 六个子命令进了界面，报告与终端逐字相同（同一份实现，两处显示）。
+> - 新增：规则表每行可改「区分大小写 / 全字匹配 / 区分全半角 / 作用域」—— 以前只能导去 Excel 改完再导回来。
+> - 新增：「更多运行参数」里放出 `--exclude` 与 `--threads`（默认收起，不影响日常流程）。
+> - 新增：**执行中可以取消** —— 批量替换与「打印 / 导出 PDF」都加了「取消」按钮；关窗时先发取消、再等后台线程收尾，不再把孤儿线程留在后台。
+> - 修复：打印 / 导出前先自查文件是不是有效 docx，把「Word 弹文档修复框、整批卡住不动」的多数情况挡在进 Word 之前。
 
 ### 明细小节（写多细都行，不会进 Release 正文）
 ```
 
 ★ 这段示例**是真实的最近一版内容**，换版号时**连内容一起换** —— 只改数字会让它变成假话。
 
-- 标题写成 `## [0.7.0] - 2026-10-21`（方括号里与 tag 去掉 `v` 后一致）；
+- 标题写成 `## [0.8.0] - 2026-10-21`（方括号里与 tag 去掉 `v` 后一致）；
 - 标题下面**紧跟那组引用行**；
 - **引用行只写主要条目** —— 实现细节（文件名、行号、实测数字）放下面的明细；
 - **找不到对应小节、或小节里没有这组引用行 → 发版失败并明确报错**
@@ -302,7 +302,7 @@ bash regress.sh D:/test/cargo-target/release/wrepl.exe \
 | 位置 | 说明 |
 |---|---|
 | `Cargo.toml` 的 `version` | 唯一真源 |
-| `README.md` 的启动日志示例 | `======== wrepl-gui v0.7.0 启动 ========` —— 这行来自 `env!("CARGO_PKG_VERSION")`，不改就对不上 |
+| `README.md` 的启动日志示例 | `======== wrepl-gui v0.8.0 启动 ========` —— 这行来自 `env!("CARGO_PKG_VERSION")`，不改就对不上 |
 | `Cargo.lock` 里 `name = "wrepl"` 那一条 | **按 `name = "wrepl"` 定位，别按版本号全文替换** —— 别的 crate 也可能是同一个号（0.4.2 时 `xkbcommon-dl` 就是）。改完跑 `cargo metadata --locked --offline`，退出码必须是 0 |
 
 ### 3.4 提交信息
@@ -314,7 +314,7 @@ vX.Y.Z：一句话说清这版干了什么
 - 修复：…
 - 交互：…
 
-验证：cargo check/build 0 error 且自家代码零警告；cargo test --lib 89 / --bin 97 全绿；
+验证：cargo check/build 0 error 且自家代码零警告；cargo test --lib 92 / --bin 105 全绿；
 regress.sh 通过 78 / 失败 0，含 26/26 SHA256 与基线完全相同。
 ```
 

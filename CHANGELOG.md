@@ -24,8 +24,11 @@
 
 ---
 
-## [未发布]
+## [0.8.0] - 2026-10-21
 
+> - 新增：**「诊断工具」页** —— 命令行的 `inspect` / `passthrough` / `diff` / `dump` / `probe` / `verify --batch` 六个子命令进了界面，报告与终端逐字相同（同一份实现，两处显示）。
+> - 新增：规则表每行可改「区分大小写 / 全字匹配 / 区分全半角 / 作用域」—— 以前只能导去 Excel 改完再导回来。
+> - 新增：「更多运行参数」里放出 `--exclude` 与 `--threads`（默认收起，不影响日常流程）。
 > - 新增：**执行中可以取消** —— 批量替换与「打印 / 导出 PDF」都加了「取消」按钮；关窗时先发取消、再等后台线程收尾，不再把孤儿线程留在后台。
 > - 修复：打印 / 导出前先自查文件是不是有效 docx，把「Word 弹文档修复框、整批卡住不动」的多数情况挡在进 Word 之前。
 
@@ -84,10 +87,144 @@ zip 完好但 XML 坏了的拦不住 —— 那种情况靠取消按钮兜底（
 
 #### 验证
 
-- `--lib` **89**（83 + `cancel` 4 条 + `pipeline` 2 条）、`--bin wrepl-gui` **94**（92 + 2 条）
+- 本批新增 7 条测试（`--lib` 4 条 + `--bin` 3 条），全套数字见本节末尾的「本版总判据」
 - 新增的 `取消之后不再开始新文件` 用 `threads: 1` 把并发钉死再断言 —— 并行下"第一个"
   是哪个不确定，断言会变成掷骰子
-- 回归 78/0、26/26 SHA256 与基线**完全相同**（取消默认不发生，产物一个字节没变）
+
+### 诊断工具页（2026-10-21）
+
+#### 为什么做
+
+`inspect / passthrough / diff / dump / probe / verify --batch` 一直是"命令行才有"的能力
+（`docs/ROADMAP.md` §7.1 的另一半）。可它们是**同一件工具的排障面**：有人说
+"这份产物怎么改了这么多"，第一步就是 `diff` 原件与产物；换了台机器想确认拷贝链路
+没动字节，就是 `passthrough`。会用到这些的时候，往往正是**不方便开终端**的时候
+（交付现场、同事的电脑）。
+
+#### 怎么做的：把报告文本下沉到 `wrepl::tools`
+
+关键不在"加几个按钮"，而在**同一件事只能有一份实现**。界面另写一套解析，
+同一个文件在两边会给出不同结论 —— 那是最难查的那种 bug。
+
+所以新模块 `src/tools.rs` 提供六个函数，每个**只产出文本**、不碰 stdout：
+
+```rust
+pub struct ToolOutput { pub text: String, pub ok: bool }
+pub fn inspect(file: &Path) -> Result<ToolOutput>
+pub fn passthrough(input: &Path, output: &Path) -> Result<ToolOutput>
+pub fn diff(a: &Path, b: &Path) -> Result<ToolOutput>
+pub fn dump(file: &Path, part: Option<&str>, grep: Option<&str>, limit: usize, special: bool) -> Result<ToolOutput>
+pub fn probe_dir_report(dir: &Path, recursive: bool, out: Option<&Path>) -> Result<ToolOutput>
+pub fn verify(a: &Path, b: &Path, level1_only: bool, batch: bool) -> Result<ToolOutput>
+```
+
+`text` 给人看，`ok` 是**结论**（命令行的退出码 / 界面上那行"通过 / 不通过"）。
+两件事分开，调用方就不必去解析自己的输出来判断成败。
+
+`main.rs` 那边只剩三件事：选路、打印、按 `ok` 决定退出码：
+
+```rust
+fn cmd_inspect(file: &Path) -> Result<()> { emit(tools::inspect(file)?) }
+```
+
+#### ★ 判据：CLI 输出必须**逐字不变**
+
+搬代码最容易出的事是"报告少一行/多一行"，而这类差异没人会去逐行比对。
+所以先在旧二进制上把六件工具的完整输出存成基线（真实交付包：`inspect` / `dump --limit 3`、
+`diff`、`probe` 整个目录、`verify --batch` 两个目录、`passthrough`），改完再逐字节 `cmp`。
+
+**六份全部 SAME**，只有一处需要改实现（见下条）：
+
+| 工具 | 结果 |
+|---|---|
+| `inspect` / `dump` / `diff` / `probe` / `verify --batch` | 逐字节相同 |
+| `passthrough` | 一开始**顺序不同** —— 见下面那条修复 |
+
+#### 顺带修掉：`package::passthrough` 不再往 stderr 打提示
+
+它原来在函数里 `eprintln!("  · 已复原 N 个条目的 zip 记账字段…")`。
+命令行时代问题不明显（`2>&1` 之后看着像插在报告中间），但：
+
+1. **图形界面没有控制台** —— 这行打出去就消失了，而它恰恰是"透传到底做了什么"的唯一证据；
+2. 命令行的报告现在是**攒成一段再打印**的，stderr 立刻落地、stdout 攒到最后 →
+   那行会跑到报告的最前面去（实测：从第 5 行变成第 1 行）。
+
+改成返回 `Result<Vec<String>>`（过程提示），由调用方插到正确位置。
+`tools::passthrough` 插在"读了什么 / 写了什么"之后、"比得怎样"之前 ——
+与命令行时代的位置一致。**这是本次唯一的库公共 API 变化**，只有一个调用点。
+
+#### 界面这一页
+
+「诊断工具」放在导航末位（排障面，不是日常动作），四块卡片：工具选择 → 参数 → 运行 → 结果。
+
+- **A 栏是文件还是目录由当前工具决定**（`Kind::a_is_dir`）：同一个「选文件 / 选目录」按钮
+  在「part 清单」下挑文件、在「项目侦察」下挑目录。填错一栏会让人以为程序坏了。
+- **跑在后台线程**：`probe` 扫 26 个真实交付包要几秒，`verify` 批量更要逐个开 zip；
+  放界面线程里就是"窗口不动了"。
+- **缺参数在起跑前就拦**（`precheck`）：让用户等两秒才知道少填一栏，很糟。
+  零改动透传的"输入输出同一个文件"也在这里拦 —— 库那边会拒绝，但那是跑起来之后。
+- 结果区**限高自滚 + 可框选 + 「复制全部」**：报告动辄上百行，不限高会把整页撑开。
+- 拖放落到 A 栏，第二项落到 B 栏（`diff` 一次拖两个文件正好）。
+- `WREPL_DEBUG_PAGE=tools` 可以直接落在本页（截图与演示用，同另三页）。
+
+### 规则行属性 + 更多运行参数（2026-10-21）
+
+`Row` 上有四个字段长期只能靠 Excel / 文本规则文件往返才能改：
+区分大小写、全字匹配、区分全半角、作用域。于是出现了这种局面 ——
+界面上**看得见结果、改不了原因**："这条只改了页眉"这种标记，过去得导表、改表、再导回来。
+
+#### 每行一个「…」
+
+命中数右边加了一个 26 px 的「…」，点开是这一条的四个属性：
+
+- 三个匹配开关（带 hover 说明，包括 `kana_sensitive` 这个**与假名无关**的历史字段名）；
+- 作用域给**文档内部的五维**（正文 / 页眉页脚 / 文本框 / 脚注 / 批注）+ 「全选」「只正文」两个快捷；
+
+★ **「文件名」那一维故意不在这里**：它由「同步替换文件名」总开关把关
+（`App::scope_of` 里那句 `sc.filename = self.rename_files`）。行里再放一个勾子会和总开关打架，
+谁也说不清哪个说了算。弹层底部有一行小字说明这件事。
+
+作用域串写坏时按「全部」显示，**不在弹层里报错** —— 真报错在 `App::scope_of`，
+那里知道是第几条、能把行号说出来。一个"点开就报错、还不告诉你在哪"的弹层比宽松默认值更糟。
+
+#### 「更多运行参数」（默认收起）
+
+`--exclude` 与 `--threads` 命令行一直有、界面一直没有。这两项 2026-10-11 那轮是**主动不给入口**的
+（排除框"日常用不到，摆着让人怀疑不填会漏掉什么"；线程数"是机器的事"）。收进折叠区是折中：
+
+- 默认收起 → 常规流程不多两个想不明白的字段；
+- 展开就有 → 网络盘上并行读反而更慢、目录里混着 `*_bak*` 副本时，这个旋钮有用。
+
+线程数 `0 = 自动（按核数）`，随界面状态一起持久化（`state.json` 的 `replace.threads`）。
+**收起时不影响任何默认行为**：`~$*.docx` 那些临时锁文件是 `pipeline::exclude_reason` 里的
+内置规则，跟这个框无关。
+
+### GUI 错误类型统一成 `anyhow::Result`（2026-10-21）
+
+界面侧原本整片 `Result<_, String>`，边界处一堆 `map_err(|e| format!("…{e:#}"))`。
+统一之后**只在 toast / 日志那一层转 String**：
+
+| 位置 | 现在 |
+|---|---|
+| `app.rs` 的 `load_rules_file` / `load_rules_xlsx` / `export_rules_xlsx` / `scope_of` / `build_rules` / `write_report` | `anyhow::Result` + `.context(…)` / `bail!` |
+| `picker.rs` 的 `read_dir_entries`（及其通道类型） | 同上 |
+| `printers.rs` 的 `list` | 同上 |
+| `services.rs` 的 `parse_pdf_pages` | 同上 |
+| `word_session.rs` 的 `preflight` | 同上 |
+| `state.rs` 的 `save` / `read_state` / `save_to` | 同上 |
+
+★ 两点别改回去：
+
+- **`{e:#}` 是对的** —— anyhow 的链式 Display（`"外层：内层：根因"`）。写成 `{e}` 只剩最外层；
+- **`com.rs` 的 `DispResult<T> = Result<T, String>` 保持不动**：那是 COM 晚期绑定的边界，
+  错误里混着 HRESULT 语义、20+ 个调用点，改它没有收益。
+
+#### 本版总判据
+
+- `cargo check --features gui`：**0 error**，自家代码**零警告**
+- 单元测试：`--lib` **92**、`--bin wrepl-gui` **105**（两套是彼此独立的测试集，都要跑）
+- 回归 `regress.sh`：通过 **78** / 失败 **0**，26/26 SHA256 与基线**完全相同**
+  （本版对改写逻辑一个字没动 —— 六件工具的输出也逐字节比过）
 
 ---
 

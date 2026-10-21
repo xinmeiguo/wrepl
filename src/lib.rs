@@ -26,6 +26,7 @@
 //! | [`probe`] | 侦察：从目录里扫出候选项目编号与客户名 |
 //! | [`par`] | 零依赖并行映射：按索引并行、结果按索引归位 |
 //! | [`cancel`] | 取消令牌：广播语义的原子布尔，只在文件边界生效 |
+//! | [`tools`] | 诊断工具的报告文本（inspect / diff / probe / verify …），CLI 与 GUI 共用 |
 //! | [`pipeline`] | 流水线：收集 → 改写 → 改名 → 验证 → 汇总，CLI 与 GUI 共用 |
 //! | [`cli`] | 命令行参数定义（GUI 不依赖它） |
 
@@ -40,4 +41,5 @@ pub mod pipeline;
 pub mod probe;
 pub mod report;
 pub mod rules;
+pub mod tools;
 pub mod verify;
