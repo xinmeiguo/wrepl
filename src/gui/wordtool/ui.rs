@@ -27,6 +27,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use eframe::egui::{self, RichText};
 
 use crate::ds;
+use wrepl::cancel::Cancel;
 use wrepl::hdr;
 
 use super::com::ComInit;
@@ -149,6 +150,17 @@ struct Task {
     rx: Receiver<WtMsg>,
     /// 进度（当前 / 总数）；`None` 表示已结束。
     progress: Option<(usize, usize)>,
+    /// 本趟活的取消令牌。点过取消之后**不立刻丢** —— 线程还在把当前这个文档
+    /// 做完，界面要能显示「正在取消…」而不是看起来没反应。
+    cancel: Cancel,
+    /// 已经点过取消、线程还没报完工。
+    cancelling: bool,
+    /// 这一档是否支持取消。
+    ///
+    /// 目前只有「打印」「导出 PDF」支持 —— 它们走 Word COM，一个文档要几秒，
+    /// 一批几百个就是十几分钟，中途想停是真实需求。页眉替换是纯 Rust 内存操作，
+    /// 26 个包不到 1 秒，还没到能点下去的时间就跑完了，暂不接。
+    cancellable: bool,
 }
 
 pub struct WordTool {
@@ -402,16 +414,23 @@ impl WordTool {
     /// 一次，那本身无害，但一旦失败（没装 Word、被管控套件拦了）就会在**真正开跑之前**
     /// 直接把整趟活判死 —— 而纯 Rust 根本不需要 COM。页眉替换改成纯 Rust 之后，
     /// 这里是最容易被漏掉的一根线头。
-    fn start<F>(&mut self, verb: &str, need_com: bool, f: F)
+    fn start<F>(&mut self, verb: &str, need_com: bool, cancellable: bool, f: F)
     where
-        F: FnOnce(&mut dyn FnMut(String), &mut dyn FnMut(usize, usize)) -> (i32, i32)
+        F: FnOnce(&mut dyn FnMut(String), &mut dyn FnMut(usize, usize), &Cancel) -> (i32, i32)
             + Send
             + 'static,
     {
         let (tx, rx) = mpsc::channel();
+        // 令牌在这里建、一份进 `Task`（给取消按钮用）、一份进线程。
+        // 放在 `start` 里而不是每个调用方各建一个：调用方漏建一次，
+        // 那一档就变成"按钮点了没反应"，而且只有那一档有问题。
+        let cancel = Cancel::new();
         self.task = Some(Task {
             rx,
             progress: Some((0, 0)),
+            cancel: cancel.clone(),
+            cancelling: false,
+            cancellable,
         });
         self.last_result = None;
         let verb_s = verb.to_string();
@@ -420,7 +439,7 @@ impl WordTool {
                 match ComInit::sta() {
                     Ok(c) => {
                         // 保活到活干完（Drop 时 CoUninitialize）
-                        let (ok, fail) = run_body(f, &tx);
+                        let (ok, fail) = run_body(f, &tx, &cancel);
                         drop(c);
                         let _ = tx.send(WtMsg::Done {
                             verb: verb_s,
@@ -440,7 +459,7 @@ impl WordTool {
                     }
                 }
             }
-            let (ok, fail) = run_body(f, &tx);
+            let (ok, fail) = run_body(f, &tx, &cancel);
             let _ = tx.send(WtMsg::Done {
                 verb: verb_s,
                 ok,
@@ -638,7 +657,9 @@ impl WordTool {
                     }
                 }
                 ui.add_space(ds::SPACING.s4);
-                self.status_rows(ui);
+                if self.status_rows(ui) {
+                    self.cancel_task();
+                }
             });
         });
 
@@ -689,7 +710,7 @@ impl WordTool {
         ));
         // ★ need_com = false：页眉替换不需要 Word，也不该因为
         //   `CoInitializeEx` 失败而整趟不做。
-        self.start(&verb, false, move |log, prog| {
+        self.start(&verb, false, false, move |log, prog, _cancel| {
             hdr::run(&docs, &action, out, log, prog)
         });
     }
@@ -986,7 +1007,9 @@ impl WordTool {
                     }
                 }
                 ui.add_space(ds::SPACING.s4);
-                self.status_rows(ui);
+                if self.status_rows(ui) {
+                    self.cancel_task();
+                }
             });
         });
 
@@ -1017,8 +1040,8 @@ impl WordTool {
                 None => "默认打印机".to_string(),
             }
         ));
-        self.start("打印", true, move |log, prog| {
-            services::print_run(&docs, &range, printer.as_deref(), log, prog)
+        self.start("打印", true, true, move |log, prog, cancel| {
+            services::print_run(&docs, &range, printer.as_deref(), log, prog, Some(cancel))
         });
     }
 
@@ -1096,8 +1119,17 @@ impl WordTool {
             pages,
             pdf_a,
         } = job;
-        self.start("导出 PDF", true, move |log, prog| {
-            services::export_pdf_run(&docs, out.as_deref(), pages, pdf_a, kind, log, prog)
+        self.start("导出 PDF", true, true, move |log, prog, cancel| {
+            services::export_pdf_run(
+                &docs,
+                out.as_deref(),
+                pages,
+                pdf_a,
+                kind,
+                log,
+                prog,
+                Some(cancel),
+            )
         });
     }
 
@@ -1132,8 +1164,11 @@ impl WordTool {
     // ==================== 共享：进度 / 结果 / 日志 ====================
 
     /// 进度条 + 结果摘要（两页共用）。
-    fn status_rows(&self, ui: &mut egui::Ui) {
+    /// 进度条 + 结果一句话。**返回是否点了「取消」** —— 这里拿不到 `&mut self`
+    /// （调用处正持着别的借用），所以只回报意图，由调用方去落。
+    fn status_rows(&self, ui: &mut egui::Ui) -> bool {
         let pal = ds::palette_of(ui.ctx());
+        let mut cancel_clicked = false;
         if let Some((cur, total)) = self.task.as_ref().and_then(|t| t.progress) {
             let frac = if total > 0 {
                 (cur as f32 / total as f32).clamp(0.0, 1.0)
@@ -1145,15 +1180,52 @@ impl WordTool {
             } else {
                 "正在启动 Word…".to_string()
             };
-            // `ProgressBar` 是 `Widget`（`ui.add`）；`.label(..)` 收 `&str`，
-            // 所以先把文案落成 owned 字符串再借进去。
-            ui.add(ds::ProgressBar::new(frac).label(&text).height(8.0));
+            let cancellable = self.task.as_ref().is_some_and(|t| t.cancellable);
+            let cancelling = self.task.as_ref().is_some_and(|t| t.cancelling);
+            ui.horizontal(|ui| {
+                // 按钮放前面：`ProgressBar` 会吃满剩余宽度，后放就点不着了。
+                if cancellable {
+                    let label = if cancelling { "正在取消…" } else { "取消" };
+                    if ui
+                        .add_enabled(!cancelling, egui::Button::new(label))
+                        .clicked()
+                    {
+                        cancel_clicked = true;
+                    }
+                    ui.add_space(4.0);
+                }
+                // `ProgressBar` 是 `Widget`（`ui.add`）；`.label(..)` 收 `&str`，
+                // 所以先把文案落成 owned 字符串再借进去。
+                ui.add(ds::ProgressBar::new(frac).label(&text).height(8.0));
+            });
         }
         if let Some((msg, ok)) = &self.last_result {
             ui.label(
                 RichText::new(msg)
                     .strong()
                     .color(if *ok { pal.success } else { pal.error }),
+            );
+        }
+        cancel_clicked
+    }
+
+    /// 点「取消」之后：发信号 + 把按钮切成「正在取消…」。
+    ///
+    /// **不立刻清 `task`**：线程还在把当前这个文档做完（可能是几秒的 Word 调用），
+    /// 立刻清掉进度条会让人以为已经停了、然后去关窗口。等线程报完工再收。
+    fn cancel_task(&mut self) {
+        let mut fired = false;
+        if let Some(t) = self.task.as_mut() {
+            if t.cancellable && !t.cancelling {
+                t.cancel.cancel();
+                t.cancelling = true;
+                fired = true;
+            }
+        }
+        if fired {
+            self.log(
+                "已请求取消：当前这个文档做完就停，后面的不再开始（已经导出的文件保留）"
+                    .to_string(),
             );
         }
     }
@@ -1219,9 +1291,9 @@ fn mode_cn(m: HeaderMode) -> &'static str {
 ///
 /// 抽出来是因为 [`WordTool::start`] 现在有两个入口（要 COM / 不要 COM），
 /// 而"接线"这一段两者一模一样。留两份只会让哪天改日志格式时漏掉一支。
-fn run_body<F>(f: F, tx: &mpsc::Sender<WtMsg>) -> (i32, i32)
+fn run_body<F>(f: F, tx: &mpsc::Sender<WtMsg>, cancel: &Cancel) -> (i32, i32)
 where
-    F: FnOnce(&mut dyn FnMut(String), &mut dyn FnMut(usize, usize)) -> (i32, i32),
+    F: FnOnce(&mut dyn FnMut(String), &mut dyn FnMut(usize, usize), &Cancel) -> (i32, i32),
 {
     f(
         &mut |s: String| {
@@ -1233,6 +1305,7 @@ where
                 total,
             });
         },
+        cancel,
     )
 }
 

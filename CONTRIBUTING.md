@@ -236,8 +236,8 @@ cd /d/test/wrepl
 cargo check --features gui --offline
 
 # ② 单元测试（★ 两个都要跑，这是两套不同的测试集）
-cargo test --features gui --offline --lib                 # 期望 83 passed / 0 failed
-cargo test --features gui --offline --bin wrepl-gui       # 期望 92 passed / 0 failed
+cargo test --features gui --offline --lib                 # 期望 89 passed / 0 failed
+cargo test --features gui --offline --bin wrepl-gui       # 期望 97 passed / 0 failed
 
 # ③ release 构建
 cargo build --release --features gui --offline
@@ -314,7 +314,7 @@ vX.Y.Z：一句话说清这版干了什么
 - 修复：…
 - 交互：…
 
-验证：cargo check/build 0 error 且自家代码零警告；cargo test --lib 83 / --bin 92 全绿；
+验证：cargo check/build 0 error 且自家代码零警告；cargo test --lib 89 / --bin 97 全绿；
 regress.sh 通过 78 / 失败 0，含 26/26 SHA256 与基线完全相同。
 ```
 
@@ -398,6 +398,7 @@ grep -rn "D:/test" src/ bench/ docs/ .github/ *.sh *.py *.md | grep -v "^target/
    |---|---|
    | `src/docx/` | 纯 Rust 改 OOXML 的内核（不依赖 Office） |
    | `src/hdr.rs` | 页眉替换的纯 Rust 引擎 |
+   | `src/cancel.rs` | 取消令牌（广播语义的原子布尔，只在文件边界生效） |
    | `src/gui/` | 界面（`app.rs` 外壳 / `ds.rs` 设计系统 / `picker.rs` 文件选择器 / `state.rs` 状态存档 / `wordtool/` COM 部分） |
    | `src/main.rs` · `src/gui/main.rs` | 两个入口（CLI / GUI） |
 

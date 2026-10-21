@@ -25,9 +25,11 @@
 //! | [`report`] | 归档级 Excel 报告（封面 + 汇总 + 明细 + 文件清单 + 规则快照） |
 //! | [`probe`] | 侦察：从目录里扫出候选项目编号与客户名 |
 //! | [`par`] | 零依赖并行映射：按索引并行、结果按索引归位 |
+//! | [`cancel`] | 取消令牌：广播语义的原子布尔，只在文件边界生效 |
 //! | [`pipeline`] | 流水线：收集 → 改写 → 改名 → 验证 → 汇总，CLI 与 GUI 共用 |
 //! | [`cli`] | 命令行参数定义（GUI 不依赖它） |
 
+pub mod cancel;
 pub mod cli;
 pub mod docx;
 pub mod engine;

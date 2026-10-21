@@ -147,9 +147,9 @@ egui 之所以用 `impl Into<f32>`（`epaint-0.34.3/src/stroke.rs:24`）是有�
 
 ### 2.2 更大项：暂缓
 
-| 项 | 为什么缓 |
+| 项 | 结论 |
 |---|---|
-| 界面加「预演」入口 | `app.rs:303` 明写"界面上没有预演入口"，是**刻意的设计**；pipeline 的 dry 路径已经存在。要加得先想清楚"点完之后用户看到什么"，不然又是一个要改的交互 |
+| ~~界面加「预演」入口~~ | **2026-10-21 核实：入口早就有** —— 批量替换页 `F5`，`verdict_text` 里也有专门的「预演完成：命中 N 处…未写入任何文件」。上面原来引的 `app.rs:303` 是 2026-10-19 的行号，早已漂移到别的字段上，导致这一条被当成"还没做"。<br>**追加决定（用户拍板）：预演顺手也导一份报告 —— 否决**，理由是"清单没人看，意义不大"。本项关闭。 |
 
 > 「批量导出 PDF」2026-10-19 已从这张表里移出（落地见 §1.4）——它当时缓的理由是
 > "打印页那套骨架得先稳"，而骨架在 0.4.x 已经稳了。
@@ -390,11 +390,14 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 > `CHANGELOG.md` 的「报告行构造下沉到 `report`」「界面状态持久化」两节。
 > 前者消掉三处重复并修掉界面报告里"被跳过文件 mtime 是空串"的偏差；
 > 后者把规则表 / 主题 / 导出设置落到 `%LOCALAPPDATA%\wrepl\state.json`。
+>
+> **「取消信号 + 关窗 join」于 2026-10-21 落地**（`src/cancel.rs` + 两处副本循环的
+> 文件边界检查 + 界面的「取消」按钮 + `on_exit` 有界 join），明细见
+> `CHANGELOG.md` 的「执行中取消 + 关窗收尾」一节。
 
 | 项 | 位置 | 收益 / 代价 |
 |---|---|---|
 | **GUI 错误类型统一成 `anyhow::Result`** | `app.rs` 6 处、`picker.rs:1842`、`printers.rs:56`、`services.rs:83` | GUI 侧整片 `Result<_, String>`，边界处一堆 `map_err(|e| format!("…{e:#}"))`。统一后只在 toast / 日志那一层转 String。**注意：`{e:#}` 本身是对的**（anyhow 链式 Display），别改成 `{e}` |
-| **取消信号 + 关窗 join** | `app.rs:186` `Job { rx, handle }` | 执行中按钮只能变「执行中…」；关窗时 `JoinHandle` drop 不 join，后台线程 + Word 进程变孤儿。加 `Arc<AtomicBool>`，worker 在**每个文件边界**检查；eframe `on_exit` 发信号 + join |
 | **CLI ↔ GUI 功能对齐** | `cli.rs:84-207`、`app.rs:1851` | `Inspect/Passthrough/Diff/Dump/Probe/Verify --batch` GUI 无入口；规则表的 `区分大小写 / 全字匹配 / 区分全半角 / 作用域` 只能 Excel 往返调；`--exclude` / `--threads` 在界面上被隐掉 |
 
 ### 7.2 结构 / 维护性（改动量大，收益是"以后好改"）
@@ -406,23 +409,29 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 | `App::render` 拆段 | `app.rs:1219-1481` | 262 行；topbar / sidebar / bottombar 各抽 `fn` |
 | `WordTool::ui_print` 拆段 | `ui.rs:682-952` | 270 行画四张卡 |
 | `WordTool` 字段私有化 | `ui.rs:155-208` | 20+ 字段全 `pub`；生产代码只用方法访问，直接读写只发生在 `selftest` |
-| `adjudicate` / `mark_overlap` 的 O(N²) | `engine.rs:380-389`、`naming.rs:111-124` | 真实 N 通常 1–3，长规则表才涨。按 `a` 排序 + 维护右端 max → O(N log N) |
 
 ### 7.3 边界场景 / 细节
 
 | 项 | 位置 | 说明 |
 |---|---|---|
-| Word「文档修复」模态框会卡死整批 | `word_session.rs` `batch_loop` | `DisplayAlerts=none` 挡不住损坏文档的修复对话框，且 Word 不可见 → 用户看不到，批次一直等。建议每个文档 60s 超时后强制 `Close` 跳过 |
+| ~~Word「文档修复」模态框会卡死整批~~ | `word_session.rs` `batch_loop` | **2026-10-21 已部分解决**：进 Word 前先用 `package::part_names` 自查（拦 zip 级损坏），加上「取消」按钮兜底。<br>**「60s 超时后强制 Close」这条不可行** —— Word 是单实例 COM 服务器，`create()` 多半 attach 到用户自己开着的 Word 上，杀进程等于连用户的文档一起杀。真要超时得走 `IMessageFilter`（`HandleInComingCall` 返 `RETRYREJECTED`），要 `Win32_System_Ole` feature，且本机无法稳定复现修复框来验证 —— 单列一条在 §7.4 |
 | 超大文件一次性读进内存 | `pipeline.rs` `process_one` | 不设上限；GUI 又没有 `--threads` 旋钮。建议「单文件超 50 MB 自动降到单线程」 |
 | `EnumPrintersW` 可能卡 UI 首帧 | `printers.rs:list`、`ui.rs:310` | 本机几毫秒，网络打印机 / 域控环境实测能到几百毫秒。建议放后台线程，下拉先空着 |
-| `F5` 实际跑的是 dry_run，但界面上没有「预演」按钮 | `app.rs:2229` | 名字 / 行为 / 按钮三处对不上。要么补按钮、要么写进帮助（与 §2.2 的「预演入口」是同一件事） |
 | 另两页没有快捷键、导航不能键盘切 | `app.rs:2209-2236`、`1289` | `Ctrl+Enter` 只在批量替换页生效；建议按 `self.page` 分发，另加 `Ctrl+1/2/3` 切页 |
 | 聚焦框可见性弱 | `ds::apply` | egui 默认在 Windows 上偏弱，Tab 导航看不出焦点 |
 | WPS 确认框里的「Tagged 标签」是术语 | `engine.rs:82` | 改「PDF 没有结构标签（屏幕阅读器读不了）」或直接删掉这半句 |
 | 建窗失败的提示术语密集 | `diag.rs:296-345` | 补一句「到 Intel / NVIDIA / AMD 官网按机型搜『显卡驱动』」比「整机厂官网的驱动包」具体 |
-| `windows` 的 `Win32_Graphics_Gdi` 可能是死 feature | `Cargo.toml:93-105` | 全代码 0 处直接调用，`pinners.rs` 只读 `pPrinterName` / `pPortName`，从不碰 `pDevMode`。试砍，能编过就省 1–3s 编译时间 |
+| ~~`windows` 的 `Win32_Graphics_Gdi` 可能是死 feature~~ | `Cargo.toml:107-113` | **2026-10-21 核实后不做**：代码里确实 0 处直接用 Gdi 符号，但 `PRINTER_INFO_2W` 的 `pDevMode` 字段**类型**是 `*mut DEVMODEW`，那个类型定义在 Gdi 模块 —— 关掉 feature 结构体就编不过。注释里写的理由成立。省 1–3 s 编译时间不值得为此做一次编译实验 |
 | 引擎热路径的小分配 | `engine.rs:67` `fold`、`:230` `matched`、`verify.rs:597` `deleted` | `fold()` 每次 `Vec<char>`；`matched` / `deleted` 用 owned String。长文档场景合计 5–15% 引擎时间 |
 | `hdr.rs` 的开标签解析 | `hdr.rs:1146` `find_sub`、`:1159` `each_attr` | 朴素 O(N·M) 子串查找 + 每次重扫整个开标签。多节文档省 5–20ms/文件 |
+
+### 7.4 已论证、**不建议动**的
+
+| 项 | 为什么不做 |
+|---|---|
+| 用 `IMessageFilter` 给 Word 调用加超时 | 这是"Word 弹修复框卡死整批"的**真正**解法（`HandleInComingCall` 返 `RETRYREJECTED`，让 COM 调用立即失败而不是干等）。三条不做的理由：① 要加 `Win32_System_Ole` feature 并手写 `IMessageFilter` 的 vtable；② 本机**无法稳定复现**那个修复框（依赖具体损坏形态与 Word 版本），改完验证不了；③ 现有兜底（进 Word 前 `preflight` 自查 + 取消按钮）已覆盖绝大多数场景 |
+| `write_at` 退避档位从 15→480 ms 收窄到 2→64 ms | 只影响延迟分布，不影响正确性；现在的值有实测依据，换了得重测一轮 |
+| 引擎热路径的 `fold` / `matched` 分配 | 标着"5–15% 引擎时间"，但**先要 profile 定位**是"同一段落被 20 条规则各折一次"还是"命中时建 String"。不动 profile 就改，很可能优化错了那一半 —— 而且真实语料单件才 40 ms，上限也就十几毫秒 |
 
 **没列进来的**：`residue` 重复解压、整文件 SHA256、启动读 `msyh.ttc`、wgpu DX12、
 `#51` egui_sauge SHA、五项 `ds::*` 品味遗留 —— 这些在 §2 / §4 / PERFORMANCE 里

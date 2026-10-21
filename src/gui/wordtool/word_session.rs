@@ -5,6 +5,7 @@ use super::com::{Disp, DispResult, var_bool, var_bstr, var_i4};
 use super::engine::WordKind;
 use super::wd;
 use windows::core::w;
+use wrepl::cancel::Cancel;
 
 pub struct WordSession {
     /// 原始 `Application` 句柄。
@@ -153,6 +154,7 @@ pub fn run_on_documents<F>(
     progress: &mut dyn FnMut(usize, usize),
     save_after: bool,
     done_verb: &str,
+    cancel: Option<&Cancel>,
 ) -> (i32, i32)
 where
     F: Fn(&Disp, &str) -> DispResult<Option<String>>,
@@ -172,6 +174,7 @@ where
         progress,
         save_after,
         done_verb,
+        cancel,
     );
     session.cleanup();
     r
@@ -200,6 +203,7 @@ pub fn run_on_documents_printing<F>(
     save_after: bool,
     done_verb: &str,
     printer: Option<&str>,
+    cancel: Option<&Cancel>,
 ) -> (i32, i32)
 where
     F: Fn(&Disp, &str) -> DispResult<Option<String>>,
@@ -243,6 +247,7 @@ where
         progress,
         save_after,
         done_verb,
+        cancel,
     );
 
     // 正常收尾：这里能打日志、能补端口，优先于 `Drop` 的裸名字兜底。
@@ -264,6 +269,7 @@ fn batch_loop<F>(
     progress: &mut dyn FnMut(usize, usize),
     save_after: bool,
     done_verb: &str,
+    cancel: Option<&Cancel>,
 ) -> (i32, i32)
 where
     F: Fn(&Disp, &str) -> DispResult<Option<String>>,
@@ -271,7 +277,26 @@ where
     let total = doc_paths.len();
     let (mut ok, mut fail) = (0i32, 0i32);
     for (idx, path) in doc_paths.iter().enumerate() {
+        // 取消只在**文档边界**生效：已经在 Word 里打开的那个一定跑完再关，
+        // 后面的不再开始。半路停会留下一个开着的文档和写了一半的 PDF ——
+        // 那种残局比"这个文件没处理"难收拾得多。
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            log(format!(
+                "已取消：剩余 {} 个文档未处理（本批已处理 {ok} 个 / 失败 {fail} 个）",
+                total - idx
+            ));
+            break;
+        }
         progress(idx + 1, total);
+        // ★ 进 Word 之前先自己验一遍这个包能不能解析。
+        //   Word 遇到损坏文档会弹「文档修复」模态框，而批处理里 Word 是不可见的
+        //   —— 那个框没人点得到，整批就卡在那儿等，用户只能杀进程。
+        //   zip 级损坏（截断、改名的 .doc、空文件）是这类弹框的主力，我们能拦就拦。
+        if let Err(why) = preflight(path) {
+            fail += 1;
+            log(format!("跳过（文档本身打不开）：{path}（{why}）"));
+            continue;
+        }
         unsafe {
             let opened: DispResult<Disp> = (|| {
                 let docs = super::com::res_disp(word.get("Documents")?)?;
@@ -316,4 +341,77 @@ where
         }
     }
     (ok, fail)
+}
+
+/// 进 Word 之前的自查：这个文件能不能当 docx 解析。
+///
+/// ## 为什么必须有这一步
+///
+/// Word 遇到损坏文档会弹**「文档修复」模态框**，而批处理里 Word 是不可见的
+/// （`Visible = false`）—— 那个框用户根本点不到，整批就停在 `Documents.Open`
+/// 里一直等，界面上显示的是"正在处理第 N 个"，实际已经死在那儿了。
+/// `DisplayAlerts = 0` **挡不住**这个框：它不属于普通提示框。
+///
+/// 而"这个文件能不能打开"我们**自己就能判断**，不必交给 Word 去撞。
+///
+/// ## 只做到 zip 这一层
+///
+/// **不做** XML 语义校验。理由是代价不对等：一次完整 XML 解析是 10 ms 级，
+/// 而打印/导出的单件耗时本来就是秒级（Word 打开一个文档就要 1–3 秒），
+/// 多花那 10 ms 省不下什么；而 zip 级损坏（截断、改名的 `.doc`、空文件、
+/// 网盘同步到一半）恰好是"Word 弹修复框"的主力。
+///
+/// 剩下的那部分（zip 完好但 XML 坏了）拦不住。真正的兜底是**取消按钮**：
+/// 用户看到卡住能自己停，而不是只能杀进程。
+fn preflight(path: &str) -> Result<(), String> {
+    let names = wrepl::docx::package::part_names(std::path::Path::new(path))
+        .map_err(|e| format!("{e:#}"))?;
+    if names.iter().any(|n| n == "[Content_Types].xml") {
+        Ok(())
+    } else {
+        Err("缺 [Content_Types].xml，不是有效的 docx".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preflight;
+    use std::path::PathBuf;
+
+    /// 建在测试二进制旁边（本机 `%TEMP%` 在 C 盘，对非系统进程不是稳定可写）。
+    fn scratch(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().expect("取当前测试可执行文件路径");
+        let dir = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(exe.as_path())
+            .join("wrepl-wordsession-tmp");
+        std::fs::create_dir_all(&dir).expect("建测试临时目录");
+        dir.join(name)
+    }
+
+    /// 非 zip 必须被拦在 Word 门外。
+    ///
+    /// 这条钉的是"别等 Word 去发现"：Word 发现的方式是弹一个**不可见**的
+    /// 修复模态框（批处理里 `Visible = false`），整批就停在 `Open` 里一直等，
+    /// 而 `DisplayAlerts = 0` 挡不住它。我们自己先看一眼，代价是几毫秒。
+    ///
+    /// 注意它**测不到**"zip 完好但 XML 坏了"那种 —— 那一类真拦不住，
+    /// 靠界面上的「取消」按钮兜底。别把这条当成万灵药。
+    #[test]
+    fn 预检拦住不是_zip_的文件() {
+        let p = scratch("broken.docx");
+        std::fs::write(&p, b"not a zip at all").expect("写测试文件");
+
+        let err = preflight(&p.display().to_string()).expect_err("非 zip 应当被拦下");
+        assert!(!err.is_empty(), "拦下时要给出能看懂的原因");
+    }
+
+    /// 文件根本不存在时也应当是"拦下 + 说明"，不能 panic。
+    #[test]
+    fn 预检拦住不存在的文件() {
+        let p = scratch("no-such-file.docx");
+        let _ = std::fs::remove_file(&p);
+        assert!(preflight(&p.display().to_string()).is_err());
+    }
 }

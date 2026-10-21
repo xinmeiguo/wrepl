@@ -54,7 +54,10 @@ use crate::ds;
 use eframe::egui::{self, Color32, RichText};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use wrepl::cancel::Cancel;
 use wrepl::pipeline::{self, Options, RunResult};
 use wrepl::rules::{self, Rule, Scope};
 // `naming` 原本只被「文件名改名预览」用 —— 那块 2026-10-11 下线后就没人引了，
@@ -203,6 +206,15 @@ struct Job {
     /// 收尾时再算就可能落到另一个目录去。
     report_path: PathBuf,
     log_path: PathBuf,
+    /// 取消令牌。底栏「取消」按钮和关窗都发这一个。
+    cancel: Cancel,
+    /// 工作线程是否已经退出。
+    ///
+    /// `on_exit` 用它做**有界**的 join：Rust 没有 `join_timeout`，而工作线程
+    /// 可能正卡在一个几十秒的 COM 调用里 —— 关窗口不能跟着它一起卡死，
+    /// 但也不能一声不响地把孤儿线程留在后台。所以"等 3 秒，等到就 join、
+    /// 等不到就记日志放手"。
+    finished: Arc<AtomicBool>,
 }
 
 /// 进度条要显示的（比例, 文案）。
@@ -214,6 +226,17 @@ struct Job {
 /// 抽成纯函数是为了能脱窗测：这四个分支的顺序**不能调换**
 /// （`done >= total` 若排在 `total == 0` 前面，空批次一进去就是"正在收尾…"）。
 fn progress_of(job: &Job) -> (f32, String) {
+    // 取消之后文案**优先**：这时候人最想知道的是"到底停没停"，
+    // 而不是"现在跑到第几个"。比例仍按实际进度算 —— 别让它跳回 0，
+    // 那看起来像"取消了又重新开始"。
+    if job.cancel.is_cancelled() {
+        let frac = if job.total > 0 {
+            (job.done as f32 / job.total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        return (frac, "正在取消… 当前文件做完就停".to_string());
+    }
     match &job.stage {
         Some((name, i, t)) if *t > 0 => (
             (*i as f32 / *t as f32).clamp(0.0, 1.0),
@@ -1136,9 +1159,13 @@ impl App {
         let tx = Mutex::new(tx);
         let ctx2 = ctx.clone();
         let (paths2, rules2, opts2) = (paths.clone(), rule_list.clone(), opts.clone());
+        // 令牌与"线程已退出"标志：一份留在界面（`Job`），一份进线程。
+        let cancel = Cancel::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let (cancel2, finished2) = (cancel.clone(), Arc::clone(&finished));
 
         let handle = std::thread::spawn(move || {
-            let out = pipeline::run(&paths2, &rules2, &opts2, &|i, t, o| {
+            let out = pipeline::run_with_cancel(&paths2, &rules2, &opts2, &|i, t, o| {
                 let mark = match o.status {
                     "OK" | "DRY_RUN" => "·",
                     "CONFLICT" => "!",
@@ -1176,7 +1203,7 @@ impl App {
                 let _ = g.send(Msg::Stage(stage.to_string(), i, t));
                 drop(g);
                 ctx2.request_repaint();
-            });
+            }, &cancel2);
 
             let msg = match out {
                 Ok(res) => Msg::Done(Box::new(res)),
@@ -1185,6 +1212,9 @@ impl App {
             let g = tx.lock().unwrap_or_else(|e| e.into_inner());
             let _ = g.send(msg);
             drop(g);
+            // ★ 先立"已退出"，再叫醒界面：`on_exit` 看见它就会 join，
+            //   顺序反过来的话存在一个"标志还没翻、线程已经在退出"的窗口。
+            finished2.store(true, Ordering::Release);
             ctx2.request_repaint();
         });
 
@@ -1201,7 +1231,67 @@ impl App {
             dry,
             report_path,
             log_path,
+            cancel,
+            finished,
         });
+    }
+
+    /// 点「取消」：只发信号，**不清 `job`**。
+    ///
+    /// 线程还在把当前这个文件做完（可能是几百毫秒到几秒），立刻清掉进度条会让人
+    /// 以为已经停了，然后心安理得地去关窗口 —— 而那时线程还在写盘。
+    fn cancel_job(&mut self) {
+        let mut fired = false;
+        if let Some(j) = &self.job {
+            if !j.cancel.is_cancelled() {
+                j.cancel.cancel();
+                fired = true;
+            }
+        }
+        if fired {
+            self.push_log(
+                "已请求取消：当前这个文件做完就停，后面的不再处理（已写出的产物保留）"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// 关窗时把后台线程收干净：先发取消，再**有界地**等它退出。
+    ///
+    /// ## 为什么必须"有界"
+    ///
+    /// Rust 没有 `join_timeout`，而工作线程可能正卡在一个几十秒的调用里
+    /// （读一个 8 MB 的包、或者等一次写盘退避）。无限 join 会让**窗口关不掉** ——
+    /// 那比留一个后台线程更糟：用户会以为程序死了，从任务管理器强杀，
+    /// 反而更容易把正在写的产物变成半个坏文件。
+    ///
+    /// 所以规则是：等 3 秒 —— 等到就 join（线程干净退出）；等不到就记日志放手
+    /// （线程做完当前这个文件后自己结束，产物不会因此损坏）。
+    ///
+    /// 这同时堵住了一个老问题：`JoinHandle` 直接 drop 不 join，后台线程
+    /// 在进程退出时被硬杀，运行日志最后几行就是这么丢的。
+    fn cancel_and_join(&mut self) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        job.cancel.cancel();
+        let Some(handle) = job.handle else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !job.finished.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                crate::diag::log(
+                    "关窗：后台线程 3 秒内未退出，已放弃等待；\
+                     它会在做完当前这个文件后自行结束"
+                        .to_string(),
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = handle.join();
+        crate::diag::log("关窗：后台线程已正常结束".to_string());
     }
 
     /// 收一次后台进度。每帧调一次；没消息就立刻返回，不阻塞界面。
@@ -1558,6 +1648,25 @@ impl App {
                     .clicked()
                 {
                     self.start_run(false, &ctx);
+                }
+                // 执行中给一条取消出路：几百个文件跑起来是分钟级，
+                // 跑到一半发现规则写错了却只能杀进程，是最糟的体验。
+                if running {
+                    let cancelling = self
+                        .job
+                        .as_ref()
+                        .is_some_and(|j| j.cancel.is_cancelled());
+                    let cl = if cancelling { "正在取消…" } else { "取消" };
+                    ui.add_space(ds::SPACING.s5);
+                    let resp = ui.add(ds::Button::secondary(cl).disabled(cancelling));
+                    if resp
+                        .on_hover_text(
+                            "当前这个文件做完就停，后面的不再处理\n已写出的产物与报告保留，不会回滚",
+                        )
+                        .clicked()
+                    {
+                        self.cancel_job();
+                    }
                 }
                 ui.add_space(ds::SPACING.s5);
                 let open_lbl = if self.out_to_subdir {
@@ -2885,6 +2994,7 @@ impl eframe::App for App {
     /// 进程被外部干掉时它不会跑 —— 那种情况下的兜底就是上面那条 2 秒钟。
     /// 两件不同的事：这里保"最后一下"，节流保"被杀之前的绝大多数"。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.cancel_and_join();
         self.flush_state();
     }
 }
@@ -3021,6 +3131,19 @@ fn doc_start(docs: &[String]) -> PathBuf {
 }
 
 pub fn verdict_text(res: &RunResult, dry: bool) -> String {
+    // 取消**优先于其它一切**：这时 `failed()` 之类的数字只覆盖"取消之前"那一段，
+    // 拿它下结论（"不合格：3 个文件处理失败"）会让人以为剩下两百个也跑过了。
+    if res.cancelled {
+        let done = res
+            .outcomes
+            .iter()
+            .filter(|o| o.status != "CANCEL")
+            .count();
+        return format!(
+            "已取消：完成 {done} / {} 个文件，其余未处理（已写出的产物保留）",
+            res.outcomes.len()
+        );
+    }
     if res.failed() > 0 {
         format!("不合格：{} 个文件处理失败，见日志", res.failed())
     } else if res.verify_bad() > 0 {
@@ -4426,6 +4549,26 @@ mod tests {
         );
     }
 
+    /// 取消**压过其它所有结论**，包括"有文件失败"和"预演"。
+    ///
+    /// 理由：取消时 `failed()` / `total_conflicts()` 都只覆盖"取消之前"那一段，
+    /// 拿它们下结论（"不合格：3 个文件处理失败"）会让人以为剩下两百个也跑过了、
+    /// 只是失败了 3 个 —— 而事实是那两百个压根没动。
+    #[test]
+    fn 结论文案_取消压过失败数() {
+        let mut res = RunResult::default();
+        res.cancelled = true;
+
+        let t = verdict_text(&res, false);
+        assert!(t.starts_with("已取消"), "取消要有自己的说法：{t}");
+        assert!(t.contains("未处理"), "要说清剩下的没动：{t}");
+        assert!(t.contains("保留"), "要说清已写出的产物没回滚：{t}");
+
+        // 预演 + 取消：仍然是取消优先，别退回"预演完成"
+        let t = verdict_text(&res, true);
+        assert!(t.starts_with("已取消"), "取消优先于预演：{t}");
+    }
+
     // ── 无窗口帧循环（冒烟） ───────────────────────────────────────
 
     /// 一个**装好设计系统**的 `Context`。
@@ -4641,7 +4784,77 @@ mod tests {
             dry: false,
             report_path: PathBuf::new(),
             log_path: PathBuf::new(),
+            cancel: Cancel::new(),
+            finished: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 取消之后文案立刻切到「正在取消」，但**比例不跳回 0**。
+    ///
+    /// 比例若跳回 0，看起来像"取消了又重新开始"，人就会以为取消没生效、再点一次。
+    /// 真实行为是：不再推进、停在原位，等当前这个文件做完。
+    #[test]
+    fn 取消后文案切换但比例不回退() {
+        let job = 假任务(180, 120, None);
+        assert!(
+            progress_of(&job).1.contains("改写中"),
+            "未取消时应显示正常进度"
+        );
+
+        job.cancel.cancel();
+        let (f, t) = progress_of(&job);
+        assert!(t.contains("正在取消"), "实际「{t}」");
+        assert!(
+            (f - 120.0 / 180.0).abs() < 1e-6,
+            "比例不该跳回 0，实际 {f}"
+        );
+    }
+
+    /// 取消的**整条链路**：起跑 → 发取消 → 界面收尾。
+    ///
+    /// 只测 `pipeline` 那一层是不够的 —— 这里有一条接线：令牌建在 `start_run` 里、
+    /// 克隆一份进线程、界面那份留给按钮和关窗用。**两层各自都对、中间的线没接上**
+    /// 是这类功能最常见的坏法（按钮点了没反应，日志里一片安静）。
+    #[test]
+    fn 取消之后界面能正常收尾() {
+        let dir = 临时目录("cancel-run");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).expect("建输出目录");
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("{i}.docx")), b"not a zip").expect("写测试文件");
+        }
+
+        let mut app = App::new();
+        app.input = dir.display().to_string();
+        app.out_to_subdir = true;
+        app.output = out.display().to_string();
+        app.rows = vec![Row::new("a", "b", "正文")];
+        // 关掉改名：这一条验的是"能不能停下来"，不是改名逻辑
+        app.rename_files = false;
+
+        let ctx = egui::Context::default();
+        app.start_run(false, &ctx);
+        app.job
+            .as_ref()
+            .expect("start_run 之后应当有 job")
+            .cancel
+            .cancel();
+
+        // 手动泵到收尾（`run_blocking` 是 `--selftest` 专用，它不收取消）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.job.is_some() {
+            app.pump_job();
+            if app.job.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "取消之后 20 秒还没收尾"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let (msg, _ok) = app.toast.clone().expect("收尾后应当给出结论");
+        assert!(msg.contains("已取消"), "结论应是取消而不是合格/不合格：{msg}");
     }
 
     /// 四个分支各归各位：收集 / 改写中 / 阶段 4-5 / 收尾。

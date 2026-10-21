@@ -9,6 +9,7 @@ use super::wd;
 use super::word_session::{run_on_documents, run_on_documents_printing};
 use std::path::{Path, PathBuf};
 use windows::Win32::System::Variant::VARIANT;
+use wrepl::cancel::Cancel;
 
 // ==================== 批量打印 ====================
 
@@ -22,6 +23,7 @@ pub fn print_run(
     printer: Option<&str>,
     log: &mut dyn FnMut(String),
     progress: &mut dyn FnMut(usize, usize),
+    cancel: Option<&Cancel>,
 ) -> (i32, i32) {
     let pages = page_range.trim().to_string();
     run_on_documents_printing(
@@ -47,6 +49,7 @@ pub fn print_run(
         false, // 打印不改动文档，无需保存
         "已发送打印",
         printer,
+        cancel,
     )
 }
 
@@ -186,6 +189,7 @@ pub fn export_pdf_run(
     kind: WordKind,
     log: &mut dyn FnMut(String),
     progress: &mut dyn FnMut(usize, usize),
+    cancel: Option<&Cancel>,
 ) -> (i32, i32) {
     // 显式给了目录：**动手前**建一次，建不出来就放弃整批。
     // 不这么做的话，一个建不出来的目录会顺着每份文档各记一条 ERROR，
@@ -212,6 +216,7 @@ pub fn export_pdf_run(
         progress,
         false, // 导出不改动文档，无需保存
         "已导出",
+        cancel,
     )
 }
 

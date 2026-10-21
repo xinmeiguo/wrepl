@@ -484,6 +484,7 @@ fn main() {
                 kind,
                 &mut log,
                 &mut prog,
+                None, // 探针没有界面，也就不需要取消
             );
             println!("== 结果：成功 {ok} / 失败 {fail}");
             drop(init);

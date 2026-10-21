@@ -13,6 +13,7 @@
 //! 原因写进 `note`，其余文件照跑。这样一份交付包里有个坏文件时，
 //! 仍然能拿到其余 25 个的产物和一份完整的报告。
 
+use crate::cancel::Cancel;
 use crate::docx::package;
 use crate::engine::{self, Hit};
 use crate::naming;
@@ -118,6 +119,19 @@ impl Outcome {
             written: false,
         }
     }
+
+    /// 因整批被取消而**没有开始处理**的文件。
+    ///
+    /// 只改 `status` 与 `note`，尺寸 / mtime / 规则条数仍走
+    /// [`Outcome::errored`] 那套现读磁盘的逻辑 —— 报告里这一行的"事实"部分
+    /// 照样是真的，只有结论是"没动"。
+    fn cancelled(src: &Path, rules: &[Rule]) -> Self {
+        Self {
+            status: "CANCEL",
+            note: "已取消，未处理".to_string(),
+            ..Self::errored(src, rules, String::new())
+        }
+    }
 }
 
 /// 一次运行的参数。前端把用户的选择映射成这个结构，别再自己拼逻辑。
@@ -184,6 +198,12 @@ pub struct RunResult {
     /// 本次实际使用的并行线程数（1 = 串行）。前端把它报出来，
     /// 免得"到底有没有并行"只能靠猜。
     pub threads: usize,
+    /// 本批是否**被取消**（而不是正常跑完）。
+    ///
+    /// 取消时 [`RunResult::outcomes`] 里既有正常处理完的文件，也有状态为
+    /// `"CANCEL"` 的"没开始"的文件 —— 两者加起来才是原计划的全部。
+    /// 各 `total_*()` 只统计已处理的，所以读这些数字时得配合本项才不会误读。
+    pub cancelled: bool,
 }
 
 impl RunResult {
@@ -240,6 +260,28 @@ pub fn run(
     on_file: &(dyn Fn(usize, usize, &Outcome) + Sync),
     on_stage: &(dyn Fn(&str, usize, usize) + Sync),
 ) -> Result<RunResult> {
+    run_with_cancel(paths, rules, opts, on_file, on_stage, &Cancel::new())
+}
+
+/// 同 [`run`]，外加一个取消令牌。
+///
+/// ## 取消的语义（三条，别自行加码）
+///
+/// 1. **只在文件边界生效**：已经开始的那个文件一定做完，后面的不再开始。
+///    半途中止会留下写了一半的 zip —— 那比"这个文件没处理"难解释得多。
+/// 2. **被取消的文件留在结果里**，状态记 `"CANCEL"`、备注「已取消，未处理」。
+///    不静默丢掉：报告要能证明"这 N 个这次确实没动过"，而不是让人对着少一截的
+///    文件清单猜是不是漏了文件。`failed()` 不把 `"CANCEL"` 算作失败。
+/// 3. **取消后不再改名、不再验证**：那两段属于"执行的一部分"，执行没做完就没有
+///    可验证的产物，硬跑只会对半成品出结论。
+pub fn run_with_cancel(
+    paths: &[PathBuf],
+    rules: &[Rule],
+    opts: &Options,
+    on_file: &(dyn Fn(usize, usize, &Outcome) + Sync),
+    on_stage: &(dyn Fn(&str, usize, usize) + Sync),
+    cancel: &Cancel,
+) -> Result<RunResult> {
     if !opts.in_place && opts.out_dir.is_none() && !opts.dry_run {
         bail!("必须二选一：就地替换（in_place）或输出目录（out_dir）；只有预演可以不选");
     }
@@ -270,6 +312,7 @@ pub fn run(
         name_rows: Vec::new(),
         verify_rows: Vec::new(),
         threads: threads_used,
+        cancelled: false,
     };
 
     // ── 阶段 2：串行预分配输出路径 ──
@@ -295,6 +338,11 @@ pub fn run(
     let total = files.len();
     let done = AtomicUsize::new(0);
     res.outcomes = parallel_map(&files, threads_used, |i, (src, _rel)| {
+        // 取消检查放在**领到号之后、动手之前**：已经在跑的那个文件不受影响
+        // （做完才算完，不留半成品），还没轮到的连文件都不打开。
+        if cancel.is_cancelled() {
+            return Outcome::cancelled(src, rules);
+        }
         let o = match process_one(
             src,
             dsts[i].as_deref(),
@@ -316,7 +364,9 @@ pub fn run(
         o
     });
 
-    if opts.rename_files && !opts.dry_run {
+    // 取消之后不再改名、不再验证：这两段属于"执行的一部分"，执行没做完就没有
+    // 可验证的产物，硬跑只会对半成品出结论。
+    if opts.rename_files && !opts.dry_run && !cancel.is_cancelled() {
         rename_outputs(
             &mut res.outcomes,
             rules,
@@ -326,9 +376,10 @@ pub fn run(
             on_stage,
         );
     }
-    if opts.verify_after && !opts.dry_run {
+    if opts.verify_after && !opts.dry_run && !cancel.is_cancelled() {
         res.verify_rows = verify_outputs(&res.outcomes, rules, threads_used, on_stage);
     }
+    res.cancelled = cancel.is_cancelled();
     Ok(res)
 }
 
@@ -1288,5 +1339,107 @@ mod tests {
         let r = extension_gate(&PathBuf::from("a.doc"), false).unwrap();
         assert!(r.contains("老格式"));
         assert!(extension_gate(&PathBuf::from("a.docx"), false).is_none());
+    }
+
+    // ═══════════════════ 取消 ═══════════════════
+
+    /// 测试用临时目录：建在测试二进制旁边而不是 `%TEMP%`
+    /// （本机 `%TEMP%` 在 C 盘，对非系统进程不是稳定可写）。
+    fn scratch_dir(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().expect("取当前测试可执行文件路径");
+        let dir = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(exe.as_path())
+            .join("wrepl-pipeline-tmp-wrepl-cancel")
+            .join(name);
+        std::fs::create_dir_all(&dir).expect("建测试临时目录");
+        dir
+    }
+
+    /// 取消之后**不再开始新文件**，但已经开始的那个一定做完。
+    ///
+    /// 用 `threads: 1` 把并发钉成 1 —— 并行下"第一个"是哪个不确定，
+    /// 断言会变成掷骰子。串行路径同时也是并行路径的等价对照（见 `par` 模块）。
+    ///
+    /// 关键断言是**两类文件都在结果里**：真处理过的（这里是 ERROR，
+    /// 因为测试文件不是合法 zip）+ 状态 `CANCEL` 的"没开始"。
+    /// 如果 CANCEL 行被静默丢掉，报告就会少一截，归档时看不出"这批没跑完"。
+    #[test]
+    fn 取消之后不再开始新文件() {
+        let dir = scratch_dir("four");
+        // 目录里可能残留上一轮的文件，先清成确定状态
+        for e in std::fs::read_dir(&dir).expect("读测试目录") {
+            let p = e.expect("目录项").path();
+            if p.is_file() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("{i}.docx")), b"not a zip at all").expect("写测试文件");
+        }
+
+        let opts = Options {
+            threads: 1,
+            dry_run: true,
+            ..Default::default()
+        };
+        let cancel = Cancel::new();
+        let c2 = cancel.clone();
+        let res = run_with_cancel(
+            &[dir.clone()],
+            &[Rule::new(1, "a", "b")],
+            &opts,
+            &|done, _total, _o| {
+                // 第 1 个文件处理完就发取消：后面 3 个应当一眼都不看
+                if done == 1 {
+                    c2.cancel();
+                }
+            },
+            &|_, _, _| {},
+            &cancel,
+        )
+        .expect("整批应当正常返回（取消不是错误）");
+
+        assert!(res.cancelled, "结果里要能看出这批是被取消的");
+        assert_eq!(res.outcomes.len(), 4, "被取消的文件也要留在结果里");
+        let cancelled = res
+            .outcomes
+            .iter()
+            .filter(|o| o.status == "CANCEL")
+            .count();
+        assert_eq!(cancelled, 3, "只处理第一个，其余三个记 CANCEL");
+        assert_eq!(
+            res.outcomes[0].status, "ERROR",
+            "第一个文件确实被处理过（内容不是合法 zip，所以是 ERROR 而不是 CANCEL）"
+        );
+        assert!(
+            res.outcomes.iter().skip(1).all(|o| o.note.contains("已取消")),
+            "CANCEL 行要写清为什么没处理"
+        );
+    }
+
+    /// 没发取消时，行为与 [`run`] 完全一致（令牌默认"永不取消"）。
+    #[test]
+    fn 不取消时一切照旧() {
+        let dir = scratch_dir("plain");
+        std::fs::write(dir.join("a.docx"), b"not a zip").expect("写测试文件");
+        let opts = Options {
+            threads: 1,
+            dry_run: true,
+            ..Default::default()
+        };
+        let res = run_with_cancel(
+            &[dir],
+            &[Rule::new(1, "a", "b")],
+            &opts,
+            &|_, _, _| {},
+            &|_, _, _| {},
+            &Cancel::new(),
+        )
+        .expect("跑通");
+        assert!(!res.cancelled);
+        assert_eq!(res.outcomes.len(), 1);
+        assert!(res.outcomes.iter().all(|o| o.status != "CANCEL"));
     }
 }
