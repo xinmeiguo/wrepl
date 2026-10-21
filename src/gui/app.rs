@@ -455,7 +455,7 @@ pub struct App {
 /// ★ 导航上的标签 2026-10-11 由「正文替换」改成「批量替换」（用户要求）。
 ///   `Page::Replace` 这个**内部名字没动** —— 它对应的是"在正文里做替换"这份能力，
 ///   改它要连带动 CLI、报告与一堆注释，收益为零。标签只是给人看的。
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Page {
     /// 正文批量替换（原有）。界面标签叫「批量替换」。
     Replace,
@@ -2716,11 +2716,27 @@ impl App {
         // 有任务在跑就不接 —— 与底栏「执行替换」按钮的置灰条件一致。
         let running = self.job.is_some();
         let has_input = !self.input.trim().is_empty();
-        let (ctrl, f5, ctrl_enter) = ctx.input(|i| {
+        let (ctrl, f5, ctrl_enter, digits) = ctx.input(|i| {
             let m = i.modifiers;
             let c = m.ctrl || m.command;
-            (c, i.key_pressed(egui::Key::F5), c && i.key_pressed(egui::Key::Enter))
+            let digits = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+            ]
+            .map(|k| c && i.key_pressed(k));
+            (c, i.key_pressed(egui::Key::F5), c && i.key_pressed(egui::Key::Enter), digits)
         });
+
+        // `Ctrl+1..4` 切页 —— 顺序与左侧导航一致（见 `Page` 的四个变体）。
+        // 数字键是**一维**的（不像 `Ctrl+O` 那样按页分发），所以放在最前面。
+        for (i, hit) in digits.iter().enumerate() {
+            if *hit {
+                self.page = [Page::Replace, Page::Header, Page::Print, Page::Tools][i];
+                return;
+            }
+        }
 
         if ctrl && ctx.input(|i| i.key_pressed(egui::Key::O)) {
             // 「选目录」的落点跟着当前页走：批量替换页选的是**输入目录**，
@@ -2734,20 +2750,37 @@ impl App {
             }
             return;
         }
-        // 诊断工具页只认 `Ctrl+Enter`（= 点「运行」）。`F5` 是"预演一整批替换"，
-        // 在这一页没有对应动作 —— 接了只会让人以为按错了没反应。
-        if self.page == Page::Tools {
-            if ctrl_enter {
-                self.tools.start_now();
+        // 主按钮：每页一个，判据（能不能跑）由各页自己把关 ——
+        // 这里只做分发，不重复一遍"有没有选文档、内容填没填"。
+        //
+        // `F5` 只归「批量替换」：它是"预演一整批替换"，另三页没有对应动作。
+        // ★ 以前这里没按页分流，站在页眉替换页按 F5 会去跑**批量替换**的预演
+        //   （用的是另一页的输入目录），看起来像"按错页了却真动了"。
+        match self.page {
+            Page::Replace => {
+                if f5 && !running && has_input {
+                    self.start_run(true, ctx);
+                    return;
+                }
+                if ctrl_enter && !running && has_input {
+                    self.start_run(false, ctx);
+                }
             }
-            return;
-        }
-        if f5 && !running && has_input {
-            self.start_run(true, ctx);
-            return;
-        }
-        if ctrl_enter && !running && has_input {
-            self.start_run(false, ctx);
+            Page::Header => {
+                if ctrl_enter {
+                    self.wt.run_header_now();
+                }
+            }
+            Page::Print => {
+                if ctrl_enter {
+                    self.wt.run_print_now();
+                }
+            }
+            Page::Tools => {
+                if ctrl_enter {
+                    self.tools.start_now();
+                }
+            }
         }
     }
 
@@ -4996,6 +5029,38 @@ mod tests {
             matches!(app.picker_for, Some(PickFor::PrintDocs)),
             "打印与导出页同理"
         );
+    }
+
+    /// `Ctrl+1..4` 切页，顺序与左侧导航一致。
+    ///
+    /// 顺带钉住一件容易漂的事：`Page` 是**枚举**，数字键是**数组下标** ——
+    /// 将来在枚举中间插一个变体，这里不跟着改就会"按 2 去了打印页"。
+    #[test]
+    fn 快捷键_ctrl_数字键切页() {
+        let 按下 = |app: &mut App, key: egui::Key| {
+            let ctx = 装了设计系统的_ctx();
+            let mut input = egui::RawInput::default();
+            input.modifiers = egui::Modifiers::CTRL;
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            });
+            let _ = ctx.run_ui(input, |ui| app.render(ui));
+        };
+
+        let mut app = App::new();
+        for (key, want) in [
+            (egui::Key::Num2, Page::Header),
+            (egui::Key::Num3, Page::Print),
+            (egui::Key::Num4, Page::Tools),
+            (egui::Key::Num1, Page::Replace),
+        ] {
+            按下(&mut app, key);
+            assert_eq!(app.page, want, "按 {key:?} 该切到 {want:?}");
+        }
     }
 
     // ═══════════════════ 状态持久化 ═══════════════════

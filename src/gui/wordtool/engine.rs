@@ -78,8 +78,13 @@ impl EngineProbe {
 /// 确认框正文。**只留能让人做判断的那一条**：分页差异 + 实测数字。
 /// 展开写"表格换行也可能动""PDF/A 未验证"只会把重点冲淡 —— 详细对照在
 /// `CHANGELOG.md`，界面不重复。
+///
+/// 2026-10-21：`PDF 无 Tagged 标签` 改成人话。原文用的是 PDF 规范里的词
+/// （Tagged PDF = 带结构标签的 PDF），可这句要传达的是**后果** ——
+/// 屏幕阅读器读不出、复制粘贴和朗读会乱。术语可以写在文档里，不该写在
+/// 一个"点继续还是取消"的确认框上。
 pub const WPS_CONFIRM_BODY: &str =
-    "WPS 与 Word 排版不同：每份少 1 页（页脚 of 23→of 22），PDF 无 Tagged 标签。";
+    "WPS 与 Word 排版不同：每份少 1 页（页脚 of 23→of 22），PDF 没有结构标签（屏幕阅读器读不出）。";
 
 /// 「打印」这一档在只有 WPS 时的拒绝理由。
 pub const PRINT_NEEDS_WORD: &str = "打印需要 Microsoft Word。可改用「导出 PDF」（会先确认）。";
@@ -258,7 +263,10 @@ mod tests {
         assert!(WPS_CONFIRM_BODY.contains("少 1 页"), "{WPS_CONFIRM_BODY}");
         assert!(WPS_CONFIRM_BODY.contains("of 22"), "{WPS_CONFIRM_BODY}");
         assert!(WPS_CONFIRM_BODY.contains("WPS"), "{WPS_CONFIRM_BODY}");
-        assert!(WPS_CONFIRM_BODY.contains("Tagged"), "{WPS_CONFIRM_BODY}");
+        // 说后果，别说规范术语（2026-10-21 改）：确认框是拿来"点继续还是取消"的，
+        // 「Tagged 标签」只有做 PDF 的人看得懂。
+        assert!(WPS_CONFIRM_BODY.contains("结构标签"), "{WPS_CONFIRM_BODY}");
+        assert!(!WPS_CONFIRM_BODY.contains("Tagged"), "{WPS_CONFIRM_BODY}");
     }
 
     /// 界面提示一律要短。**用字符数钉住**：这类文案没人管就会长成说明书

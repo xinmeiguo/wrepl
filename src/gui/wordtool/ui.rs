@@ -206,6 +206,12 @@ pub struct WordTool {
     /// 枚举打印机失败的原因（显示在页面上，而不是让下拉框空着让人猜）。
     pub printers_err: Option<String>,
     printers_loaded: bool,
+    /// 后台枚举打印机的那条通道（`Some` = 正在读）。
+    ///
+    /// 为什么要后台：`EnumPrintersW` 在本机几毫秒，但**域内网络打印机实测能到
+    /// 几百毫秒**（2026-10-21 记于 ROADMAP §7.3）。放在首帧上就是"点了打印页，
+    /// 窗口先卡一下"。改成后台之后，首帧照常画，下拉先空着、下面写一行「正在读取…」。
+    printer_rx: Option<Receiver<anyhow::Result<Vec<Printer>>>>,
     /// 想选的那台打印机**名字**（来自存档），等枚举完再认。
     ///
     /// 为什么不直接存下标：打印机在**进打印页时才枚举**（见 [`Self::reload_printers`]），
@@ -258,6 +264,7 @@ impl WordTool {
             printer_pick: 0,
             printers_err: None,
             printers_loaded: false,
+            printer_rx: None,
             printer_wanted: None,
             engine: None,
             wps_confirm: false,
@@ -324,13 +331,67 @@ impl WordTool {
         }
     }
 
-    /// 重扫打印机。
+    /// 重扫打印机（**同步**）。
     ///
-    /// 同步调（`EnumPrintersW` 在装机上一般几毫秒）。**不进绘制路径的常驻部分** ——
-    /// 只在进入打印页时做一次、以及用户点「重新扫描」时做一次，
-    /// 所以这点耗时不会变成"每帧都卡一下"。
+    /// 只在两处用：无头自检（要求确定性）与单元测试。界面上走
+    /// [`Self::reload_printers_async`]，原因见 `printer_rx` 的注释。
     pub fn reload_printers(&mut self) {
-        match printers::list() {
+        let r = printers::list();
+        self.apply_printers(r);
+    }
+
+    /// 正在后台读打印机列表。
+    pub fn printers_loading(&self) -> bool {
+        self.printer_rx.is_some()
+    }
+
+    /// 后台重扫打印机。已经在读就不叠第二个线程（用户连点「重新扫描」时会发生）。
+    fn reload_printers_async(&mut self, ctx: &egui::Context) {
+        self.start_printer_load(ctx, printers::list);
+    }
+
+    /// 起一条后台线程读打印机列表。抽成泛型只为一件事：**单元测试能塞假数据**，
+    /// 不必在测试机上真的枚举一遍打印机（域内那一下可能要几百毫秒）。
+    fn start_printer_load<F>(&mut self, ctx: &egui::Context, f: F)
+    where
+        F: FnOnce() -> anyhow::Result<Vec<Printer>> + Send + 'static,
+    {
+        if self.printer_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = f();
+            let _ = tx.send(r);
+            // 结果落地时用户可能一动不动 —— 不主动要一帧，界面不会自己重画，
+            // 下拉就永远停在「正在读取…」。
+            ctx.request_repaint();
+        });
+        self.printer_rx = Some(rx);
+    }
+
+    /// 收后台枚举的结果。`App::poll` 每帧调（**不管当前在哪一页**：
+    /// 结果到了就该落地，不该等用户切回来才认）。
+    fn poll_printers(&mut self) {
+        let Some(rx) = &self.printer_rx else { return };
+        match rx.try_recv() {
+            Ok(r) => {
+                self.printer_rx = None;
+                self.apply_printers(r);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.printer_rx = None;
+                self.apply_printers(Err(anyhow::anyhow!("后台枚举线程意外结束（没有回传结果）")));
+            }
+        }
+    }
+
+    /// 把一次枚举的结果落到界面状态上。**同步与后台两条路共用这一处** ——
+    /// 各写一份的话，"重扫后按名字保住选择"这类细节迟早有一边漏掉。
+    fn apply_printers(&mut self, r: anyhow::Result<Vec<Printer>>) {
+        match r {
             Ok(v) => {
                 // 选择按**名字**保留：重扫后顺序可能变，按下标留会指错打印机。
                 // 存档里的那台优先（`printer_wanted`）—— 它比"当前选中的"更权威：
@@ -470,6 +531,11 @@ impl WordTool {
 
     /// 每帧轮询工作线程。
     pub fn poll(&mut self) {
+        // 打印机那条通道先收：它与"有没有活在跑"无关，不能放在下面那个
+        // `let Some(t) = &self.task else { return }` 之后 —— 那会变成
+        // "只要没跑活就永不落地"，而它恰恰是在没跑活的时候发的。
+        self.poll_printers();
+
         let (messages, disconnected) = {
             let Some(t) = &self.task else { return };
             let mut msgs = Vec::new();
@@ -626,14 +692,7 @@ impl WordTool {
         ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 4：执行 ----
-        let can = !busy
-            && !self.hdr_docs.is_empty()
-            && match self.hdr_mode {
-                HeaderMode::Text => {
-                    !(self.text_en.trim().is_empty() && self.text_cn.trim().is_empty())
-                }
-                HeaderMode::Image => !self.img_path.is_empty(),
-            };
+        let can = self.header_can_run();
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 // GUIDE §4：一屏只有**一个** primary —— 本页就是「执行替换」。
@@ -646,15 +705,7 @@ impl WordTool {
                     )
                     .clicked();
                 if clicked {
-                    let job = self.build_job();
-                    // 就地覆盖 = 唯一"可能弄坏源文件"的路径，先确认一次再跑。
-                    // 引擎内部还有 self_check 兜底（写回原字节），但那是**出错时**
-                    // 的保护；确认框管的是"我确实要这个动作"。
-                    self.hdr_confirm = matches!(job.out, hdr::Out::InPlace);
-                    self.hdr_pending = Some(job);
-                    if !self.hdr_confirm {
-                        self.spawn_job();
-                    }
+                    self.press_execute();
                 }
                 ui.add_space(ds::SPACING.s4);
                 if self.status_rows(ui) {
@@ -668,6 +719,42 @@ impl WordTool {
 
         // 确认框最后画：它要浮在整页之上（含底部那排动作按钮）。
         self.hdr_confirm_dialog(ui.ctx());
+    }
+
+    /// 「执行替换」这一档现在能不能跑。按钮置灰与 `Ctrl+Enter` **共用同一个判据**
+    /// —— 分成两份的话，键盘迟早会绕过按钮上那几条限制（没选文档、内容空着）。
+    fn header_can_run(&self) -> bool {
+        if self.busy() || self.hdr_docs.is_empty() {
+            return false;
+        }
+        match self.hdr_mode {
+            HeaderMode::Text => {
+                !(self.text_en.trim().is_empty() && self.text_cn.trim().is_empty())
+            }
+            HeaderMode::Image => !self.img_path.is_empty(),
+        }
+    }
+
+    /// 「执行替换」按钮被按下时做的那件事：拼活 → 判要不要确认 → 开跑。
+    /// 按钮与 `Ctrl+Enter` 都走这一条。
+    fn press_execute(&mut self) {
+        if !self.header_can_run() {
+            return;
+        }
+        let job = self.build_job();
+        // 就地覆盖 = 唯一"可能弄坏源文件"的路径，先确认一次再跑。
+        // 引擎内部还有 self_check 兜底（写回原字节），但那是**出错时**
+        // 的保护；确认框管的是"我确实要这个动作"。
+        self.hdr_confirm = matches!(job.out, hdr::Out::InPlace);
+        self.hdr_pending = Some(job);
+        if !self.hdr_confirm {
+            self.spawn_job();
+        }
+    }
+
+    /// 从键盘触发本页的主按钮（`Ctrl+Enter`）。与点按钮同一条路。
+    pub fn run_header_now(&mut self) {
+        self.press_execute();
     }
 
     /// 按界面上的当前选择拼出这一趟要跑的活。**只读不写** —— 尤其不能在这里
@@ -747,9 +834,10 @@ impl WordTool {
     // ==================== 渲染：打印与导出 ====================
 
     pub fn ui_print(&mut self, ui: &mut egui::Ui) {
-        // 打印机只枚举一次并缓存 —— 见 `reload_printers`。
+        // 打印机只在进本页时枚举一次并缓存；**在后台读**，窗口这一帧不等它
+        // （见 `printer_rx` 的注释）。已经在读时不重复发起。
         if !self.printers_loaded {
-            self.reload_printers();
+            self.reload_printers_async(ui.ctx());
         }
         // 引擎同样只探一次：**只读注册表**，不启动 Word / WPS，几微秒返回。
         // 装了 Office 之后由卡片上那个「重新检测」刷新。
@@ -866,16 +954,28 @@ impl WordTool {
                         .show(ui, &mut self.printer_pick, &cur_label, opts);
                     ui.add_space(ds::SPACING.s2);
 
+                    // 后台还在读：说一声，别让「只有一条『用默认』」看起来像
+                    // "这台机器上没装打印机"。
+                    if self.printers_loading() {
+                        let pal = ds::palette_of(ui.ctx());
+                        ui.label(
+                            RichText::new("正在读取本机打印机…")
+                                .text_style(egui::TextStyle::Small)
+                                .color(pal.text_secondary),
+                        );
+                        ui.add_space(ds::SPACING.s2);
+                    }
+
                     if ui
                         .add(
                             ds::Button::secondary("重新扫描")
                                 .leading(ds::Icon::Refresh)
-                                .disabled(busy),
+                                .disabled(busy || self.printers_loading()),
                         )
                         .on_hover_text("重新枚举本机打印机")
                         .clicked()
                     {
-                        self.reload_printers();
+                        self.reload_printers_async(ui.ctx());
                     }
                 }
                 // 导出 PDF 不碰打印机：**一个系统窗口都不建**，也就没有
@@ -952,15 +1052,10 @@ impl WordTool {
         ui.add_space(ds::SPACING.s4);
 
         // ---- 卡片 3：执行 ----
-        let pages_ok = match self.sink {
-            Sink::Printer => true,
-            Sink::Pdf => services::parse_pdf_pages(&self.page_range).is_ok(),
-        };
         let plan = plan_click(self.sink, probe);
         // 引擎干不了这一档（只有 WPS 却要打印 / 两样都没装）时，按钮也要灰掉 ——
         // 让它可点、点完只写一行日志，比直接灰掉更让人困惑。
-        let can = !busy && !self.print_docs.is_empty() && pages_ok
-            && !matches!(plan, ClickPlan::Blocked(_));
+        let can = self.print_can_run(probe);
         card(ui, |ui| {
             // 灰着的按钮不说话最招人烦：把原因先摆在按钮上面。
             if let ClickPlan::Blocked(why) = plan {
@@ -992,22 +1087,7 @@ impl WordTool {
                     )
                     .clicked();
                 if clicked {
-                    // 引擎分叉**只有这一处**：有 Word 就照旧，只有 WPS 就先问，
-                    // 什么都没有就明说。判断逻辑在 `plan_click` 里，能单测。
-                    match plan_click(self.sink, probe) {
-                        ClickPlan::Blocked(why) => {
-                            self.log(format!("没有执行：{why}"));
-                        }
-                        ClickPlan::ConfirmWps => {
-                            // 走到这里一定是「导出 PDF + 只有 WPS」——
-                            // 打印那一档已被 `plan_click` 拦在外面。
-                            self.stage_wps_export();
-                        }
-                        ClickPlan::Run(kind) => match self.sink {
-                            Sink::Printer => self.launch_print(),
-                            Sink::Pdf => self.launch_export(kind),
-                        },
-                    }
+                    self.press_print(probe);
                 }
                 ui.add_space(ds::SPACING.s4);
                 if self.status_rows(ui) {
@@ -1024,6 +1104,55 @@ impl WordTool {
     }
 
     // ---------- 打印与导出：三条出口 ----------
+
+    /// 这一档现在能不能跑。按钮置灰与 `Ctrl+Enter` 共用 —— 理由同
+    /// [`Self::header_can_run`]。
+    fn print_can_run(&self, probe: EngineProbe) -> bool {
+        if self.busy() || self.print_docs.is_empty() {
+            return false;
+        }
+        let pages_ok = match self.sink {
+            Sink::Printer => true,
+            Sink::Pdf => services::parse_pdf_pages(&self.page_range).is_ok(),
+        };
+        pages_ok && !matches!(plan_click(self.sink, probe), ClickPlan::Blocked(_))
+    }
+
+    /// 主按钮被按下时做的那件事。按钮与 `Ctrl+Enter` 都走这一条。
+    ///
+    /// 引擎分叉**只有这一处**：有 Word 就照旧，只有 WPS 就先问，什么都没有就明说。
+    /// 判断逻辑在 [`plan_click`] 里，能单测。
+    fn press_print(&mut self, probe: EngineProbe) {
+        if !self.print_can_run(probe) {
+            return;
+        }
+        match plan_click(self.sink, probe) {
+            ClickPlan::Blocked(why) => {
+                self.log(format!("没有执行：{why}"));
+            }
+            ClickPlan::ConfirmWps => {
+                // 走到这里一定是「导出 PDF + 只有 WPS」——
+                // 打印那一档已被 `plan_click` 拦在外面。
+                self.stage_wps_export();
+            }
+            ClickPlan::Run(kind) => match self.sink {
+                Sink::Printer => self.launch_print(),
+                Sink::Pdf => self.launch_export(kind),
+            },
+        }
+    }
+
+    /// 从键盘触发本页的主按钮（`Ctrl+Enter`）。
+    ///
+    /// 引擎判定没探过就当场探一次（只读注册表，几微秒）—— 否则键盘这条路
+    /// 会因为 `engine == None` 被 `plan_click` 判成「什么都没装」而静默不动。
+    pub fn run_print_now(&mut self) {
+        if self.engine.is_none() {
+            self.engine = Some(engine_override().unwrap_or_else(EngineProbe::detect));
+        }
+        let probe = self.engine.unwrap_or(EngineProbe::None);
+        self.press_print(probe);
+    }
 
     /// 「打印机」这一档开跑。只有真 Word 会走到这里（见 [`plan_click`]）——
     /// WPS 的 `PrintOut` 没实测过，而"打到纸上"不可撤销，不赌。
@@ -1569,5 +1698,86 @@ mod tests {
         wt.want_printer(r"\\别的电脑\打印机".into());
         assert_eq!(wt.printer_pick, 0);
         assert_eq!(wt.printer_name(), "", "空串＝用系统默认");
+    }
+
+    // ═══════════════ 打印机：后台枚举 ═══════════════
+
+    /// 后台读打印机时**同时只开一个线程** —— 用户连点「重新扫描」会发生重入。
+    #[test]
+    fn 打印机只在后台读一次() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let ctx = egui::Context::default();
+        let mut wt = WordTool::new();
+        let 起了几次 = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let n = 起了几次.clone();
+            wt.start_printer_load(&ctx, move || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![假打印机("激光机")])
+            });
+        }
+        // 等结果落地。不用固定 sleep 赌时间 —— 线程调度不由我们说了算。
+        for _ in 0..400 {
+            wt.poll_printers();
+            if !wt.printers_loading() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(起了几次.load(Ordering::SeqCst), 1, "重入只该开一个线程");
+        assert!(wt.printers_loaded, "结果落地后要记成「已读」，否则每帧重复发起");
+        assert_eq!(wt.printers.len(), 1);
+    }
+
+    /// 枚举失败要落到界面上（那一行红字读的就是 `printers_err`），
+    /// 而不是留着上一轮的列表假装正常。
+    #[test]
+    fn 打印机枚举失败要落到界面上() {
+        let mut wt = WordTool::new();
+        wt.printers = vec![假打印机("上一轮的")];
+        wt.printers_loaded = true;
+        wt.printer_pick = 1;
+
+        wt.apply_printers(Err(anyhow::anyhow!("RPC 服务器不可用")));
+
+        assert!(wt.printers.is_empty(), "失败了就别留着上一轮的列表");
+        assert_eq!(wt.printer_pick, 0, "失败了退回系统默认");
+        assert!(wt.printers_loaded, "失败也算读过一次，别每帧重试");
+        assert!(
+            wt.printers_err.unwrap_or_default().contains("RPC 服务器不可用"),
+            "原因要原样带到界面上"
+        );
+    }
+
+    // ═══════════════ 键盘起跑：不许绕过按钮的限制 ═══════════════
+
+    /// `Ctrl+Enter` 走的就是主按钮那一条 —— 判据必须是同一份，
+    /// 否则键盘会绕过"没选文档 / 内容空着 / 页码写坏 / 引擎干不了这一档"。
+    #[test]
+    fn 键盘起跑也走主按钮的判据() {
+        let mut wt = WordTool::new();
+        // 起手什么都没有：两页都跑不了
+        assert!(!wt.header_can_run());
+        assert!(!wt.print_can_run(EngineProbe::Word));
+
+        wt.hdr_docs = vec!["a.docx".into()];
+        assert!(!wt.header_can_run(), "有文档但内容还是空的，不该跑");
+        wt.text_en = "ACME".into();
+        assert!(wt.header_can_run());
+
+        wt.print_docs = vec!["a.docx".into()];
+        assert!(wt.print_can_run(EngineProbe::Word));
+        // 只有 WPS 却要打印：主按钮是灰的，键盘也不许跑
+        assert!(!wt.print_can_run(EngineProbe::WpsOnly));
+
+        // 导出那档：页码写坏就不许跑
+        wt.sink = Sink::Pdf;
+        wt.page_range = "3-".into();
+        assert!(!wt.print_can_run(EngineProbe::Word));
+        wt.page_range = "3-7".into();
+        assert!(wt.print_can_run(EngineProbe::Word));
     }
 }
