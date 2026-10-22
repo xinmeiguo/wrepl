@@ -1513,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn 完整镜像强制打开文件SHA() {
+    fn 完整镜像强制打开文件_sha() {
         let opts = Options {
             mirror: true,
             file_sha: false,

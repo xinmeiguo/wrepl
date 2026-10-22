@@ -444,6 +444,15 @@ pub struct App {
     last_save: std::time::Instant,
     /// 写盘失败只记一次日志 —— 磁盘满时不该每 2 秒刷一行。
     state_err_logged: bool,
+    /// 是否**真的**弹系统对话框。**默认 `false`**（不弹）。
+    ///
+    /// 只有正常开窗（[`App::with_saved_state`]）才置 `true` —— 与 `save_state`
+    /// 同一条规矩：`App::new()` 必须完全无副作用，测试与 `--selftest` 都走它。
+    ///
+    /// 关掉时 [`Self::pick_system`] 只把"这一趟替谁选"记到 `picker_for` 上，
+    /// 不碰 `rfd`。这不是洁癖：`rfd` 要建真窗口，在测试进程里会**爆栈**
+    /// （实测 `快捷键_ctrl_o_的落点跟着当前页走` 直接 stack overflow）。
+    dialogs_off: bool,
 }
 
 /// 顶部的三个页。
@@ -524,25 +533,35 @@ impl App {
             saved: None,
             last_save: std::time::Instant::now(),
             state_err_logged: false,
+            dialogs_off: true,
         };
         app.push_log("就绪：选文件或目录（文件可多选）→ 填规则（或「从 Excel 导入」）→ 点「执行替换」");
-        // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save|hdrdocs|printdocs|img|browse`
-        // 时启动就把选择器打开，再配合 `WREPL_DEBUG_CLICK` 就能无人值守地复现"点一下"。
+        // 诊断开关：`WREPL_DEBUG_PICKER=dir|file|out|save|hdrdocs|printdocs|img|browse|sys`
+        // 时启动就把**自绘面板**打开，再配合 `WREPL_DEBUG_CLICK` 就能无人值守地
+        // 复现"点一下"。★ 走 `pick_own` 不走 `pick_system`：系统对话框是 OS 的窗口，
+        // 截图脚本抓不到它，这个开关当初就是为了照自绘面板才有的。
         // 本机的合成鼠标输入进不来窗口（见 `diag` 里的说明），只能让程序自己做。
         // 不设这个环境变量时，下面整段是空转。
         match crate::diag::debug_picker_mode().as_deref() {
-            Some("dir") => app.open_picker(PickFor::InputDir),
-            Some("file") => app.open_picker(PickFor::InputFiles),
-            Some("out") => app.open_picker(PickFor::OutputDir),
-            Some("save") => app.open_picker(PickFor::ExportXlsx),
+            Some("dir") => app.pick_own(PickFor::InputDir),
+            Some("file") => app.pick_own(PickFor::InputFiles),
+            Some("out") => app.pick_own(PickFor::OutputDir),
+            Some("save") => app.pick_own(PickFor::ExportXlsx),
             // 另两页的「选择文档 / 选择图片」——同一个面板、同一个入口分派，
             // 只是结果落到 `WordTool` 那边（见 `apply_picked`）。
-            Some("hdrdocs") => app.open_picker(PickFor::HeaderDocs),
-            Some("printdocs") => app.open_picker(PickFor::PrintDocs),
-            Some("img") => app.open_picker(PickFor::HeaderImage),
+            Some("hdrdocs") => app.pick_own(PickFor::HeaderDocs),
+            Some("printdocs") => app.pick_own(PickFor::PrintDocs),
+            Some("img") => app.pick_own(PickFor::HeaderImage),
             // 浏览模式（底部「打开源目录 / 打开报告」）——它有自己的一套底部按钮
             // （「打开」+「关闭」，没有「...」），值得单独照一帧。
-            Some("browse") => app.open_picker(PickFor::BrowseDir),
+            Some("browse") => app.pick_own(PickFor::BrowseDir),
+            // `sys` 是**主路径**的诊断口：验证 `rfd` 在这台机器上真能弹出系统
+            // 对话框（本机抢不到前台，合成点击进不了窗口 —— 只能让程序自己点）。
+            // 它必须先把 `dialogs_off` 关掉，否则 `pick_system` 只记意图不弹框。
+            Some("sys") => {
+                app.dialogs_off = false;
+                app.pick_system(PickFor::InputDir);
+            }
             Some(other) => {
                 crate::diag::log(format!("[诊断] 未知的 WREPL_DEBUG_PICKER={other:?}，忽略"))
             }
@@ -625,6 +644,8 @@ impl App {
     pub fn with_saved_state() -> Self {
         let mut app = App::new();
         app.save_state = true;
+        // 只有这里把系统对话框打开：这是"人真的在用它"的唯一入口。
+        app.dialogs_off = false;
         match crate::state::load() {
             Some(st) => {
                 let n = st.rules.len();
@@ -1546,14 +1567,9 @@ impl App {
 
     /// 用系统默认程序打开一个**文件**（.xlsx 报告 / .docx / 图片…）。
     ///
-    /// 与自绘面板的分工：**面板负责"看"，这里负责"把看到的那一个打开"**。
-    /// 原先这里叫 `open_path`、对文件取父目录再拉资源管理器 —— 现在
-    /// "看"这件事交给 [`PickFor::BrowseDir`] 那套自绘面板了（不新建 OS 窗口），
-    /// 留下来的只有"打开"这一个动作。
-    ///
-    /// 走 `explorer`：它拿到**文件**路径时等价于 `ShellExecute`（拿目录路径才是
-    /// "打开资源管理器"）。这是全程序唯一还会新建 OS 窗口的地方，而且只在
-    /// 用户主动双击 / 点「打开」时发生 —— 不是点一下就弹。
+    /// 与两个「浏览」入口的分工：**浏览负责"看"（资源管理器），这里负责"把
+    /// 看到的那一个打开"**。走 `explorer`：它拿到**文件**路径时等价于
+    /// `ShellExecute`（拿目录路径才是"打开资源管理器"）。
     fn open_file(&mut self, p: &str) {
         let p = p.trim();
         if p.is_empty() || !Path::new(p).is_file() {
@@ -1561,6 +1577,39 @@ impl App {
         }
         if let Err(e) = std::process::Command::new("explorer").arg(p).spawn() {
             self.error = Some(format!("打不开：{e}"));
+        }
+    }
+
+    /// 用资源管理器**显示**产物落点 / 报告落点 —— 两个「浏览」入口的系统侧。
+    ///
+    /// 目录就直接打开；文件就选中它（`/select,`）。报告还没生成是常态，那时
+    /// 打开它**所在的目录**而不是报错：用户点这颗按钮本来就是"我想看看那儿"。
+    ///
+    /// ⚠ `explorer.exe` 成功时也常返回非 0 退出码，所以只看 `spawn` 成不成，
+    /// 不要 `wait()` 之后再判状态（那会把每次成功都当成失败）。
+    fn reveal(&mut self, what: PickFor) {
+        let p = match what {
+            PickFor::BrowseReport => self.report_path(),
+            _ => self.product_dir(),
+        };
+        let mut cmd = std::process::Command::new("explorer");
+        if p.is_file() {
+            // `/select,` 与路径必须在**同一个**参数里：explorer 不接受拆开的两段。
+            cmd.arg(format!("/select,{}", p.display()));
+        } else if p.is_dir() {
+            cmd.arg(p.as_os_str());
+        } else if let Some(d) = p.parent().filter(|d| d.is_dir()) {
+            // 产物目录还没建（还没跑过）→ 退一级，打开父目录。
+            cmd.arg(d.as_os_str());
+        } else {
+            self.error = Some(format!(
+                "这个位置还不存在：{}\n先选输入目录（或勾上「输出到子文件夹」并填输出目录）",
+                p.display()
+            ));
+            return;
+        }
+        if let Err(e) = cmd.spawn() {
+            self.error = Some(format!("打不开资源管理器：{e}"));
         }
     }
 
@@ -1739,18 +1788,27 @@ impl App {
                 };
                 if ui
                     .add(ds::Button::secondary(open_lbl).leading(ds::Icon::FolderOpen))
+                    .on_hover_text("用资源管理器打开（产物落在哪一看就知道）")
                     .clicked()
                 {
-                    // 走自绘面板浏览，不拉资源管理器 —— 后者是新的 OS 窗口，
-                    // 本机每建一个要交 0.8~2 秒「窗口税」（见 `picker` 模块头）。
-                    self.open_picker(PickFor::BrowseDir);
+                    // 主路径 = 资源管理器：点「打开目录」的人要的就是它。
+                    self.pick_system(PickFor::BrowseDir);
+                }
+                // 「⋯」= 自绘面板：不新建 OS 窗口（省 0.8~2 秒窗口税），
+                // 面板里双击文件还能直接用默认程序打开。
+                if ds::dots(ui, "用内置面板浏览（不新建资源管理器窗口）\n面板里双击文件 = 直接用默认程序打开") {
+                    self.pick_own(PickFor::BrowseDir);
                 }
                 ui.add_space(ds::SPACING.s2);
                 if ui
                     .add(ds::Button::secondary("打开报告").leading(ds::Icon::FileText))
+                    .on_hover_text("用资源管理器定位到报告文件")
                     .clicked()
                 {
-                    self.open_picker(PickFor::BrowseReport);
+                    self.pick_system(PickFor::BrowseReport);
+                }
+                if ds::dots(ui, "用内置面板浏览报告所在目录（不新建资源管理器窗口）") {
+                    self.pick_own(PickFor::BrowseReport);
                 }
                 ui.add_space(ds::SPACING.s5);
                 // 执行期间不给清：那一整段日志等一下要落盘成「运行日志.txt」
@@ -1830,30 +1888,50 @@ impl App {
         self.confirm_inplace_dialog(&ctx);
 
         // 「页眉替换 / 打印与导出」两页的「选择文档」按钮**不自己弹对话框**：
-        // 选择器是常驻的、全程序只有一台，所以由这里统一收口 —— 界面上那些
-        // 按钮只把意图抛出来（`WordTool::take_pick`），开还是这儿开。
+        // 选择器是常驻的、全程序只有一台，由这里统一收口 —— 界面上那些按钮
+        // 只把意图抛出来（`WordTool::take_pick` / `take_pick_own`），开还是这儿开。
         // 收在这里还有个好处：此刻已出了 `CentralPanel` 的借用期，够得着 `self.picker`。
         if let Some(who) = self.wt.take_pick() {
-            self.open_picker(match who {
+            self.pick_system(match who {
+                crate::wordtool::PickDoc::Header => PickFor::HeaderDocs,
+                crate::wordtool::PickDoc::Print => PickFor::PrintDocs,
+                crate::wordtool::PickDoc::HeaderImage => PickFor::HeaderImage,
+            });
+        }
+        if let Some(who) = self.wt.take_pick_own() {
+            self.pick_own(match who {
                 crate::wordtool::PickDoc::Header => PickFor::HeaderDocs,
                 crate::wordtool::PickDoc::Print => PickFor::PrintDocs,
                 crate::wordtool::PickDoc::HeaderImage => PickFor::HeaderImage,
             });
         }
 
-        // 诊断工具页自己不调 `open_picker`（它拿不到 `&mut App`），只举旗子。
+        // 诊断工具页自己不调选路径（它拿不到 `&mut App`），只举旗子。
         // 在这里消费掉：三个请求位与本页其它入口走**同一条**选路管线。
         if self.tools.pick_a {
             self.tools.pick_a = false;
-            self.open_picker(PickFor::ToolA);
+            self.pick_system(PickFor::ToolA);
         }
         if self.tools.pick_b {
             self.tools.pick_b = false;
-            self.open_picker(PickFor::ToolB);
+            self.pick_system(PickFor::ToolB);
         }
         if self.tools.pick_out {
             self.tools.pick_out = false;
-            self.open_picker(PickFor::ToolOut);
+            self.pick_system(PickFor::ToolOut);
+        }
+        // 同一套槽位的旁路：「⋯」→ 自绘面板。
+        if self.tools.pick_a_own {
+            self.tools.pick_a_own = false;
+            self.pick_own(PickFor::ToolA);
+        }
+        if self.tools.pick_b_own {
+            self.tools.pick_b_own = false;
+            self.pick_own(PickFor::ToolB);
+        }
+        if self.tools.pick_out_own {
+            self.tools.pick_out_own = false;
+            self.pick_own(PickFor::ToolOut);
         }
 
         // 自绘文件选择器比确认框还要靠前（`Foreground` 面板 + 全屏遮罩），
@@ -1917,6 +1995,10 @@ impl App {
             let mut pick_in_dir = false;
             let mut pick_in_file = false;
             let mut pick_out_dir = false;
+            // 三个「⋯」走自绘面板（`pick_own`），与上面那三个系统对话框入口分开记。
+            let mut pick_in_dir_own = false;
+            let mut pick_in_file_own = false;
+            let mut pick_out_dir_own = false;
             let mut use_sibling_out = false;
 
             // GUIDE §7：标签在字段**正上方**（不是左侧——IT 类界面这样扫得更快）。
@@ -1940,23 +2022,35 @@ impl App {
                 );
                 ui.add_space(ds::SPACING.s2);
                 ui.vertical(|ui| {
-                    if ui
-                        .add(ds::Button::secondary("选目录").leading(ds::Icon::Folder))
-                        .on_hover_text("选输入目录（或目录里的一批 .docx）\n快捷键：Ctrl+O")
-                        .clicked()
-                    {
-                        pick_in_dir = true;
-                    }
-                    if ui
-                        .add(ds::Button::secondary("选文件").leading(ds::Icon::FileText))
-                        .on_hover_text(
-                            "按住 Ctrl / Shift 一次选多个 .docx；选中几个就处理几个。\n\
-                             也可以直接把多个路径粘进左边的框里（一行一个，或用分号隔开）。",
-                        )
-                        .clicked()
-                    {
-                        pick_in_file = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(ds::Button::secondary("选目录").leading(ds::Icon::Folder))
+                            .on_hover_text("选输入目录（或目录里的一批 .docx）\n快捷键：Ctrl+O")
+                            .clicked()
+                        {
+                            pick_in_dir = true;
+                        }
+                        // 主按钮 = 系统对话框；这三个小点 = 自绘面板（旁路）。
+                        // 面板能做的事更多（整目录递归加入），但不该是第一眼的选择。
+                        if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）\n面板里选中文件夹 = 把里面的 .docx 递归加入") {
+                            pick_in_dir_own = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(ds::Button::secondary("选文件").leading(ds::Icon::FileText))
+                            .on_hover_text(
+                                "按住 Ctrl / Shift 一次选多个 .docx；选中几个就处理几个。\n\
+                                 也可以直接把多个路径粘进左边的框里（一行一个，或用分号隔开）。",
+                            )
+                            .clicked()
+                        {
+                            pick_in_file = true;
+                        }
+                        if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）\n面板里选中文件夹 = 把里面的 .docx 递归加入") {
+                            pick_in_file_own = true;
+                        }
+                    });
                 });
             });
             ui.add_space(ds::SPACING.s3);
@@ -1996,6 +2090,9 @@ impl App {
                         .clicked()
                     {
                         pick_out_dir = true;
+                    }
+                    if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）") {
+                        pick_out_dir_own = true;
                     }
                     if ui
                         .add(ds::Button::ghost("源文件目录").leading(ds::Icon::Refresh))
@@ -2067,15 +2164,25 @@ impl App {
                 });
 
             // 选路径的动作放在布局之后执行：避免在借用 self 的闭包里嵌套借用。
-            // 四个入口都走**同一个自绘面板**，靠 `PickFor` 区分结果落到哪个字段。
+            // 主按钮走系统对话框（`pick_system`），旁边的「⋯」走自绘面板（`pick_own`）；
+            // 两条路靠 `PickFor` 区分结果落到哪个字段。
             if pick_in_dir {
-                self.open_picker(PickFor::InputDir);
+                self.pick_system(PickFor::InputDir);
+            }
+            if pick_in_dir_own {
+                self.pick_own(PickFor::InputDir);
             }
             if pick_in_file {
-                self.open_picker(PickFor::InputFiles);
+                self.pick_system(PickFor::InputFiles);
+            }
+            if pick_in_file_own {
+                self.pick_own(PickFor::InputFiles);
             }
             if pick_out_dir {
-                self.open_picker(PickFor::OutputDir);
+                self.pick_system(PickFor::OutputDir);
+            }
+            if pick_out_dir_own {
+                self.pick_own(PickFor::OutputDir);
             }
             if use_sibling_out {
                 // 与「输出到子文件夹」留空时的默认落点同一条路（见 input_dir）
@@ -2419,20 +2526,33 @@ impl App {
         // 三个入口同样走自绘面板，导入/导出的**实际处理**在下面的三个 `do_*` 里，
         // 面板与「... 系统对话框」两条路共用同一份逻辑。
         if import_txt {
-            self.open_picker(PickFor::ImportTxt);
+            self.pick_system(PickFor::ImportTxt);
         }
         if import_xlsx {
-            self.open_picker(PickFor::ImportXlsx);
+            self.pick_system(PickFor::ImportXlsx);
         }
         if export_xlsx {
-            self.open_picker(PickFor::ExportXlsx);
+            self.pick_system(PickFor::ExportXlsx);
         }
     }
 
-    // ─────────────────── 选路径：自绘面板 + 系统对话框兜底 ───────────────────
+    // ─────────────── 选路径：系统对话框（主） + 自绘面板（旁路） ───────────────
+    //
+    // 2026-10-22 主次对调。原先所有入口都开自绘面板、系统对话框只当逃生口；
+    // 实测用户不习惯自绘那套（不认它、找不到"我的文档"、不知道双击能进目录）。
+    // 现在反过来：
+    //
+    // · **主路径 [`Self::pick_system`]** —— 系统原生的「打开 / 选择文件夹 / 另存为」。
+    //   用户在 Windows 里用了二十年的那套，另存为位置、最近位置、网络位置、
+    //   OneDrive、搜索框全都在。
+    // · **旁路 [`Self::pick_own`]** —— 自绘面板，**只由按钮旁边那个「⋯」触发**。
+    //   它快（不新建 OS 窗口，本机每建一个要交 0.8~2 秒窗口税），而且能整目录
+    //   递归加入（系统对话框做不到这件事），留给熟路的人。
+    //
+    // 两条路的结果都汇到 [`Self::apply_picked`] 同一处 —— 走哪条都不该产生行为差异。
 
-    /// 打开自绘面板，替 `what` 这个入口选路径。
-    fn open_picker(&mut self, what: PickFor) {
+    /// 打开自绘面板（「⋯」旁路），替 `what` 这个入口选路径。
+    fn pick_own(&mut self, what: PickFor) {
         // 起点目录：能猜一个合理的就猜，猜不出就交给面板用它自己记住的上次目录
         // （`PathBuf::new()` = 空 → 面板回退到 `last_dir`）。
         let in_first = first_path(&self.input);
@@ -2604,7 +2724,7 @@ impl App {
         match outcome {
             Outcome::Cancelled => {}
             // 「...」：自绘面板搞不定（比如要连一个没映射的网络位置），退回系统对话框。
-            Outcome::Fallback => self.fallback_dialog(what),
+            Outcome::Fallback => self.pick_system(what),
             Outcome::Picked(paths) => self.apply_picked(what, paths),
         }
     }
@@ -2704,7 +2824,7 @@ impl App {
     /// | `F5` | 扫描（预演） | `start_run(true, …)` |
     /// | `Ctrl+Enter` | 执行 | `start_run(false, …)` |
     ///
-    /// 三条都调**既有的入口**（`open_picker` / `start_run`），不新开路径 ——
+    /// 三条都调**既有的入口**（`pick_system` / `start_run`），不新开路径 ——
     /// 所以「就地覆盖要确认」那道关（兜在 `start_run` 里，见那里的注释）
     /// 快捷键也躲不过去。
     ///
@@ -2742,11 +2862,11 @@ impl App {
             // 「选目录」的落点跟着当前页走：批量替换页选的是**输入目录**，
             // 另两页的起手动作是选文档（它们没有"目录"这个概念）。
             match self.page {
-                Page::Replace => self.open_picker(PickFor::InputDir),
-                Page::Header => self.open_picker(PickFor::HeaderDocs),
-                Page::Print => self.open_picker(PickFor::PrintDocs),
+                Page::Replace => self.pick_system(PickFor::InputDir),
+                Page::Header => self.pick_system(PickFor::HeaderDocs),
+                Page::Print => self.pick_system(PickFor::PrintDocs),
                 // 诊断工具页的"起手动作"是挑 A 那栏（文件还是目录由当前工具定）。
-                Page::Tools => self.open_picker(PickFor::ToolA),
+                Page::Tools => self.pick_system(PickFor::ToolA),
             }
             return;
         }
@@ -2978,11 +3098,27 @@ impl App {
             });
     }
 
-    /// 兜底：用系统原生对话框重来一遍（面板右下角「...」）。
+    /// **主路径**：系统原生对话框（`rfd`）。
     ///
-    /// 逻辑与自绘面板**完全一致**，只是换了个选路径的壳 —— 结果都汇到
+    /// 逻辑与自绘面板**完全一致**，只是换了个壳 —— 结果都汇到
     /// [`App::apply_picked`] 同一处，不会因为走了哪条路而产生行为差异。
-    fn fallback_dialog(&mut self, what: PickFor) {
+    ///
+    /// ⚠ `rfd` 是**阻塞**调用：模态窗口开着的时候界面这一帧就停在这儿。
+    /// 这正是人们对系统对话框的预期（点它就该接管），别改成后台线程 ——
+    /// 那样窗口不跟随、还可能被主窗盖住，反而像卡死。
+    fn pick_system(&mut self, what: PickFor) {
+        // 无头（测试 / `--selftest`）：只记"替谁选"，真对话框一个都不弹。
+        if self.dialogs_off {
+            self.picker_for = Some(what);
+            return;
+        }
+        // 两个「浏览」入口在系统这边**不是**选路径，而是"用资源管理器打开" ——
+        // 用户点「打开源目录」想看到的就是资源管理器，不是又一个选择框。
+        // 它们不该经过 `apply_picked`（没有路径要落盘）。
+        if matches!(what, PickFor::BrowseDir | PickFor::BrowseReport) {
+            self.reveal(what);
+            return;
+        }
         let picked: Option<Vec<PathBuf>> = match what {
             PickFor::InputDir | PickFor::OutputDir => {
                 rfd::FileDialog::new().pick_folder().map(|p| vec![p])
@@ -3015,13 +3151,12 @@ impl App {
                 .add_filter("图片文件", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff"])
                 .pick_file()
                 .map(|p| vec![p]),
-            // 两个「浏览」入口**没有**兜底：`Mode::Browse` 的面板本来就不摆「...」
-            // 那个逃生口（浏览模式不"选"东西，原生对话框没有对应动作可做）。
+            // 两个「浏览」入口在上面就 return 掉了（走资源管理器）。
             // 这一支留在 match 里只为穷尽性 —— 走不到。
             PickFor::BrowseDir | PickFor::BrowseReport => None,
             // 诊断工具页的三个槽位：A/B 是文件还是目录由当前工具定，
-            // 与 `open_picker` 里那一套分派保持一致（不然"..."点出来的
-            // 对话框会与面板挑的东西类型不同）。
+            // 与 `pick_own` 里那一套分派保持一致（不然同一个按钮的两条路
+            // 会让用户挑到不同类型的东西）。
             PickFor::ToolA => {
                 if self.tools.kind.a_is_dir() {
                     rfd::FileDialog::new().set_title("诊断工具 —— 选目录").pick_folder().map(|p| vec![p])
@@ -3457,7 +3592,7 @@ fn short_name(p: &Path) -> String {
 /// 是不是 Word 文档 —— `.doc` / `.docx`，**不看大小写**。
 ///
 /// 拖放的白名单与「页眉替换 / 打印与导出」那两页的选择器白名单是同一个来源
-/// （`fallback_dialog` 里的 `add_filter("Word 文档", &["doc", "docx"])`），
+/// （`pick_system` 里的 `add_filter("Word 文档", &["doc", "docx"])`），
 /// 所以拖进来的必须是同一批东西，否则两条路给出的候选集会不一样。
 ///
 /// 之所以自己判而不在 `is_dir()` 之后交给别处：拖进来的路径是**任意**用户
@@ -4106,7 +4241,7 @@ pub fn selftest(args: &[String]) -> i32 {
         (PickFor::BrowseDir, "浏览"),
         (PickFor::HeaderImage, "选图片"),
     ] {
-        app.open_picker(what);
+        app.pick_own(what);
         for _ in 0..2 {
             let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
         }
@@ -4137,7 +4272,7 @@ pub fn selftest(args: &[String]) -> i32 {
     //     后建的控件压在它上面优先拿事件），所以点标题栏那条空白最保险。
     {
         app.page = Page::Replace;
-        app.open_picker(PickFor::BrowseDir);
+        app.pick_own(PickFor::BrowseDir);
         for _ in 0..3 {
             let _ = ctx.run_ui(raw.clone(), |ui| app.render(ui));
         }

@@ -231,7 +231,12 @@ pub struct WordTool {
     // ---------- 共享 ----------
     pub log: Vec<String>,
     /// 「选择文档」的待办，由 `App` 每帧取走（见 [`PickDoc`]）。
+    ///
+    /// 两条路各一个槽位：主按钮写 `want_pick`（`App` 会开**系统对话框**），
+    /// 按钮旁那个「⋯」写 `want_pick_own`（开**自绘面板**）。分开记而不是加个
+    /// bool 参数，是因为 `App` 那边是两个不同的函数，混在一起判容易判错。
     want_pick: Option<PickDoc>,
+    want_pick_own: Option<PickDoc>,
     task: Option<Task>,
     /// 上一趟的结果摘要（文案, 是否全成功）。没跑过就是 `None`。
     last_result: Option<(String, bool)>,
@@ -271,6 +276,7 @@ impl WordTool {
             wps_pending: None,
             log: Vec::new(),
             want_pick: None,
+            want_pick_own: None,
             task: None,
             last_result: None,
         }
@@ -281,9 +287,14 @@ impl WordTool {
         self.task.is_some()
     }
 
-    /// 取走「要选文档」的待办。`App` 每帧调一次。
+    /// 取走「要选文档」的待办（**系统对话框**那条路）。`App` 每帧调一次。
     pub fn take_pick(&mut self) -> Option<PickDoc> {
         self.want_pick.take()
+    }
+
+    /// 取走「要选文档」的待办（**自绘面板**那条路，由「⋯」触发）。
+    pub fn take_pick_own(&mut self) -> Option<PickDoc> {
+        self.want_pick_own.take()
     }
 
     /// 自绘选择器选完文档之后，由 `App` 回填。`what` 决定落到哪一页的列表。
@@ -657,8 +668,6 @@ impl WordTool {
                 }
                 HeaderMode::Image => {
                     ui.horizontal(|ui| {
-                        // 选图片和「选择文档」走同一台自绘选择器（`PickDoc::HeaderImage`）：
-                        // 原来它是全程序最后一个还在弹系统对话框的入口。
                         if ui
                             .add(
                                 ds::Button::secondary("选择图片…")
@@ -668,6 +677,10 @@ impl WordTool {
                             .clicked()
                         {
                             self.want_pick = Some(PickDoc::HeaderImage);
+                        }
+                        // 「⋯」= 自绘面板（主按钮走系统对话框）
+                        if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）") {
+                            self.want_pick_own = Some(PickDoc::HeaderImage);
                         }
                         ui.add_space(ds::SPACING.s4);
                         ui.add(ds::Checkbox::with_label(&mut self.img_scale, "按表格高度等比缩放"));
@@ -696,13 +709,15 @@ impl WordTool {
                             .leading(ds::Icon::FolderOpen)
                             .disabled(busy),
                     )
-                    // 面板里**选中文件夹**再确认也可以：会把它里面的 .doc/.docx
-                    // 递归收进来（那时底部按钮写成「加入此文件夹」）。这行提示是
-                    // 唯一告诉人"能这么干"的地方 —— 光看按钮名看不出来。
-                    .on_hover_text("可多选文件；选中文件夹则把它里面的 .doc / .docx 一起加入")
+                    .on_hover_text("可多选 .doc / .docx")
                     .clicked()
                 {
                     self.want_pick = Some(PickDoc::Header);
+                }
+                // 「⋯」= 自绘面板：能在面板里选中**文件夹**再确认，
+                // 把它里面的 .doc / .docx 递归收进来 —— 系统对话框做不到这件事。
+                if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）\n面板里选中文件夹 = 把里面的 .doc / .docx 递归加入") {
+                    self.want_pick_own = Some(PickDoc::Header);
                 }
                 ui.add_space(ds::SPACING.s2);
                 if ui
@@ -905,13 +920,13 @@ impl WordTool {
                             .leading(ds::Icon::FolderOpen)
                             .disabled(busy),
                     )
-                    // 面板里**选中文件夹**再确认也可以：会把它里面的 .doc/.docx
-                    // 递归收进来（那时底部按钮写成「加入此文件夹」）。这行提示是
-                    // 唯一告诉人"能这么干"的地方 —— 光看按钮名看不出来。
-                    .on_hover_text("可多选文件；选中文件夹则把它里面的 .doc / .docx 一起加入")
+                    .on_hover_text("可多选 .doc / .docx")
                     .clicked()
                 {
                     self.want_pick = Some(PickDoc::Print);
+                }
+                if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）\n面板里选中文件夹 = 把里面的 .doc / .docx 递归加入") {
+                    self.want_pick_own = Some(PickDoc::Print);
                 }
                 ui.add_space(ds::SPACING.s2);
                 if ui

@@ -135,6 +135,39 @@ pub fn install(ctx: &egui::Context) {
     crate::diag::log(format!("设计系统就绪：界面字体 {used}"));
 }
 
+/// 「⋯」—— 主按钮旁边的**旁路入口**（2026-10-22）。
+///
+/// 主按钮走系统原生对话框；这三个小点是给熟路的人留的快速通道（自绘面板）。
+/// 刻意做得不显眼：默认 `text_tertiary`、无边框无背景，只有悬停时才亮起来、
+/// 浮出一行说明 —— 它不该在第一眼就被当成一个操作按钮，否则又会有人问
+/// "这个点点是什么"。
+///
+/// 边长写死 26（= `ButtonSize::Sm` 的高度；那个 `height()` 不对外）。它和左边
+/// 那颗 Md 按钮在 `horizontal` 里按基线居中排布，不会把行高顶歪。
+///
+/// 返回"被点了没有"，调用方拿到 `true` 就去开自绘面板。
+pub fn dots(ui: &mut egui::Ui, tip: &str) -> bool {
+    let pal = palette_of(ui.ctx());
+    let side = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, RADIUS.md, pal.bg_hover);
+        }
+        let color = if resp.hovered() {
+            pal.text_primary
+        } else {
+            pal.text_tertiary
+        };
+        let r = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(13.0));
+        Icon::DotsHorizontal.paint(ui.painter(), r, color);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip).clicked()
+}
+
 /// 应用设计系统主题。`light` = 浅色还是深色 palette。
 ///
 /// **全局**（写 `Context` 级样式）：在 `render` 里按 `light_theme` 变化触发一次，

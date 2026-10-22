@@ -131,14 +131,21 @@ pub struct ToolPage {
     rx: Option<Receiver<Done>>,
     /// 起跑时刻，用来显示"已跑了多久"。
     started: Option<Instant>,
-    /// 三个"要开选择器"的请求位。
+    /// 三个"要开选择器"的请求位。**主按钮 = 系统对话框**。
     ///
-    /// 用 bool 而不是直接调 `App::open_picker`：这一页拿不到 `&mut App`，
+    /// 用 bool 而不是直接调 `App::pick_system`：这一页拿不到 `&mut App`，
     /// 而把 `&mut App` 传进来会让两边互相借（历史上踩过）。App 每帧看一眼，
     /// 消费掉就置回 false。
     pub pick_a: bool,
     pub pick_b: bool,
     pub pick_out: bool,
+    /// 同一套槽位的**旁路**：三个按钮右边的「⋯」= 自绘面板。
+    ///
+    /// 与上面三个分开记，是因为 `App` 那边是两个不同的函数
+    /// （`pick_system` / `pick_own`），混在一个 bool 里判容易判反。
+    pub pick_a_own: bool,
+    pub pick_b_own: bool,
+    pub pick_out_own: bool,
 }
 
 impl Default for ToolPage {
@@ -167,6 +174,9 @@ impl ToolPage {
             pick_a: false,
             pick_b: false,
             pick_out: false,
+            pick_a_own: false,
+            pick_b_own: false,
+            pick_out_own: false,
         }
     }
 
@@ -278,6 +288,10 @@ impl ToolPage {
                     if ui.add(pick_button(self.kind.a_is_dir())).clicked() {
                         self.pick_a = true;
                     }
+                    // 「⋯」= 自绘面板（主按钮走系统对话框）
+                    if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）") {
+                        self.pick_a_own = true;
+                    }
                 });
 
                 if let Some(role) = self.kind.b_role() {
@@ -302,6 +316,9 @@ impl ToolPage {
                             .show(ui);
                         if ui.add(pick_button(role == Role::InDir)).clicked() {
                             self.pick_b = true;
+                        }
+                        if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）") {
+                            self.pick_b_own = true;
                         }
                     });
                 }
@@ -360,6 +377,9 @@ impl ToolPage {
                             .clicked()
                         {
                             self.pick_out = true;
+                        }
+                        if ds::dots(ui, "用内置快速选择器打开（不弹系统窗口）") {
+                            self.pick_out_own = true;
                         }
                     });
                     ui.add_space(4.0);

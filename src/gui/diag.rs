@@ -415,7 +415,10 @@ fn crash_box(msg: &str) {
 //
 // 下面两个环境变量只服务于这个目的，正常使用不会碰到（不设 = 完全无影响）。
 
-/// `WREPL_DEBUG_PICKER=dir|file|save` —— 启动即把选择器打开。
+/// `WREPL_DEBUG_PICKER=dir|file|save|…` —— 启动即把选择器打开。
+///
+/// 取值见 `app.rs` 的 `App::new()`（那里是唯一的分派处）；`sys` 是例外 ——
+/// 它走的是**系统对话框**那条主路径，其余都开自绘面板。
 pub fn debug_picker_mode() -> Option<String> {
     let v = std::env::var("WREPL_DEBUG_PICKER").ok()?;
     let v = v.trim().to_ascii_lowercase();
