@@ -3,10 +3,11 @@
 > **这个文件只记"还没做的"和"为什么先不做"。**
 > 做完的进 [`CHANGELOG.md`](../CHANGELOG.md)；过程、约束与验证链进 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。
 >
-> 最后更新：2026-10-21（**0.8.3 已发版**；§7.2 / §7.3 的源码行号已按 0.8.3 之后的代码重新核对；
+> 最后更新：2026-10-22（**0.8.4 已发版**；§7.2 / §7.3 的源码行号已按 0.8.3 之后的代码重新核对；
 > 增量导出已否决，见 §2.3；全项目扫描的
 > 剩余项见 §7，其中「行为不变」的 7 条已随 0.6.0 落地、§7.1 的六条已随 0.7.0 / 0.8.0
-> 全部清空、§7.3 的四条小项已随 0.8.1 落地、exe 图标与版本信息已随 0.8.3 落地，
+> 全部清空、§7.3 的四条小项已随 0.8.1 落地、exe 图标与版本信息已随 0.8.3 落地、
+> 文件选择主次对调（系统对话框为主、自绘面板降为「⋯」旁路）已随 0.8.4 落地，
 > 见 `CHANGELOG.md`）
 
 ## 0. 顺序不是按"重要性"排的，是按**依赖**排的
@@ -411,16 +412,16 @@ tag 可以被 `git push --force` 移动。钉 SHA 意味着**任何人都无法�
 
 ### 7.2 结构 / 维护性（改动量大，收益是"以后好改"）
 
-> 行号 2026-10-21 按 0.8.3 之后的代码重新核过（0.8.0～0.8.3 的下沉与新增让它整体漂了 40～350 行）。
+> 行号 2026-10-22 按 0.8.4 之后的代码重新核过（0.8.0～0.8.4 的下沉与新增让它整体漂了 40～350 行）。
 
 | 项 | 位置 | 说明 |
 |---|---|---|
-| `Picker::content` 拆段 | `picker.rs:1295-1888` | 593 行单函数、6 层嵌套。拆 header / list / rubber_band / status_bar / action_bar |
-| `App::render` 拆段 | `app.rs:1581-1872` | 291 行；topbar / sidebar / bottombar 各抽 `fn` |
-| `WordTool::ui_print` 拆段 | `ui.rs:885-1157` | 272 行画四张卡 |
-| `WordTool` 字段私有化 | `ui.rs:166-238` | 20 个 `pub` + 8 个私有；生产代码只用方法访问，直接读写只发生在 `selftest`（`wps_confirm` 那种为无头自检才 pub 的要在注释里留理由） |
+| `Picker::content` 拆段 | `picker.rs:1304-1897` | 593 行单函数、6 层嵌套。拆 header / list / rubber_band / status_bar / action_bar |
+| `App::render` 拆段 | `app.rs:1630-1950` | 320 行；topbar / sidebar / bottombar 各抽 `fn` |
+| `WordTool::ui_print` 拆段 | `ui.rs:900-1172` | 272 行画四张卡 |
+| `WordTool` 字段私有化 | `ui.rs:166-242` | 19 个 `pub` + 9 个私有；生产代码只用方法访问，直接读写只发生在 `selftest`（`wps_confirm` 那种为无头自检才 pub 的要在注释里留理由） |
 
-> **~~`process_one` 的 11 个位置参数~~ → 2026-10-21 已解决（未发版）**：八个开关收进
+> **~~`process_one` 的 11 个位置参数~~ → 2026-10-21 已解决（0.8.4）**：八个开关收进
 > `ProcessFlags`（`pipeline.rs`），形参降到 4 个、`#[allow(too_many_arguments)]` 去掉。
 > 顺手把原来**写在调用点上、没有任何测试**的两句推导收进 `ProcessFlags::from_options`：
 > `want_verify = verify_after && !dry_run`、`mirror = mirror && !dry_run`、
